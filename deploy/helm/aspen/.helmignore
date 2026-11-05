@@ -1,0 +1,5 @@
+# Not part of the packaged chart.
+*.orig
+*.rej
+.DS_Store
+ci/

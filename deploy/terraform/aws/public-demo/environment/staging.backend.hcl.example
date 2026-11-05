@@ -1,0 +1,8 @@
+# Remote state for the staging environment. Copy to staging.backend.hcl (ignored by
+# git) and run `terraform init -reconfigure -backend-config=staging.backend.hcl`.
+
+bucket       = "REPLACE-ME-aspen-tfstate"
+key          = "public-demo/staging/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

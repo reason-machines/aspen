@@ -1,0 +1,107 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "stale-branch",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:45027/bench.git"
+  },
+  "params": {
+    "points": [
+      10,
+      100,
+      1000
+    ],
+    "protocol": 2,
+    "repeats": 3,
+    "repo_changes_per_commit": 10,
+    "repo_commits": 20,
+    "repo_file_bytes": 4096,
+    "repo_files": 200,
+    "repo_seed": 1
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": "d42c286010f22ca453a63559d9cf723e7893df4e",
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 16939364352,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793759287054,
+  "wall_seconds": 26.599854125999997,
+  "latencies_ms": {
+    "stale_fetch_n10": {
+      "count": 3,
+      "min": 28.376357000000002,
+      "mean": 28.742343333333334,
+      "p50": 28.698635,
+      "p90": 29.152038,
+      "p99": 29.152038,
+      "max": 29.152038
+    },
+    "stale_fetch_n100": {
+      "count": 3,
+      "min": 34.086249,
+      "mean": 34.23118266666666,
+      "p50": 34.256065,
+      "p90": 34.351234,
+      "p99": 34.351234,
+      "max": 34.351234
+    },
+    "stale_fetch_n1000": {
+      "count": 3,
+      "min": 50.589846,
+      "mean": 51.27276366666666,
+      "p50": 51.180564999999994,
+      "p90": 52.04788,
+      "p99": 52.04788,
+      "max": 52.04788
+    },
+    "trunk_push": {
+      "count": 1000,
+      "min": 24.504293,
+      "mean": 25.799503969000014,
+      "p50": 25.589255,
+      "p90": 26.909694000000002,
+      "p99": 28.804616000000003,
+      "max": 31.171681
+    },
+    "trunk_push_first_tenth": {
+      "count": 100,
+      "min": 24.625235999999997,
+      "mean": 25.341894870000015,
+      "p50": 25.178589000000002,
+      "p90": 26.146716,
+      "p99": 27.015096,
+      "max": 27.350337999999997
+    },
+    "trunk_push_last_tenth": {
+      "count": 100,
+      "min": 24.504293,
+      "mean": 25.570940870000005,
+      "p50": 25.297311999999998,
+      "p90": 26.408458,
+      "p99": 28.186425,
+      "max": 28.299712
+    }
+  },
+  "throughput": {
+    "trunk_pushes_per_second": 38.19911088709061
+  },
+  "counts": {
+    "fetches_ok": 9,
+    "received_bytes.n10": 437,
+    "received_bytes.n100": 443,
+    "received_bytes.n1000": 410,
+    "trunk_pushes": 1000
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

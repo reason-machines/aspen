@@ -1,0 +1,2 @@
+00b0want 75daa37135828c2d26838bf1becb3d0eef564290 multi_ack_detailed no-done side-band-64k thin-pack no-progress include-tag ofs-delta deepen-since deepen-not agent=git/2.39.5
+0034shallow abe8be00c5b1672c4393d6abad681127b55cbe5a0015deepen 21474836470000

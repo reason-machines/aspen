@@ -1,0 +1,88 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "aspen",
+    "url": "http://127.0.0.1:8086/bench-writers-1793754138.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "push_url": "branch-scoped",
+    "pushes_per_writer": null,
+    "repo_source_tip": "777489f9e09c8d0dd6b12f9d90de6376330577a2",
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793754155165,
+  "wall_seconds": 30.541675881,
+  "latencies_ms": {
+    "push": {
+      "count": 378,
+      "min": 612.8724589999999,
+      "mean": 1252.742111317461,
+      "p50": 1030.970262,
+      "p90": 2390.7518360000004,
+      "p99": 2982.7668470000003,
+      "max": 3339.430121
+    },
+    "push_to_fetch": {
+      "count": 378,
+      "min": 91.36330600000001,
+      "mean": 237.03073193915347,
+      "p50": 198.225537,
+      "p90": 450.507062,
+      "p99": 623.8804100000001,
+      "max": 648.931989
+    },
+    "reader_fetch": {
+      "count": 378,
+      "min": 82.906618,
+      "mean": 230.2340911243385,
+      "p50": 190.171851,
+      "p90": 439.012473,
+      "p99": 623.084884,
+      "max": 642.646618
+    },
+    "reader_queue": {
+      "count": 378,
+      "min": 0.057992999999999996,
+      "mean": 6.626495272486773,
+      "p50": 4.062045,
+      "p90": 17.401030000000002,
+      "p99": 40.882716,
+      "max": 52.075555
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 12.376531054576285
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 378,
+    "reader_fetches": 378,
+    "readers_created": 32,
+    "seen": 378,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

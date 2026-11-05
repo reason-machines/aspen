@@ -1,0 +1,80 @@
+[package]
+name = "aspen-server"
+description = "Aspen's server: Git smart HTTP (access control, git-upload-pack, git-receive-pack) and the wiring of the metadata store, blob store, planner and stitcher."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `aspen_server::testing`: seeds a repository's stores from a local Git
+# repository, the way the push path does, and runs a test server. For tests
+# and the interop smoke only; never enabled by the `aspen` binary.
+testing = ["tokio/rt-multi-thread"]
+# `aspen_server::fuzzing`: the crate-private SSH command parser and request
+# body readers, for the fuzz targets in `aspen-fuzz` (fuzz/, issue #139)
+# only; never enabled by the `aspen` binary.
+fuzzing = []
+
+[dependencies]
+aspen-auth = { path = "../aspen-auth" }
+aspen-core = { path = "../aspen-core" }
+aspen-proto = { path = "../aspen-proto" }
+aspen-pack = { path = "../aspen-pack" }
+aspen-planner = { path = "../aspen-planner" }
+aspen-meta = { path = "../aspen-meta" }
+aspen-blob = { path = "../aspen-blob" }
+# Exact cached shallow packs (node C8) are built with the compactor's
+# repack writer and checks.
+aspen-compact = { path = "../aspen-compact" }
+aspen-express = { path = "../aspen-express" }
+aspen-mirror = { path = "../aspen-mirror" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+bytes = "1"
+# Git gzips large upload-pack requests (`Content-Encoding: gzip`).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+http-body = "1"
+# The HTTP listener (`listen`): hyper with a timer, so header reads time out
+# (axum::serve sets none), HTTP/1.1 and cleartext HTTP/2.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "server-graceful", "service", "tokio"] }
+tower-service = "0.3"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
+# Git over SSH (node C3). `ring` instead of the default aws-lc-rs (a C/CMake
+# build, as A4 decided for rustls), and no `rsa` feature: the `rsa` crate
+# carries RUSTSEC-2023-0071 with no fix, so RSA keys are not accepted
+# (decisions log, C3).
+russh = { version = "=0.65.1", default-features = false, features = ["ring"] }
+# Push spools and per-push work directories (receive-pack).
+tempfile = { workspace = true }
+# A blocking reader over the push body, for pass 1 (receive-pack).
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+# Logs and spans (node C5); the binary installs the subscriber and exporter.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The fetch tests use `testing`; this turns it on for the tests only.
+aspen-server = { path = ".", features = ["testing"] }
+aspen-testkit = { path = "../../testkit" }
+# The mirror tests check GitHub App JWTs the way GitHub does.
+base64 = "0.22"
+ring = "0.17"
+# Hand-built packs in the receive-pack tests.
+gix-hash = { version = "=0.28.1", features = ["sha1"] }
+gix-zlib = "=0.4.0"
+http-body-util = "0.1"
+serde_json = { workspace = true }
+# The GC race tests detach a cover's pack the way a crashed compactor leaves it.
+sqlx = { workspace = true, features = ["any"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "io-util"] }
+tower = { version = "0.5", features = ["util"] }
+# Captures the access log in the observability tests.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+
+[lints]
+workspace = true

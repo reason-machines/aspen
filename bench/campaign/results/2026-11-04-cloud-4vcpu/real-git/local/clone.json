@@ -1,0 +1,52 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "clone",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:36905/bench.git"
+  },
+  "params": {
+    "clones": 8,
+    "concurrency": 4,
+    "protocol": 2,
+    "repo_source_tip": "777489f9e09c8d0dd6b12f9d90de6376330577a2"
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 16939364352,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793756822157,
+  "wall_seconds": 66.214145422,
+  "latencies_ms": {
+    "clone": {
+      "count": 8,
+      "min": 32896.334331,
+      "mean": 33019.250666,
+      "p50": 32938.96004,
+      "p90": 33231.262322,
+      "p99": 33231.262322,
+      "max": 33231.262322
+    }
+  },
+  "throughput": {
+    "clones_per_second": 0.12082010496418727,
+    "received_mib_per_second": 29.123855356848438
+  },
+  "counts": {
+    "clones_ok": 8,
+    "received_bytes": 2022085696
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

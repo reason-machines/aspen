@@ -1,0 +1,39 @@
+# Gitea with Postgres, configured entirely through environment variables so
+# no install wizard runs. Credentials here are throwaway and local-only; the
+# benchmark user is created by target.sh with a random password.
+name: aspen-bench-gitea
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gitea
+      POSTGRES_PASSWORD: gitea
+      POSTGRES_DB: gitea
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "gitea"]
+      interval: 2s
+      retries: 30
+  gitea:
+    image: ${GITEA_IMAGE:-gitea/gitea:28.3.0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: postgres
+      GITEA__database__HOST: postgres:5432
+      GITEA__database__NAME: gitea
+      GITEA__database__USER: gitea
+      GITEA__database__PASSWD: gitea
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__ROOT_URL: http://127.0.0.1:${BENCH_PORT:-3000}/
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__START_SSH_SERVER: "false"
+      GITEA__server__LFS_START_SERVER: "false"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__repository__DEFAULT_BRANCH: main
+      GITEA__log__LEVEL: Warn
+    ports:
+      - "127.0.0.1:${BENCH_PORT:-3000}:3000"

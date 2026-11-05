@@ -1,0 +1,26 @@
+# Local secrets and settings
+compose/.env
+**/terraform.tfvars
+**/*.auto.tfvars
+**/backend.hcl
+# The public demo's environment root keeps one file per environment.
+/terraform/aws/public-demo/environment/*.tfvars
+/terraform/aws/public-demo/environment/*.backend.hcl
+
+# Terraform working files. Root modules commit .terraform.lock.hcl.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/crash.log
+
+# The reusable modules have no lock file of their own; their tests and CI
+# reuse the example root's (cp examples/<root>/.terraform.lock.hcl .).
+/terraform/aws/.terraform.lock.hcl
+/terraform/gcp/.terraform.lock.hcl
+/terraform/azure/.terraform.lock.hcl
+/terraform/hetzner-minio/.terraform.lock.hcl
+/terraform/aws/public-demo/account-budget/.terraform.lock.hcl
+
+# Python bytecode from the release and chart scripts
+**/__pycache__/

@@ -1,0 +1,282 @@
+# Required checks for every pull request and for main. Keep this fast: slow
+# suites (interop matrix, chaos, fuzzing, benchmarks) belong in nightly.yml.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install   # reads rust-toolchain.toml
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy + rustdoc + layering
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Broken, ambiguous, redundant or private intra-doc links and invalid
+      # HTML in doc comments (#224). Private items are documented too, so
+      # internal module docs are checked. Reuses clippy's dependency builds:
+      # about a minute, in a job that ends well before `test`.
+      - name: rustdoc (warnings denied)
+        run: cargo doc --workspace --no-deps --locked --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: cargo xtask check-deps
+      - run: cargo xtask check-workflows
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # aspen-blob's S3 conformance suite runs against a real MinIO; under CI
+      # it fails, rather than skips, without one.
+      - name: Start MinIO for the S3 blob store tests
+        run: crates/aspen-blob/scripts/test-minio.sh
+      # The interop smoke has its own job, against the latest Git release.
+      - run: cargo test --workspace --locked --exclude aspen-interop
+      - run: cargo test --locked -p aspen-interop --lib
+
+  interop-smoke:
+    name: interop smoke (latest git, protocol v2, HTTP)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The runner's Git if it is already the latest release, else the git-core
+      # PPA, else a signature-checked build of the kernel.org release tarball,
+      # cached by version. Never stock Git: the check step fails unless git on
+      # PATH is exactly the latest release. See the script's header.
+      - name: Install the latest stable Git
+        id: git
+        run: .github/scripts/install-latest-git.sh install
+      - name: Restore the cached source build of Git
+        id: git-cache
+        if: steps.git.outputs.build == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.git.outputs.prefix }}
+          key: ${{ steps.git.outputs.cache-key }}
+      - name: Build the latest stable Git from its signed release tarball
+        if: steps.git.outputs.build == 'true' && steps.git-cache.outputs.cache-hit != 'true'
+        run: .github/scripts/install-latest-git.sh build
+      - name: Save the source build of Git
+        if: steps.git.outputs.build == 'true' && steps.git-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.git.outputs.prefix }}
+          key: ${{ steps.git.outputs.cache-key }}
+      - name: Check that git on PATH is the latest stable release
+        run: .github/scripts/install-latest-git.sh check
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked -p aspen-interop --test smoke
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features --locked
+
+  deploy-config:
+    name: deploy config (terraform, tflint, helm, compose, release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    defaults:
+      run:
+        working-directory: deploy/terraform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.65.0
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}/.terraform-plugin-cache
+            ~/.tflint.d/plugins
+          key: terraform-${{ hashFiles('deploy/terraform/**/.terraform.lock.hcl', 'deploy/terraform/.tflint.hcl') }}
+      - run: terraform fmt -check -recursive -diff
+      # No credentials and no backend: these never talk to a cloud account.
+      - name: validate the example roots (and the modules through them)
+        run: |
+          for root in aws/examples/isolated gcp/examples/project azure/examples/subscription \
+                      hetzner-minio/examples/single-host \
+                      aws/public-demo/account aws/public-demo/environment; do
+            echo "::group::$root"
+            (cd "$root" && terraform init -backend=false -lockfile=readonly && terraform validate)
+            echo "::endgroup::"
+          done
+      - name: module tests with mocked providers
+        run: |
+          for pair in aws:examples/isolated gcp:examples/project azure:examples/subscription \
+                      hetzner-minio:examples/single-host; do
+            module="${pair%%:*}" root="${pair#*:}"
+            echo "::group::$module"
+            (cd "$module" && cp "$root/.terraform.lock.hcl" . \
+              && terraform init -backend=false -lockfile=readonly && terraform test)
+            echo "::endgroup::"
+          done
+      - name: public demo roots (account, environment) with mocked providers
+        run: |
+          for root in aws/public-demo/account aws/public-demo/environment; do
+            echo "::group::$root"
+            (cd "$root" && terraform init -backend=false -lockfile=readonly && terraform test)
+            echo "::endgroup::"
+          done
+      - name: public demo account budget check (the rule both roots run)
+        working-directory: deploy/terraform/aws/public-demo/account-budget
+        run: |
+          cp ../account/.terraform.lock.hcl .
+          terraform init -backend=false -lockfile=readonly && terraform test
+      - name: AWS pack CDN viewer function (expired and non-express URLs refused at the edge)
+        run: node aws/cdn/viewer-request.test.mjs
+      - name: AWS generated secrets never enter Terraform state
+        working-directory: .
+        run: deploy/scripts/check-terraform-write-only.sh
+      # The runner image ships PostgreSQL (server stopped); the test starts its
+      # own throwaway cluster on loopback.
+      - name: public demo create-database.sh against PostgreSQL (place cannot reach Aspen's database)
+        run: |
+          if ! ls -d /usr/lib/postgresql/*/bin >/dev/null 2>&1; then
+            sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends postgresql
+          fi
+          PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n 1)
+          PG_BIN="$PG_BIN" sh aws/public-demo/environment/tests/create-database.test.sh
+      - name: public demo smoke.sh keeps the token off git's command line
+        run: sh aws/public-demo/tests/smoke.test.sh
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # plugin download rate limit
+        run: |
+          tflint --init
+          tflint --recursive --config "$PWD/.tflint.hcl"
+      - name: shellcheck deploy scripts
+        working-directory: deploy
+        run: shellcheck compose/*.sh scripts/*.sh helm/ci/*.sh release/*.sh terraform/hetzner-minio/templates/*.sh terraform/aws/public-demo/*.sh terraform/aws/public-demo/environment/*.sh terraform/aws/public-demo/environment/tests/*.sh terraform/aws/public-demo/tests/*.sh
+      - name: shellcheck the tool installer
+        working-directory: .
+        run: shellcheck .github/scripts/install-tool.sh
+      - name: helm chart (lint, render, schema, refusals)
+        working-directory: .
+        run: |
+          .github/scripts/install-tool.sh helm "$RUNNER_TEMP/bin"
+          .github/scripts/install-tool.sh kubeconform "$RUNNER_TEMP/bin"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          python3 -c 'import yaml' || sudo apt-get install -yq python3-yaml
+          helm lint --strict deploy/helm/aspen -f deploy/helm/aspen/ci/minimal-values.yaml
+          python3 deploy/helm/check-chart.py
+      - name: release tooling (formula rendering, version checks)
+        working-directory: .
+        run: python3 deploy/release/test_release.py
+      - name: Dockerfile Rust version matches rust-toolchain.toml
+        working-directory: .
+        run: deploy/scripts/check-rust-version.sh
+      - name: base and default images pinned by digest (issue #125)
+        working-directory: .
+        run: |
+          python3 deploy/scripts/test_check_image_pins.py
+          deploy/scripts/check-image-pins.py
+      - name: compose file resolves
+        working-directory: deploy/compose
+        run: |
+          ./init-env.sh "$RUNNER_TEMP/compose.env"
+          docker compose --env-file "$RUNNER_TEMP/compose.env" config --quiet
+          python3 test_compose_defaults.py
+
+  # The place demo front end (demo/place): Node only, runs in parallel with
+  # the Rust jobs and takes about a minute.
+  place:
+    name: place (lint, typecheck, test, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: demo/place
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: demo/place/.nvmrc
+          cache: npm
+          cache-dependency-path: demo/place/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # The documentation site (site/): mdBook build, links and headings, and the
+  # configuration page against the variables the code reads. Under a minute.
+  docs:
+    name: docs site (build, links, configuration)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck site/install-mdbook.sh
+      - name: Install mdBook (pinned, checksum verified)
+        run: |
+          site/install-mdbook.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: python3 site/test_build.py
+      - run: python3 site/build.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-site
+          path: site/target/html
+          retention-days: 14
+
+  # One stable check name for branch protection.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [fmt, clippy, test, interop-smoke, deny, deploy-config, place, docs]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All required jobs passed
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'

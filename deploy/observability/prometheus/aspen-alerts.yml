@@ -1,0 +1,182 @@
+# Prometheus alerting rules for Aspen (node C5).
+#
+# Load this file with `rule_files:` in prometheus.yml, or as a
+# PrometheusRule's `spec` with the Prometheus Operator. Every metric here is
+# described in docs/OBSERVABILITY.md, and a test in aspen-server checks
+# that each name used below is one the server exports.
+#
+# Severity labels:
+#   page    - wake someone: data is wrong or work the system relies on stopped.
+#   ticket  - look during working hours: degraded, not broken.
+#
+# Database gauges (aspen_jobs*, aspen_trunk_repos) are the same on every
+# instance, so rules take `max` across instances, never `sum`.
+
+groups:
+  - name: aspen-paging
+    rules:
+      - alert: AspenDeadJobs
+        expr: max by (kind) (aspen_jobs{state="dead"}) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} dead {{ $labels.kind }} job(s)"
+          description: >-
+            A background job failed or lost its lease 10 times and was parked
+            as dead. Nothing retries it, so its work is not happening (a dead
+            rewrite_pack leaves a stored pack failing every fetch that stitches
+            it). Run `aspen doctor jobs` to see the last error, fix the cause,
+            then `aspen doctor jobs requeue <id>` (or `resolve <id>` if the work
+            was done some other way).
+
+      - alert: AspenStoredPackNotBaseFirst
+        expr: sum(increase(aspen_alert_stored_pack_forward_base_total[10m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "A stored pack breaks the base-first invariant"
+          description: >-
+            Fetches that stitch this pack fail with a retryable ERR, and retries
+            cannot heal it. The server enqueued a rewrite_pack job; check that it
+            runs (`aspen doctor jobs`) and look for "is not base-first" in the
+            server logs for the pack ID.
+
+      - alert: AspenStoreCorruption
+        expr: sum(increase(aspen_alert_store_corruption_total[10m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Stored data does not match its metadata row"
+          description: >-
+            A fetch read a blob that is missing, short or different from what its
+            packs row says. Look for "stored data does not match its row" in the
+            server logs, and check the blob store.
+
+      - alert: AspenExpressCorruptPack
+        expr: sum(increase(aspen_alert_express_corrupt_pack_total[10m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "An express node read a pack that does not hash to its key"
+          description: >-
+            The pack was streamed unverified and not cached; clients reject it
+            and fall back. Check the blob behind the key (docs/EXPRESS.md).
+
+  - name: aspen-tickets
+    rules:
+      - alert: AspenWiderTrunk
+        expr: max(aspen_trunk_repos{closure="wider"}) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} repositories have a wider trunk version"
+          description: >-
+            A wider trunk closure is inherited by every later trunk version, so
+            every incremental fetch of those repositories now sends a full
+            clone. Trunk stays exact in ordinary use; find when it happened with
+            aspen_push_trunk_versions_total{closure="wider"} and the
+            "committed a wider trunk version" log line.
+
+      - alert: AspenWiderTrunkCommitted
+        expr: sum(increase(aspen_push_trunk_versions_total{closure="wider"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A push committed a wider trunk version"
+          description: >-
+            See AspenWiderTrunk. The push's log line names the repository.
+
+      - alert: AspenRepairJobNotEnqueued
+        expr: sum(increase(aspen_job_enqueue_failures_total[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A rewrite_pack repair job could not be enqueued"
+          description: >-
+            The paging alert for the pack already fired; the next fetch that hits
+            the pack tries to enqueue the repair again. Check the metadata
+            database.
+
+      - alert: AspenJobQueueLagging
+        expr: max by (kind) (aspen_jobs_queued_lag_seconds) > 600
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.kind }} jobs have waited over 10 minutes"
+          description: >-
+            Workers are not keeping up, or none runs for this kind. Commits
+            without index rows are still served from packs, more slowly.
+
+      - alert: AspenMetaStatsDown
+        expr: min by (instance) (aspen_meta_stats_up) == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} cannot read the database gauges"
+          description: >-
+            aspen_jobs and aspen_trunk_repos keep their last values, so the
+            dead-job alert cannot fire on new dead jobs. Check database access
+            from that instance; a read that takes over 5 seconds counts as
+            failed.
+
+      - alert: AspenMetaStatsMissing
+        expr: absent(aspen_meta_stats_up)
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No scraped Aspen instance exports the database gauges"
+          description: >-
+            Without aspen_jobs the dead-job alert can never fire. The servers
+            were built without Server::with_store_gauges, or none is scraped
+            (see AspenMetricsMissing). docs/OBSERVABILITY.md has the wiring.
+
+      - alert: AspenMetricsMissing
+        expr: absent(aspen_build_info)
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No Aspen instance is being scraped"
+          description: >-
+            Every alert above depends on these metrics. Check the scrape target
+            (the metrics listener, docs/OBSERVABILITY.md).
+
+      - alert: AspenPushStoreErrors
+        expr: >-
+          sum(rate(aspen_pushes_total{result="store_error"}[5m]))
+          / sum(rate(aspen_pushes_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Over 5% of pushes fail with a storage error"
+          description: >-
+            Clients get 503 and retry. Check the metadata database and the blob
+            store.
+
+      - alert: AspenPrefetchSaturated
+        expr: sum(increase(aspen_push_prefetch_wait_timeouts_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Pushes time out waiting for a prefetch slot"
+          description: >-
+            Concurrent thin pushes need more base-prefetch memory than the
+            server's budget admits. Raise prefetch_memory_bytes if the instance
+            has memory to spare, or add instances.
+
+      - alert: AspenExpressEndpointDown
+        expr: min by (tier, endpoint) (aspen_express_endpoint_up) == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Express endpoint {{ $labels.endpoint }} is failing its probes"
+          description: >-
+            Its packs go to the next endpoint, the store's URL or the stitched
+            pack, so fetches still work at a higher cost.

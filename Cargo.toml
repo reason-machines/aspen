@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = [
+    "bench",
+    "crates/aspen-core",
+    "crates/aspen-auth",
+    "crates/aspen-meta",
+    "crates/aspen-blob",
+    "crates/aspen-pack",
+    "crates/aspen-planner",
+    "crates/aspen-compact",
+    "crates/aspen-express",
+    "crates/aspen-mirror",
+    "crates/aspen-proto",
+    "crates/aspen-server",
+    "crates/aspen-cli",
+    "demo/place/server",
+    "fuzz",
+    "testkit",
+    "tests/chaos",
+    "tests/interop",
+    "xtask",
+]
+# The libFuzzer harness is its own workspace: it needs a nightly toolchain
+# and libfuzzer-sys, which required CI never builds (fuzz/README.md).
+exclude = ["fuzz/libfuzzer"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+repository = "https://github.com/reason-machines/aspen"
+# Apache-2.0 (LICENSE, NOTICE). Every crate inherits it with
+# `license.workspace = true`. Crates stay unpublished on crates.io until
+# publishing is approved (docs/PLAN.md, section 7).
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false }
+tempfile = "3"
+thiserror = "2"
+tokio = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stderr = "allow"
+
+[profile.dev]
+# Keep debug builds fast; dependencies still get some optimisation so tests
+# that move pack data around are not painfully slow.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1

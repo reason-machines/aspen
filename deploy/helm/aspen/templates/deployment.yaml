@@ -1,0 +1,223 @@
+{{- include "aspen.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aspen.fullname" . }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aspen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        {{- include "aspen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Restart pods when the policy or limits change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /-/metrics
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "aspen.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aspen
+          image: {{ include "aspen.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 7070
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- if .Values.ssh.enabled }}
+            - name: ssh
+              containerPort: 2222
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: ASPEN_LISTEN
+              value: "0.0.0.0:7070"
+            - name: ASPEN_METRICS_LISTEN
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            {{- if .Values.ssh.enabled }}
+            - name: ASPEN_SSH_LISTEN
+              value: "0.0.0.0:2222"
+            - name: ASPEN_SSH_HOST_KEY_FILE
+              value: /etc/aspen/ssh/host_key
+            {{- end }}
+            {{- with .Values.publicUrl }}
+            - name: ASPEN_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.passwordSecret.name | quote }}
+                  key: {{ .Values.database.passwordSecret.key | quote }}
+            {{- include "aspen.blobEnv" . | nindent 12 }}
+            - name: ASPEN_POLICY_FILE
+              value: /etc/aspen/config/policy.json
+            - name: ASPEN_LIMITS_FILE
+              value: /etc/aspen/config/limits.json
+            - name: ASPEN_TRUSTED_PROXY_HOPS
+              value: {{ include "aspen.trustedProxyHops" . | quote }}
+            - name: ASPEN_SPOOL_DIR
+              value: /var/lib/aspen/spool
+            - name: ASPEN_PACKFILE_URIS
+              value: {{ .Values.packfileUris | toString | quote }}
+            - name: ASPEN_MAX_OBJECT_BYTES
+              value: {{ .Values.push.maxObjectBytes | int64 | quote }}
+            - name: ASPEN_MAX_INFLATED_BYTES
+              value: {{ .Values.push.maxInflatedBytes | int64 | quote }}
+            - name: ASPEN_MAX_PUSH_BYTES
+              value: {{ .Values.push.maxPackBytes | int64 | quote }}
+            - name: ASPEN_MAX_PUSH_OBJECTS
+              value: {{ .Values.push.maxObjects | int64 | quote }}
+            - name: ASPEN_PREFETCH_MEMORY_BYTES
+              value: {{ .Values.push.prefetchMemoryBytes | int64 | quote }}
+            {{- with .Values.express }}
+            {{- if .urls }}
+            - name: ASPEN_EXPRESS_URLS
+              value: {{ join "," .urls | quote }}
+            {{- end }}
+            {{- if .cdnUrl }}
+            - name: ASPEN_CDN_URL
+              value: {{ .cdnUrl | quote }}
+            - name: ASPEN_CDN_PAST_END
+              value: {{ .cdnPastEnd | toString | quote }}
+            {{- end }}
+            - name: ASPEN_EXPRESS_TTL_SECS
+              value: {{ .ttlSeconds | int64 | quote }}
+            - name: ASPEN_EXPRESS_WINDOW_SECS
+              value: {{ .windowSeconds | int64 | quote }}
+            - name: ASPEN_EXPRESS_SERVE
+              value: {{ .serve | toString | quote }}
+            {{- end }}
+            {{- include "aspen.mirrorEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            # Not the database: an outage must not restart every pod at once.
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Let the load balancer stop sending new requests before
+              # SIGTERM; Aspen then finishes the requests it has.
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aspen/config
+              readOnly: true
+            {{- if .Values.ssh.enabled }}
+            - name: ssh-host-key
+              mountPath: /etc/aspen/ssh
+              readOnly: true
+            {{- end }}
+            - name: spool
+              mountPath: /var/lib/aspen/spool
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "aspen.fullname" . }}
+        {{- if .Values.ssh.enabled }}
+        - name: ssh-host-key
+          secret:
+            secretName: {{ .Values.ssh.hostKeySecret.name | quote }}
+            items:
+              - key: {{ .Values.ssh.hostKeySecret.key | quote }}
+                path: host_key
+            # Readable by the pod's group (fsGroup 10001) only.
+            defaultMode: 0440
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: spool
+          {{- if .Values.spool.ephemeralVolume.enabled }}
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  {{- include "aspen.selectorLabels" . | nindent 18 }}
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: {{ .Values.spool.ephemeralVolume.storageClassName | quote }}
+                resources:
+                  requests:
+                    storage: {{ .Values.spool.ephemeralVolume.size }}
+          {{- else }}
+          # Node disk, never memory (the spool mmaps whole packs).
+          emptyDir:
+            sizeLimit: {{ .Values.spool.sizeLimit }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,87 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:33271/bench.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "pushes_per_writer": null,
+    "repo_source_tip": "777489f9e09c8d0dd6b12f9d90de6376330577a2",
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 16939364352,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793754836560,
+  "wall_seconds": 31.11574105,
+  "latencies_ms": {
+    "push": {
+      "count": 443,
+      "min": 326.67368600000003,
+      "mean": 1009.255936783295,
+      "p50": 1056.4290700000001,
+      "p90": 1221.91733,
+      "p99": 1356.274081,
+      "max": 1416.595063
+    },
+    "push_to_fetch": {
+      "count": 443,
+      "min": 532.1986330000001,
+      "mean": 1540.0145207178339,
+      "p50": 1563.384294,
+      "p90": 1892.983013,
+      "p99": 2173.758198,
+      "max": 2336.392311
+    },
+    "reader_fetch": {
+      "count": 443,
+      "min": 517.1367059999999,
+      "mean": 1517.091851185101,
+      "p50": 1541.430104,
+      "p90": 1879.1583990000001,
+      "p99": 2144.763845,
+      "max": 2311.881829
+    },
+    "reader_queue": {
+      "count": 443,
+      "min": 0.170811,
+      "mean": 22.519493487584644,
+      "p50": 21.984472,
+      "p90": 37.117637,
+      "p99": 48.997327,
+      "max": 84.542508
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 14.237166946727756
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 443,
+    "reader_fetches": 443,
+    "readers_created": 32,
+    "seen": 443,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

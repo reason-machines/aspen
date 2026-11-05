@@ -1,0 +1,143 @@
+# Aspen on a single host: Aspen + Postgres + MinIO.
+#
+#   cd deploy/compose
+#   ./init-env.sh          # writes .env with random passwords (once)
+#   docker compose up -d   # builds the aspen image from this checkout once
+#   docker compose exec aspen aspen repo create acme/app
+#   docker compose exec aspen aspen token create --subject me --grant write:acme/app
+#   git push http://me:<token>@127.0.0.1:7070/acme/app.git main
+#
+# The `aspen` service runs `aspen serve` from deploy/docker/Dockerfile with the
+# configuration contract in deploy/README.md. Set ASPEN_IMAGE to run a
+# published image instead of building one.
+#
+# Postgres and MinIO publish nothing on the host by default. Aspen's HTTP port
+# binds to 127.0.0.1 unless ASPEN_BIND_ADDRESS says otherwise.
+
+name: aspen
+
+x-minio-image: &minio-image
+  # Upstream MinIO no longer publishes container images. Chainguard's build is
+  # maintained and free; the -dev variant adds the shell, wget and mc that the
+  # healthcheck and bucket setup use. The tag is pinned to a digest (the
+  # multi-arch index) so every install and CI run gets the same MinIO; the
+  # aspen-blob test script (crates/aspen-blob/scripts/test-minio.sh) pins the
+  # same one, so bump both together. Override with MINIO_IMAGE if you mirror
+  # or build your own.
+  image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio:latest-dev@sha256:604ce09e2099ab20704a4c3bf25863bbb9bdaa643e7f522dc652098a6284bd6a}
+
+services:
+  aspen:
+    image: ${ASPEN_IMAGE:-aspen:local}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    command: ["serve"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Pushes are spooled and completed here: a real disk, never tmpfs.
+      - aspen-spool:/var/lib/aspen/spool
+      # Request rates per caller (aspen_auth::LimitsConfig; deploy/README.md).
+      # Edit limits.json to change them; `{}` turns them off.
+      - ./limits.json:/etc/aspen/limits.json:ro
+    environment:
+      # The configuration contract (deploy/README.md). Keep in sync with the
+      # ECS task definition in deploy/terraform/aws and the Helm chart.
+      ASPEN_LISTEN: 0.0.0.0:7070
+      # /-/metrics on the compose network only; nothing publishes 9464.
+      ASPEN_METRICS_LISTEN: 0.0.0.0:9464
+      # Git over SSH needs a stable host key: add ASPEN_SSH_LISTEN
+      # (0.0.0.0:2222), mount the key and set ASPEN_SSH_HOST_KEY_FILE, and
+      # publish 2222 (docs/SSH.md).
+      ASPEN_PUBLIC_URL: ${ASPEN_PUBLIC_URL:-http://127.0.0.1:7070}
+      ASPEN_LIMITS_FILE: /etc/aspen/limits.json
+      # The password travels separately, as on AWS, where it comes from
+      # Secrets Manager. libpq and sqlx read PGPASSWORD when the URL has none.
+      DATABASE_URL: postgres://aspen@postgres:5432/aspen?sslmode=disable
+      PGPASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh first}
+      ASPEN_BLOB_URL: s3://${ASPEN_BUCKET:-aspen-packs}
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: aspen
+      AWS_SECRET_ACCESS_KEY: ${ASPEN_S3_SECRET_KEY:?run ./init-env.sh first}
+      ASPEN_SPOOL_DIR: /var/lib/aspen/spool
+      # Presigned bucket URLs would name http://minio:9000, which clients
+      # outside this network cannot reach, so packs go inline. Turn this on
+      # once the bucket has an address clients can use.
+      ASPEN_PACKFILE_URIS: ${ASPEN_PACKFILE_URIS:-false}
+      ASPEN_LOG: ${ASPEN_LOG:-info}
+    ports:
+      - ${ASPEN_BIND_ADDRESS:-127.0.0.1}:${ASPEN_HTTP_PORT:-7070}:7070
+    # The image is slim, with neither curl nor wget; the check is built into
+    # the binary. /readyz answers 200 once the database does.
+    healthcheck:
+      test: ["CMD", "aspen", "healthcheck", "--url", "http://127.0.0.1:7070/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    # Pinned to a digest like every image here (issue #125); the Hetzner
+    # module pins the same one. POSTGRES_IMAGE in .env overrides it.
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b}
+    environment:
+      POSTGRES_USER: aspen
+      POSTGRES_DB: aspen
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh first}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "aspen", "-d", "aspen", "-h", "127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio:
+    <<: *minio-image
+    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-aspen-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?run ./init-env.sh first}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot: creates the pack bucket and a least-privilege `aspen` user that
+  # can only touch that bucket. Safe to re-run.
+  minio-init:
+    <<: *minio-image
+    entrypoint: ["/bin/sh", "/minio-init.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-aspen-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?run ./init-env.sh first}
+      ASPEN_BUCKET: ${ASPEN_BUCKET:-aspen-packs}
+      ASPEN_S3_ACCESS_KEY: aspen
+      ASPEN_S3_SECRET_KEY: ${ASPEN_S3_SECRET_KEY:?run ./init-env.sh first}
+      MC_CONFIG_DIR: /tmp/mc
+    volumes:
+      - ./minio-init.sh:/minio-init.sh:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  aspen-spool:
+  postgres-data:
+  minio-data:

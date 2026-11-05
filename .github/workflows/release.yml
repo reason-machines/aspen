@@ -1,0 +1,196 @@
+# Release pipeline (node C6): binaries for Linux and macOS on x86_64 and
+# arm64, a multi-arch container image, the Helm chart and a Homebrew formula.
+#
+# Every run builds and tests everything. Nothing is published unless BOTH:
+#   - the repository variable ASPEN_RELEASE_PUBLISH is "true", and
+#   - the run is a pushed tag v<version>, or a manual run with publish: true
+#     started from such a tag (the plan job fails a publish request from a
+#     branch, before anything is built or pushed).
+# Publishing jobs also run in the `release` environment, so they can require
+# a reviewer. The variable stays unset until publishing is approved and the
+# repository is public (docs/PLAN.md, section 7); until then a release is a
+# dry run whose artifacts stay on the workflow run.
+#
+# Cutting a release: bump `version` in Cargo.toml ([workspace.package]) and
+# `version`/`appVersion` in deploy/helm/aspen/Chart.yaml in one pull request
+# (CI's `release.py check-version` keeps them equal), merge, then push the
+# tag v<version>.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish (also needs vars.ASPEN_RELEASE_PUBLISH == 'true')"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          WANT_PUBLISH: ${{ (github.event_name == 'push' && github.ref_type == 'tag') || inputs.publish == true }}
+          ENABLED: ${{ vars.ASPEN_RELEASE_PUBLISH == 'true' }}
+        run: |
+          if [ -n "$TAG" ]; then
+            version="$(python3 deploy/release/release.py check-version "$TAG")"
+          else
+            version="$(python3 deploy/release/release.py check-version)"
+          fi
+          if [ "$WANT_PUBLISH" = true ] && [ -z "$TAG" ]; then
+            echo "::error::publishing needs a v<version> tag ref: start the run from the tag, not a branch"
+            exit 1
+          fi
+          publish=false
+          if [ "$WANT_PUBLISH" = true ] && [ "$ENABLED" = true ]; then publish=true; fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "Aspen $version; publish: $publish (requested: $WANT_PUBLISH, enabled: $ENABLED)" >>"$GITHUB_STEP_SUMMARY"
+
+  binaries:
+    name: binary (${{ matrix.target }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-24.04}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm}
+          - {target: x86_64-apple-darwin, os: macos-15-intel}
+          - {target: aarch64-apple-darwin, os: macos-15}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install   # reads rust-toolchain.toml
+      - run: cargo build --release --locked -p aspen-cli --bin aspen
+      - name: smoke test (aspen dev, push, clone, SIGTERM)
+        run: deploy/release/smoke-binary.sh target/release/aspen "${{ needs.plan.outputs.version }}"
+      - name: package
+        run: python3 deploy/release/release.py archive "${{ needs.plan.outputs.version }}" "${{ matrix.target }}" target/release/aspen dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aspen-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  assemble:
+    name: image, chart and formula
+    needs: [plan, binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: aspen-*
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: |
+          cat ./*.sha256 | tee SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Homebrew formula
+        run: python3 deploy/release/release.py formula "$VERSION" dist --out dist/aspen.rb
+      - name: Helm chart package
+        run: |
+          .github/scripts/install-tool.sh helm "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/helm" package deploy/helm/aspen --destination dist
+      - name: Linux binaries for the image
+        run: |
+          for arch in amd64:x86_64 arm64:aarch64; do
+            mkdir -p "image/linux-${arch%%:*}"
+            tar -xzf "dist/aspen-$VERSION-${arch##*:}-unknown-linux-gnu.tar.gz" -C "image/linux-${arch%%:*}" aspen
+          done
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: multi-arch image (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: release
+          build-contexts: dist=image
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.IMAGE }}:v${{ env.VERSION }}
+          outputs: type=oci,dest=dist/aspen-${{ env.VERSION }}-image.oci.tar
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+            dist/aspen.rb
+            dist/*.tgz
+            dist/*.oci.tar
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [plan, assemble]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push the image
+        run: |
+          skopeo copy --all "oci-archive:dist/aspen-$VERSION-image.oci.tar" "docker://$IMAGE:v$VERSION"
+          case "$VERSION" in *-*) ;; *) skopeo copy --all "docker://$IMAGE:v$VERSION" "docker://$IMAGE:latest" ;; esac
+      - name: push the chart
+        env:
+          # Through the environment, never interpolated into the script.
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          .github/scripts/install-tool.sh helm "$RUNNER_TEMP/bin"
+          printf '%s' "$REGISTRY_TOKEN" | "$RUNNER_TEMP/bin/helm" registry login ghcr.io -u "$ACTOR" --password-stdin
+          "$RUNNER_TEMP/bin/helm" push dist/aspen-*.tgz "oci://ghcr.io/$OWNER/charts"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" --verify-tag --title "Aspen $VERSION" --generate-notes \
+            dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS dist/aspen.rb
+      # The formula is attached to the release. Pushing it to a tap repository
+      # needs a token for that repository; add the step once the tap exists.

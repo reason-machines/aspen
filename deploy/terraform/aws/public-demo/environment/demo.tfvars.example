@@ -1,0 +1,25 @@
+# The public demo: copy to demo.tfvars (ignored by git) and fill in from the
+# account stack's outputs. Bring it up only after staging passed the smoke
+# test (../README.md).
+#
+#   terraform init -reconfigure -backend-config=demo.backend.hcl
+#   terraform plan -var-file=demo.tfvars -out=demo.tfplan
+
+aws_account_id  = "123456789012"
+environment     = "demo"
+base_domain     = "aspen.example.com"     # the account zone_name itself
+route53_zone_id = "Z0000000000000000000"  # account output zone_id
+
+ecr_repository_arns = [
+  "arn:aws:ecr:us-east-1:123456789012:repository/aspen",
+  "arn:aws:ecr:us-east-1:123456789012:repository/aspen-place",
+]
+
+# aspen_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen:v0.1.0"
+# place_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen-place:v0.1.0"
+
+# First start with the swarm and ambient agents stopped; an operator
+# releases the kill switch once the dashboards are watched.
+place_kill_switch = true
+
+enable_ssh = false

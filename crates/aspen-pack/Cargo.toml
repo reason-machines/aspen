@@ -1,0 +1,28 @@
+[package]
+name = "aspen-pack"
+description = "Pack ingest (receive, thin-pack completion, .idx v2, entry table, forward-base repair), object scans for commit extraction and connectivity, and the deduplicating stitcher."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+# Exact versions: the gix-* crates are pre-1.0, so upgrades are deliberate
+# (decisions log, S4).
+gix-pack = { version = "=0.77.0", default-features = false, features = ["streaming-input", "parallel", "sha1"] }
+gix-hash = { version = "=0.28.1", features = ["sha1"] }
+gix-object = "=0.66.1"
+gix-utils = { version = "=0.5.2", features = ["progress"] }
+gix-error = "=0.5.2"
+gix-zlib = "=0.4.0"
+crc32fast = "1"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

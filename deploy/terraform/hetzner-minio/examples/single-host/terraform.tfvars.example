@@ -1,0 +1,6 @@
+domain_name           = "git.example.com"
+acme_email            = "ops@example.com"
+aspen_image           = "ghcr.io/reason-machines/aspen:v0.1.0"
+admin_ssh_public_keys = ["ssh-ed25519 AAAA... you@laptop"]
+admin_cidrs           = ["203.0.113.4/32"]
+# dns_zone            = "example.com"

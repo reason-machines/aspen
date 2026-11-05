@@ -1,0 +1,105 @@
+# Written by the Aspen Hetzner Terraform module (deploy/terraform/hetzner-minio).
+# Secrets come from ${data_dir}/.env, generated on this server at first boot.
+name: aspen
+
+services:
+  caddy:
+    image: ${caddy_image}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - /opt/aspen/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${data_dir}/caddy:/data
+    depends_on:
+      aspen:
+        condition: service_healthy
+    restart: unless-stopped
+
+  aspen:
+    image: ${aspen_image}
+    command: ["serve"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # The push spool: the data volume, a real disk.
+      - ${data_dir}/spool:/var/lib/aspen/spool
+      - /opt/aspen/policy.json:/etc/aspen/policy.json:ro
+    environment:
+      ASPEN_LISTEN: 0.0.0.0:7070
+      ASPEN_PUBLIC_URL: https://${domain_name}
+      # Caddy appends the client address to X-Forwarded-For.
+      ASPEN_TRUSTED_PROXY_HOPS: "1"
+      ASPEN_POLICY_FILE: /etc/aspen/policy.json
+      ASPEN_LIMITS: ${jsonencode(limits_json)}
+      ASPEN_SPOOL_DIR: /var/lib/aspen/spool
+      DATABASE_URL: postgres://aspen@postgres:5432/aspen?sslmode=disable
+      PGPASSWORD: $${POSTGRES_PASSWORD:?missing}
+      ASPEN_BLOB_URL: s3://aspen-packs
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: aspen
+      AWS_SECRET_ACCESS_KEY: $${ASPEN_S3_SECRET_KEY:?missing}
+      # MinIO is not reachable from clients, so packs go inline.
+      ASPEN_PACKFILE_URIS: "false"
+    healthcheck:
+      test: ["CMD", "aspen", "healthcheck", "--url", "http://127.0.0.1:7070/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    image: ${postgres_image}
+    environment:
+      POSTGRES_USER: aspen
+      POSTGRES_DB: aspen
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD:?missing}
+    volumes:
+      - ${data_dir}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "aspen", "-d", "aspen", "-h", "127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  minio:
+    image: ${minio_image}
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: aspen-admin
+      MINIO_ROOT_PASSWORD: $${MINIO_ROOT_PASSWORD:?missing}
+    volumes:
+      - ${data_dir}/minio:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  minio-init:
+    image: ${minio_image}
+    entrypoint: ["/bin/sh", "/minio-init.sh"]
+    environment:
+      MINIO_ROOT_USER: aspen-admin
+      MINIO_ROOT_PASSWORD: $${MINIO_ROOT_PASSWORD:?missing}
+      ASPEN_BUCKET: aspen-packs
+      ASPEN_S3_ACCESS_KEY: aspen
+      ASPEN_S3_SECRET_KEY: $${ASPEN_S3_SECRET_KEY:?missing}
+      MC_CONFIG_DIR: /tmp/mc
+    volumes:
+      - /opt/aspen/minio-init.sh:/minio-init.sh:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"

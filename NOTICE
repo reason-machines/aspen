@@ -1,0 +1,18 @@
+Aspen
+Copyright 2026 Reason Machines and the Aspen authors
+
+This product is licensed under the Apache License, Version 2.0 (see the
+LICENSE file in this repository).
+
+This product includes third-party material, which keeps its own license:
+
+- crates/aspen-pack/src/tests/data/sha1-collision/sha-mbles-1.bin and
+  sha-mbles-2.bin: the "SHA-1 is a Shambles" chosen-prefix collision by
+  Gaëtan Leurent and Thomas Peyrin (https://sha-mbles.github.io/), copied
+  byte for byte from the test data of the sha1dc crate, version 0.1.5,
+  licensed MIT OR Apache-2.0. See the README.md in that directory.
+
+Dependencies fetched at build time (Rust crates, npm packages, Go modules,
+container images) are not part of this repository and are covered by their
+own licenses; `cargo deny check licenses` (deny.toml) lists the licenses
+Aspen's Rust dependency graph may use.

@@ -1,0 +1,27 @@
+[package]
+name = "aspen-proto"
+description = "Git wire protocol for Aspen: pkt-line, side-band, capabilities, v0/v1 receive-pack, v2 ls-refs/fetch and v0 upload-pack. No I/O beyond std::io::Read."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Isolated `git` invocations for the interop test against stock clients.
+aspen-testkit = { path = "../../testkit" }
+tempfile.workspace = true
+
+# The interop test re-executes its own binary as the server end of git's
+# `ext::` transport, so it needs its own `main` (see tests/interop.rs).
+[[test]]
+name = "interop"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,54 @@
+[package]
+name = "aspen-cli"
+description = "The `aspen` command-line tool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aspen"
+path = "src/main.rs"
+
+[dependencies]
+aspen-auth = { path = "../aspen-auth" }
+aspen-blob = { path = "../aspen-blob" }
+aspen-compact = { path = "../aspen-compact" }
+aspen-core = { path = "../aspen-core" }
+aspen-express = { path = "../aspen-express" }
+aspen-meta = { path = "../aspen-meta" }
+aspen-mirror = { path = "../aspen-mirror" }
+aspen-pack = { path = "../aspen-pack" }
+aspen-server = { path = "../aspen-server" }
+# HTTP/2 too: platforms such as Cloud Run cap HTTP/1 request bodies (32 MiB)
+# but not cleartext HTTP/2 (h2c) ones, and a push is one request body.
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+clap = { workspace = true, features = ["env"] }
+# A fresh signing key for `aspen dev`'s local blob URLs.
+getrandom = "0.4"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+# The process's effective group, for the secret-file permission check
+# (`secret_file`); safe bindings, as the workspace forbids `unsafe`.
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `/readyz` runs `SELECT 1` on the metadata store's pool.
+sqlx = { workspace = true, features = ["any"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json", "ansi"] }
+url = "2"
+
+[dev-dependencies]
+aspen-testkit = { path = "../../testkit" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

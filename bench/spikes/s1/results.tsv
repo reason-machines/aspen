@@ -1,0 +1,1009 @@
+client	version	config	protocol_configured	protocol_observed	transport	variant	scenario	expect	outcome	idx_duplicates	thin_pack_requested	ofs_delta_requested	caps	detail
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	error: bad object type 5
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	error: bad object type 5
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: object 145ee45bc15d09a68d7b3090789e2c620ab997fc tried to add buffer twice!
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: object da566ab8cde79c1fcc568e8bf007cd6c649332c6 tried to add buffer twice!
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: object 145ee45bc15d09a68d7b3090789e2c620ab997fc tried to add buffer twice!
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: object e50f07b0d131c1d6605633a3676b3707688bff42 tried to add buffer twice!
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	fatal: object 3c2f972a24822739d62435b29d6baa475aa5dcae tried to add buffer twice!
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.30.9	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: object 145ee45bc15d09a68d7b3090789e2c620ab997fc tried to add buffer twice!
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: object da566ab8cde79c1fcc568e8bf007cd6c649332c6 tried to add buffer twice!
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: object 145ee45bc15d09a68d7b3090789e2c620ab997fc tried to add buffer twice!
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: object e50f07b0d131c1d6605633a3676b3707688bff42 tried to add buffer twice!
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: object 3c2f972a24822739d62435b29d6baa475aa5dcae tried to add buffer twice!
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.30.9	git-2.30.9 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	error: bad object type 5
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.39.5	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.39.5	git-2.39.5 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	error: bad object type 5
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.43.7	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.43.7	git-2.43.7 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	error: bad object type 5
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.47.3	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 216481 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 418958 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 209648 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 113258 already resolved (duplicate base 3c2f972a24822739d62435b29d6baa475aa5dcae?)
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: REF_DELTA at offset 338 already resolved (duplicate base e50f07b0d131c1d6605633a3676b3707688bff42?)
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.47.3	git-2.47.3 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-exact	?	ACCEPT	45	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-clone	?	ACCEPT	19	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch	?	ACCEPT	3	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+naive	reject	CORRUPT	12	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack	v0	v0	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 09e0da261a25b924b396d0dc51431f6ea67be339 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 3c2f972a24822739d62435b29d6baa475aa5dcae appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 index-pack fsck	v0	v0	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	error: bad object type 5
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects	v0	v0	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 09e0da261a25b924b396d0dc51431f6ea67be339 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 3c2f972a24822739d62435b29d6baa475aa5dcae appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v0 unpack-objects fsck	v0	v0	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.56.0-Linux	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-exact	?	ACCEPT	45	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-thin	?	ACCEPT	18	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-clone	?	ACCEPT	19	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch	?	ACCEPT	3	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+naive	reject	CORRUPT	12	True	True	thin-pack no-progress ofs-delta done	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack	v2	v2	pipe	index-pack	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 09e0da261a25b924b396d0dc51431f6ea67be339 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 3c2f972a24822739d62435b29d6baa475aa5dcae appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 index-pack fsck	v2	v2	pipe	index-pack +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	error: bad object type 5
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+naive	reject	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects	v2	v2	pipe	unpack-objects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-single	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	control-bad-count	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: pack has bad object at offset 222719: unknown object type 5
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 09e0da261a25b924b396d0dc51431f6ea67be339 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0e380081b191bfe8287948760443ee221fb59ae7 appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single	?	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch	?	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 3c2f972a24822739d62435b29d6baa475aa5dcae appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+naive	reject	REJECT	0	True	True	thin-pack no-progress ofs-delta done	fatal: The same object 0ad59765fcc19b79a7f371234d95f893ccbb779c appears twice in the pack
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+git	2.56.0	git-2.56.0 v2 unpack-objects fsck	v2	v2	pipe	unpack-objects +fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	thin-pack no-progress ofs-delta done	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	control-single	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	control-bad-count	reject	REJECT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	error: org.eclipse.jgit.api.errors.TransportException: Unknown object type 5.: org.eclipse.jgit.errors.TransportException: Unknown object type 5.: java.io.IOException: Unknown object type 5.
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	clone-3seg	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	thin-2seg	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	reverse-order	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	overfetch-have	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-overlap	?	ACCEPT	18	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-exact	?	ACCEPT	45	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-thin	?	ACCEPT	18	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-single	?	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-clone	?	ACCEPT	19	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-fetch	?	ACCEPT	3	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-thin+naive	reject	CORRUPT	14	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	reverse-order+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-overlap+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-exact+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	dup-thin+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-single+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-clone+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	sc-fetch+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0	v0	v0	http	default	thin-2seg+bases	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	control-single	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	control-bad-count	reject	REJECT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	error: org.eclipse.jgit.api.errors.TransportException: Unknown object type 5.: org.eclipse.jgit.errors.TransportException: Unknown object type 5.: java.io.IOException: Unknown object type 5.
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	reverse-order	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-overlap	?	ACCEPT	18	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-exact	?	ACCEPT	45	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-thin	?	ACCEPT	18	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-single	?	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-clone	?	ACCEPT	19	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-fetch	?	ACCEPT	3	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-thin+naive	reject	CORRUPT	14	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v0 fsck	v0	v0	http	+fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	no-progress ofs-delta multi_ack_detailed thin-pack side-band-64k agent=JGit/7.8.0.202609011348-r	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	control-single	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	control-bad-count	reject	REJECT	0	True	True	no-progress ofs-delta thin-pack done	error: org.eclipse.jgit.api.errors.TransportException: Unknown object type 5.: org.eclipse.jgit.errors.TransportException: Unknown object type 5.: java.io.IOException: Unknown object type 5.
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	clone-3seg	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	thin-2seg	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	reverse-order	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	overfetch-have	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-overlap	?	ACCEPT	18	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-exact	?	ACCEPT	45	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-thin	?	ACCEPT	18	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-single	?	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-clone	?	ACCEPT	19	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-fetch	?	ACCEPT	3	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-thin+naive	reject	CORRUPT	14	True	True	no-progress ofs-delta thin-pack done	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	reverse-order+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-overlap+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-exact+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	dup-thin+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-single+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-clone+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	sc-fetch+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2	v2	v2	http	default	thin-2seg+bases	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	control-single	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	control-bad-count	reject	REJECT	0	True	True	no-progress ofs-delta thin-pack done	error: org.eclipse.jgit.api.errors.TransportException: Unknown object type 5.: org.eclipse.jgit.errors.TransportException: Unknown object type 5.: java.io.IOException: Unknown object type 5.
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	clone-3seg	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	thin-2seg	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	reverse-order	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	overfetch-have	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-overlap	?	ACCEPT	18	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-exact	?	ACCEPT	45	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-thin	?	ACCEPT	18	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-single	?	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-clone	?	ACCEPT	19	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-fetch	?	ACCEPT	3	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-thin+naive	reject	CORRUPT	14	True	True	no-progress ofs-delta thin-pack done	fsck: fsck ran out of memory (limit 4 GiB): fatal: Out of memory, realloc failed
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	reverse-order+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-overlap+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-exact+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	dup-thin+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-single+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-clone+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	sc-fetch+topo	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+jgit	7.8.0.202609011348-r	jgit v2 fsck	v2	v2	http	+fsckObjects	thin-2seg+bases	accept	ACCEPT	0	True	True	no-progress ofs-delta thin-pack done	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	control-single	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	control-bad-count	reject	REJECT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	error: Failed to consume the pack sent by the remote: Failed to write the received pack: An IO operation failed while streaming an entry: Object type 5 is unsupported
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	clone-3seg	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	thin-2seg	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	reverse-order	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	overfetch-have	accept	ACCEPT	19	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-overlap	?	ACCEPT	18	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-exact	?	ACCEPT	45	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-thin	?	ACCEPT	30	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-single	?	ACCEPT	12	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-clone	?	ACCEPT	19	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-fetch	?	ACCEPT	19	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-thin+naive	reject	ACCEPT	20	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-single+topo	accept	ACCEPT	12	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	sc-fetch+topo	accept	ACCEPT	14	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v1	v1	v0	http	default	thin-2seg+bases	accept	ACCEPT	16	True	True	thin-pack side-band-64k ofs-delta multi_ack_detailed agent=git/oxide-0.90.0 include-tag	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	control-single	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	control-bad-count	reject	REJECT	0	True	True	thin-pack ofs-delta include-tag done	error: Failed to consume the pack sent by the remote: Failed to write the received pack: An IO operation failed while streaming an entry: Object type 5 is unsupported
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	clone-3seg	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	thin-2seg	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	reverse-order	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	overfetch-have	accept	ACCEPT	19	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-overlap	?	ACCEPT	18	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-exact	?	ACCEPT	45	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-thin	?	ACCEPT	30	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-single	?	ACCEPT	12	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-clone	?	ACCEPT	19	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-fetch	?	ACCEPT	19	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-thin+naive	reject	ACCEPT	20	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	reverse-order+topo	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-overlap+topo	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-exact+topo	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	dup-thin+topo	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-single+topo	accept	ACCEPT	12	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-clone+topo	accept	ACCEPT	0	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	sc-fetch+topo	accept	ACCEPT	14	True	True	thin-pack ofs-delta include-tag done	
+gitoxide	gix 0.90.0	gitoxide v2	v2	v2	http	default	thin-2seg+bases	accept	ACCEPT	16	True	True	thin-pack ofs-delta include-tag done	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	control-single	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	control-bad-count	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: early EOF; class=Indexer (15)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	clone-3seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	thin-2seg	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	reverse-order	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	overfetch-have	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-overlap	?	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: duplicate object 145ee45bc15d09a68d7b3090789e2c620ab997fc found in pack; class=Indexer (15)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-exact	?	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: duplicate object da566ab8cde79c1fcc568e8bf007cd6c649332c6 found in pack; class=Indexer (15)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-thin	?	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: duplicate object 145ee45bc15d09a68d7b3090789e2c620ab997fc found in pack; class=Indexer (15)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-single	?	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-clone	?	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: duplicate object e50f07b0d131c1d6605633a3676b3707688bff42 found in pack; class=Indexer (15)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-fetch	?	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	ran out of memory (capped at 4 GiB): error: Out of memory; class=NoMemory (1)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-thin+naive	reject	REJECT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	error: failed to init zlib stream on unpack; class=Zlib (5)
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	reverse-order+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-overlap+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-exact+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	dup-thin+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-single+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-clone+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	sc-fetch+topo	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+libgit2	git2 0.21.0 (libgit2-sys 0.18.8+1.9.7)	libgit2	default	v0	http	default	thin-2seg+bases	accept	ACCEPT	0	True	True	multi_ack_detailed side-band-64k include-tag thin-pack ofs-delta	
+go-git	v5.19.3	go-git	default	v0	http	default	control-single	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	control-bad-count	reject	REJECT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	error: zlib reset error: zlib: invalid header
+go-git	v5.19.3	go-git	default	v0	http	default	clone-3seg	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	thin-2seg	accept	REJECT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	error: reference delta not found
+go-git	v5.19.3	go-git	default	v0	http	default	reverse-order	accept	REJECT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	error: reference delta not found
+go-git	v5.19.3	go-git	default	v0	http	default	overfetch-have	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	dup-overlap	?	CORRUPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	fsck: error: packfile .git/objects/pack/pack-30c20619b08a86f7baa092bcecc3f91a6f7f100e.pack claims to have 91 objects while index indicates 73 objects
+go-git	v5.19.3	go-git	default	v0	http	default	dup-exact	?	CORRUPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	fsck: error: packfile .git/objects/pack/pack-d948af78734a67fde17251af1876a4905d0282d4.pack claims to have 118 objects while index indicates 73 objects
+go-git	v5.19.3	go-git	default	v0	http	default	dup-thin	?	REJECT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	error: reference delta not found
+go-git	v5.19.3	go-git	default	v0	http	default	sc-single	?	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	sc-clone	?	CORRUPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	fsck: error: packfile .git/objects/pack/pack-811fc79fee95f9640f3bc69ac16eb82e8157e854.pack claims to have 92 objects while index indicates 73 objects
+go-git	v5.19.3	go-git	default	v0	http	default	sc-fetch	?	CORRUPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	fsck: error: packfile .git/objects/pack/pack-2da9e837a8253dbb0c0cc629e34ad4787cff90f6.pack claims to have 47 objects while index indicates 44 objects
+go-git	v5.19.3	go-git	default	v0	http	default	dup-thin+naive	reject	REJECT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	error: reference delta not found
+go-git	v5.19.3	go-git	default	v0	http	default	reverse-order+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	dup-overlap+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	dup-exact+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	dup-thin+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	sc-single+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	sc-clone+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	sc-fetch+topo	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	
+go-git	v5.19.3	go-git	default	v0	http	default	thin-2seg+bases	accept	ACCEPT	0	False	True	side-band-64k ofs-delta agent=go-git/5.x no-progress	

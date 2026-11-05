@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#e8ebe5" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#131a18" media="(prefers-color-scheme: dark)" />
+    <meta
+      name="description"
+      content="A shared pixel canvas where every brush stroke is a git push. Paint here, or clone the repository and push a tile."
+    />
+    <title>place: every brush stroke is a git push</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect width='2' height='2' fill='%23e3a21a'/%3E%3Crect x='2' y='2' width='2' height='2' fill='%231c2b27'/%3E%3Crect x='2' width='2' height='2' fill='%23d6262b'/%3E%3Crect y='2' width='2' height='2' fill='%233690ea'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <a class="skip" href="#canvas">Skip to the canvas</a>
+    <header class="masthead">
+      <div class="brand">
+        <h1 class="wordmark">place</h1>
+        <p class="tagline">Every brush stroke is a <code>git push</code> to your own branch.</p>
+      </div>
+      <nav class="masthead-links" aria-label="Elsewhere">
+        <span id="dashboard-slot"></span>
+      </nav>
+    </header>
+
+    <main class="layout">
+      <section class="stage" aria-labelledby="stage-title">
+        <h2 id="stage-title" class="visually-hidden">Canvas</h2>
+        <div class="statline" aria-live="off">
+          <span class="conn" id="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span id="conn-text">Connecting</span></span>
+          <span class="stat"><b id="stat-rate">0</b> pushes/s</span>
+          <span class="stat"><b id="stat-branches">0</b> branches in flight</span>
+          <span class="stat"><b id="stat-pending">0</b> tiles waiting to merge</span>
+          <span class="stat main-commit">main at <code id="stat-main">-------</code>, merged <span id="stat-merge">-</span></span>
+        </div>
+
+        <div class="plat" id="plat">
+          <div class="ruler ruler-x" id="ruler-x" aria-hidden="true"></div>
+          <div class="ruler ruler-y" id="ruler-y" aria-hidden="true"></div>
+          <div class="canvas-frame" id="canvas-frame">
+            <!-- biome-ignore lint/a11y/noInteractiveElementToNoninteractiveRole: the canvas takes arrow keys itself, which is what role=application tells screen readers -->
+            <canvas
+              id="canvas"
+              tabindex="0"
+              role="application"
+              aria-roledescription="pixel canvas"
+              aria-label="Pixel canvas. Arrow keys move the cursor, Space paints the tile, Enter pushes your stroke, Escape discards it."
+              aria-describedby="cursor-readout"
+            ></canvas>
+            <div class="loading" id="loading">Loading the canvas</div>
+          </div>
+        </div>
+
+        <div class="canvas-bar">
+          <p class="readout" id="cursor-readout" aria-live="polite">Point at a tile to see its file.</p>
+          <div class="view-tools">
+            <label class="switch"><input type="checkbox" id="show-branches" checked /> <span>Show unmerged branches</span></label>
+            <fieldset class="seg">
+              <legend class="visually-hidden">Zoom</legend>
+              <label><input type="radio" name="zoom" value="1" checked /><span>Fit</span></label>
+              <label><input type="radio" name="zoom" value="2" /><span>2×</span></label>
+              <label><input type="radio" name="zoom" value="4" /><span>4×</span></label>
+            </fieldset>
+            <fieldset class="seg" id="tool-group" hidden>
+              <legend class="visually-hidden">Tool</legend>
+              <label><input type="radio" name="tool" value="brush" checked /><span>Paint</span></label>
+              <label><input type="radio" name="tool" value="move" /><span>Move</span></label>
+            </fieldset>
+          </div>
+        </div>
+        <p class="legend">
+          <span><span class="key key-main" aria-hidden="true"></span>On <code>main</code></span>
+          <span><span class="key key-branch" aria-hidden="true"></span>Pushed to a branch, merged every <span id="merge-every">few</span> s</span>
+          <span><span class="key key-own" aria-hidden="true"></span>Your branch</span>
+        </p>
+      </section>
+
+      <aside class="rail">
+        <section class="panel paint" aria-labelledby="paint-title">
+          <h2 id="paint-title">Paint</h2>
+          <fieldset class="palette-set">
+            <legend class="visually-hidden">Color</legend>
+            <div class="palette" id="palette"></div>
+          </fieldset>
+          <div class="branch-line">
+            <span class="branch-label">Your branch</span>
+            <code id="own-branch" class="own-branch">creating…</code>
+          </div>
+          <div class="stroke-line">
+            <button type="button" class="btn btn-push" id="push-btn" disabled>Push stroke</button>
+            <span id="stroke-count" class="stroke-count">Draw on the canvas. Each stroke is pushed when you lift the brush.</span>
+          </div>
+          <div class="quota" id="quota">
+            <div class="meter" aria-hidden="true"><span id="quota-fill"></span></div>
+            <p id="quota-text">Quota loads with your branch.</p>
+          </div>
+          <p class="status" id="paint-status" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="panel git" aria-labelledby="git-title">
+          <h2 id="git-title">Or push from a terminal</h2>
+          <p>It is a real repository. Each tile is a file holding one color.</p>
+          <ol class="steps" id="git-steps"></ol>
+          <details class="format">
+            <summary>Tile file rules</summary>
+            <ul>
+              <li>Path <code>tiles/&lt;x&gt;_&lt;y&gt;.txt</code>, with <span id="rule-range">x and y from 0</span>.</li>
+              <li>Contents: exactly <code>#rrggbb</code> in lowercase plus one newline, 8 bytes, using a palette color.</li>
+              <li>Regular files only. No other paths, no deletions, no merge commits.</li>
+              <li>Push to any branch except <code>main</code>; the merger bot folds it in. Up to <span id="rule-tiles">64</span> tiles per push.</li>
+            </ul>
+          </details>
+        </section>
+
+        <section class="panel swarm" aria-labelledby="swarm-title" id="swarm-panel" data-state="idle">
+          <h2 id="swarm-title">Load test</h2>
+          <button type="button" class="btn btn-swarm" id="swarm-btn">Unleash 1,000 agents</button>
+          <p class="swarm-state" id="swarm-state" role="status" aria-live="polite">Checking the swarm…</p>
+          <p class="swarm-limits" id="swarm-limits"></p>
+        </section>
+
+        <section class="panel feed" aria-labelledby="feed-title">
+          <h2 id="feed-title">Live pushes</h2>
+          <ol class="feed-list" id="feed" role="log" aria-live="off" aria-relevant="additions"></ol>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <p>
+        Served by <a href="https://github.com/reason-machines/aspen">Aspen</a>, a Git server built for many concurrent
+        writers. Branches run in parallel; only <code>main</code> is merged.
+      </p>
+    </footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

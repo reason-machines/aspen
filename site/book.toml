@@ -1,0 +1,13 @@
+# The Aspen documentation site. Build it with `python3 site/build.py`, which
+# stages the pages (site/src plus the reference documents under docs/ and
+# deploy/) into site/target/book and runs mdBook there; do not run
+# `mdbook build site` directly, since the reference pages would be missing.
+[book]
+title = "Aspen"
+description = "A self-hostable Git server for agent-scale traffic"
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/reason-machines/aspen"
+no-section-label = true

@@ -1,0 +1,25 @@
+# Staging: copy to staging.tfvars (ignored by git) and fill in from the
+# account stack's outputs. See ../README.md.
+#
+#   terraform init -reconfigure -backend-config=staging.backend.hcl
+#   terraform plan -var-file=staging.tfvars -out=staging.tfplan
+
+aws_account_id  = "123456789012"
+environment     = "staging"
+base_domain     = "staging.aspen.example.com"  # staging.<account zone_name>
+route53_zone_id = "Z0000000000000000000"       # account output zone_id
+
+ecr_repository_arns = [
+  "arn:aws:ecr:us-east-1:123456789012:repository/aspen",
+  "arn:aws:ecr:us-east-1:123456789012:repository/aspen-place",
+]
+
+# Leave both unset for the first apply: the placeholder answers health
+# checks while DNS and certificates settle. Then pin the images you copied.
+# aspen_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen:v0.1.0"
+# place_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen-place:v0.1.0"
+
+# Staging tests SSH too, and can be destroyed without ceremony.
+enable_ssh             = true
+db_deletion_protection = false
+bucket_force_destroy   = true

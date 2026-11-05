@@ -1,0 +1,67 @@
+# D1: a long chaos run on demand (tests/chaos/README.md). Not scheduled:
+# each run spends hosted-runner minutes, and a GitHub-hosted job stops at
+# 6 hours, so the launch gate's 24-hour run belongs on a dedicated host
+# (`aspen-chaos run --scenario mixed --duration 24h`, see the README).
+name: Chaos soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Scenario (aspen-chaos scenarios); not all, which would run the duration once per scenario"
+        default: mixed
+      minutes:
+        description: "How long to run, in minutes (at most 330)"
+        default: "60"
+      seed:
+        description: "Seed (empty for a random one)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  soak:
+    name: chaos soak (${{ inputs.scenario }}, ${{ inputs.minutes }} min)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the inputs
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MINUTES" in ''|*[!0-9]*) echo "minutes must be a number" >&2; exit 1;; esac
+          [ "$MINUTES" -le 330 ] || { echo "at most 330 minutes on a hosted runner" >&2; exit 1; }
+          # --duration applies to each scenario in turn, so `all` would run
+          # nine times as long and hit the job's timeout. Use one scenario
+          # (`mixed` interleaves every fault) or the nightly job.
+          case "$SCENARIO" in
+            all) echo "choose one scenario; 'all' runs the duration once per scenario" >&2; exit 1;;
+            ''|*[!a-z]*) echo "scenario must be a scenario name" >&2; exit 1;;
+          esac
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start MinIO
+        run: crates/aspen-blob/scripts/test-minio.sh
+      - run: cargo build --locked --release -p aspen-cli -p aspen-chaos
+      - name: Run
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+          MINUTES: ${{ inputs.minutes }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          target/release/aspen-chaos run --scenario "$SCENARIO" --duration "${MINUTES}m" \
+            ${SEED:+--seed "$SEED"} --out "$RUNNER_TEMP/chaos"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: chaos-soak-logs
+          path: ${{ runner.temp }}/chaos
+          retention-days: 7
+          if-no-files-found: ignore

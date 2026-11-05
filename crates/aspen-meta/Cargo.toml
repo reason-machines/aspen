@@ -1,0 +1,29 @@
+[package]
+name = "aspen-meta"
+description = "Aspen's metadata store: the MetaStore implementation for Postgres and SQLite, and schema migrations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+# One implementation over sqlx's `Any` driver serves both dialects, so the
+# Postgres and SQLite stores cannot drift apart (see src/lib.rs). TLS is
+# rustls with the system's root certificates: the AWS deploy connects with
+# sslmode=require, and cargo deny bans OpenSSL.
+sqlx = { workspace = true, features = ["any", "migrate", "macros", "postgres", "runtime-tokio", "sqlite-bundled", "tls-rustls-ring-native-roots"] }
+
+# Already in the tree through sqlx's Tokio runtime; the transaction guard
+# uses it to spawn the rollback of a dropped write (src/tx.rs), and the
+# admission queue in front of the pool is its semaphore (src/admission.rs).
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

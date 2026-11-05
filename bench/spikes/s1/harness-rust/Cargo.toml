@@ -1,0 +1,14 @@
+[package]
+name = "s1-rust"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Spike S1: fetch a stitched pack with gitoxide (gix) and libgit2 (git2)."
+
+# Standalone: not a member of the Aspen workspace.
+[workspace]
+
+[dependencies]
+gix = { version = "0.90", default-features = false, features = ["sha1", "blocking-http-transport-reqwest"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

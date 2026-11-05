@@ -1,0 +1,26 @@
+# GitLab CE (Omnibus): nginx -> Workhorse -> Gitaly, with Rails authorizing
+# each Git request. This is the closest faithful way to benchmark Gitaly over
+# HTTP; see "GitLab and Gitaly" in bench/README.md for why a standalone
+# Gitaly is not used. Needs about 4 GB of RAM and several minutes to boot.
+name: aspen-bench-gitlab
+services:
+  gitlab:
+    image: ${GITLAB_IMAGE:-gitlab/gitlab-ce:19.5.3-ce.0}
+    shm_size: 256m
+    environment:
+      GITLAB_ROOT_PASSWORD: ${GITLAB_ROOT_PASSWORD:?run.sh sets this}
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://127.0.0.1:${BENCH_PORT:-8929}'
+        nginx['listen_port'] = 8929
+        # Only what serving Git over HTTP needs.
+        prometheus_monitoring['enable'] = false
+        registry['enable'] = false
+        gitlab_kas['enable'] = false
+        gitlab_pages['enable'] = false
+        mattermost['enable'] = false
+        # Thousands of authenticated Git requests from one IP must not trip
+        # the brute-force protection.
+        gitlab_rails['rack_attack_git_basic_auth'] = { 'enabled' => false }
+        gitlab_rails['usage_ping_enabled'] = false
+    ports:
+      - "127.0.0.1:${BENCH_PORT:-8929}:8929"

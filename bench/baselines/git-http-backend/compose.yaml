@@ -1,0 +1,10 @@
+name: aspen-bench-git-http-backend
+services:
+  git:
+    build: .
+    ports:
+      - "127.0.0.1:${BENCH_PORT:-8081}:80"
+    volumes:
+      - repos:/srv/git
+volumes:
+  repos:

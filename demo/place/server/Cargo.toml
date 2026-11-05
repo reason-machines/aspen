@@ -1,0 +1,52 @@
+[package]
+name = "aspen-place"
+description = "The back end of the `place` demo: a shared pixel canvas stored in a Git repository on Aspen, with tile rules run inside receive-pack, a merger bot and a live event feed."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aspen-place"
+path = "src/main.rs"
+
+[dependencies]
+# `aspen-place` is an application built on Aspen: a composition root like
+# aspen-server and aspen-cli (`cargo xtask check-deps`), so it may pick the
+# concrete stores.
+aspen-auth = { path = "../../../crates/aspen-auth" }
+aspen-blob = { path = "../../../crates/aspen-blob" }
+aspen-compact = { path = "../../../crates/aspen-compact" }
+aspen-core = { path = "../../../crates/aspen-core" }
+aspen-meta = { path = "../../../crates/aspen-meta" }
+aspen-pack = { path = "../../../crates/aspen-pack" }
+aspen-server = { path = "../../../crates/aspen-server" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Session tokens are base64url.
+base64 = "0.22"
+bytes = "1"
+# Objects the merger bot and the web API write are deflated into a pack.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# Session tokens and branch names come from the operating system's generator.
+getrandom = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Git object IDs and the pack trailer of objects written here.
+sha1 = "0.11"
+# Session tokens are looked up by their digest.
+sha2 = "0.11"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+aspen-testkit = { path = "../../../testkit" }
+tempfile = { workspace = true }
+# `oneshot` requests against the page's router in tests.
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

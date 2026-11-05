@@ -1,0 +1,55 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "fetch-storm",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:42099/bench.git"
+  },
+  "params": {
+    "depth": 1,
+    "jobs": 1000,
+    "mode": "cold",
+    "protocol": 2,
+    "repo_source_tip": "777489f9e09c8d0dd6b12f9d90de6376330577a2",
+    "rounds": 2
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 16939364352,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793755179264,
+  "wall_seconds": 1616.653073593,
+  "latencies_ms": {
+    "fetch": {
+      "count": 2000,
+      "min": 9709.672082000001,
+      "mean": 461902.7227972888,
+      "p50": 471679.160258,
+      "p90": 783540.848943,
+      "p99": 809433.363137,
+      "max": 811073.492365
+    }
+  },
+  "throughput": {
+    "fetches_per_second": 1.2371238039061863,
+    "received_mib_per_second": 14.30283028801816
+  },
+  "counts": {
+    "fetches_ok": 2000,
+    "received_bytes": 24245923528,
+    "received_bytes_per_fetch": 12122961
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

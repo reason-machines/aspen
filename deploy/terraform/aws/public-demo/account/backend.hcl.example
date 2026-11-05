@@ -1,0 +1,9 @@
+# Remote state for the account stack. Copy to backend.hcl (ignored by git) and
+# run `terraform init -backend-config=backend.hcl`. The state bucket lives in
+# the same dedicated account (../README.md, step 2).
+
+bucket       = "REPLACE-ME-aspen-tfstate"
+key          = "public-demo/account/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

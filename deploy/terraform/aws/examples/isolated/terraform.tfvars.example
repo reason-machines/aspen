@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (ignored by git) and fill in.
+
+aws_account_id  = "123456789012"     # the dedicated Aspen account
+region          = "us-east-1"
+name            = "aspen-staging"
+domain_name     = "git.example.com"  # a subdomain you already own
+route53_zone_id = "Z0000000000000000000"
+
+budget_limit_usd    = 300
+budget_alert_emails = ["ops@example.com"]
+
+# Leave unset to run the placeholder health server.
+# container_image     = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen:0.1.0"
+# ecr_repository_arns = ["arn:aws:ecr:us-east-1:123456789012:repository/aspen"]
+
+# The pack CDN (CloudFront in front of /-/express) needs no keys from you:
+# the module generates the URL signing key into Secrets Manager.
+# enable_cdn = false

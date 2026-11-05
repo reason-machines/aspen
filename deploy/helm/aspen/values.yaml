@@ -1,0 +1,254 @@
+# Default values for the Aspen chart. Every setting maps to the
+# configuration contract in deploy/README.md; `helm install` fails with a
+# message naming the value when a required one is missing or unsafe.
+
+image:
+  repository: ghcr.io/reason-machines/aspen
+  # Defaults to v<appVersion> from Chart.yaml.
+  tag: ""
+  # Pin by digest (sha256:...) for reproducible deploys; wins over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Instances of `aspen serve`. Every instance is stateless: refs and history
+# live in PostgreSQL, packs in the bucket.
+replicaCount: 2
+
+# The URL clients use (https://git.example.com). Needed for express routes
+# that name this server, and shown in the install notes.
+publicUrl: ""
+
+database:
+  # postgres://<user>@<host>:5432/<db>?sslmode=require, WITHOUT a password.
+  # Required.
+  url: ""
+  # The password, from an existing Secret, set as PGPASSWORD. Required for
+  # PostgreSQL (create the Secret with kubectl or an external-secrets operator).
+  passwordSecret:
+    name: ""
+    key: password
+
+blob:
+  # s3://<bucket>[/<prefix>]. Required. GCS works through its S3
+  # interoperability API (deploy/README.md).
+  url: ""
+  # Plain settings for the S3 client: AWS_REGION, AWS_ENDPOINT_URL, ...
+  env: {}
+  # Static credentials from an existing Secret with the keys
+  # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Leave empty to use workload
+  # identity (IRSA, EKS Pod Identity) through serviceAccount.annotations.
+  credentialsSecret: ""
+
+# Access policy (aspen_auth::PolicyConfig): anonymous grants, OIDC issuers
+# and per-subject grants, rendered as JSON into a ConfigMap. Empty means
+# every request needs an API token (`aspen token create`).
+#   policy:
+#     anonymous: ["read:public/*"]
+#     oidc:
+#       - name: github
+#         issuer: https://token.actions.githubusercontent.com
+#         audience: https://git.example.com
+#         jwks: {...}
+#         rules:
+#           - claims: {repository_owner: acme}
+#             grants: ["write:acme/*"]
+policy: {}
+
+# Rate limits and push quotas (aspen_auth::LimitsConfig), as JSON. Request
+# rates are per caller (a token's subject, or an anonymous client address)
+# and per replica. The defaults bound what one caller can cost a server
+# strangers reach (issue #125); raise them for fleets of agents sharing one
+# token, and remove one with `--set limits.read=null`. Push quotas, e.g.
+#     quota: {max_pack_bytes: 2147483648, bytes_per_hour: 21474836480}
+limits:
+  read: {burst: 100, per_second: 20}
+  push: {burst: 20, per_second: 5}
+
+# Proxies in front of the pods that append to X-Forwarded-For (an ingress
+# controller is one). Anonymous rate limits key on the address they record.
+# Unset: 1 when ingress.enabled, else 0 (the TCP peer). Set it to the real
+# count for any other proxy chain: a value too high lets clients choose the
+# address they are limited by. By default the header is read on connections
+# from any private, shared (100.64.0.0/10) or link-local address, so any
+# other pod in the cluster, or a tailnet client, that calls the Service
+# directly can choose its address the same way. Set ASPEN_TRUSTED_PROXIES in
+# extraEnv to the ingress controller's pod CIDR (or add a NetworkPolicy that
+# lets only the controller reach the pods), and to add a proxy with public
+# addresses.
+trustedProxyHops: null
+
+# Mirror mode (docs/MIRROR.md): the credentials mirrors may name. Tokens and
+# GitHub App keys come only from Secrets (secretKeyRef); IDs must be quoted
+# strings.
+#   mirror:
+#     credentials:
+#       - name: github
+#         tokenSecret: {name: aspen-mirror-github, key: token}
+#       - name: acme-app
+#         githubApp:
+#           appId: "123456"
+#           installationId: "7890123"
+#           privateKeySecret: {name: aspen-mirror-acme-app, key: private-key}
+mirror:
+  credentials: []
+  # Seconds between sync passes of each mirror.
+  syncSeconds: 60
+
+# Packfile URIs: auto (on when the store presigns URLs or express routes are
+# set), true or false.
+packfileUris: auto
+
+# Push limits; see `aspen serve --help`. Size `resources` and the spool for
+# them: the spool holds about twice the largest push.
+push:
+  maxObjectBytes: 536870912
+  maxInflatedBytes: 8589934592
+  maxPackBytes: 8589934592
+  maxObjects: 10000000
+  prefetchMemoryBytes: 4294967296
+
+# Where pushes are spooled and completed. It must be a real disk, never
+# memory, so the chart offers only node disk (emptyDir) or a generic
+# ephemeral volume from a StorageClass.
+spool:
+  # emptyDir on the node's disk, capped at sizeLimit.
+  sizeLimit: 20Gi
+  # Use a per-pod PersistentVolumeClaim instead (recommended for large
+  # pushes): set storageClassName and size.
+  ephemeralVolume:
+    enabled: false
+    storageClassName: ""
+    size: 50Gi
+
+# Express and CDN packfile URIs (docs/EXPRESS.md).
+express:
+  # Secret with ASPEN_EXPRESS_KEYS (`id:hexsecret[,...]`) under this key.
+  # Required when any express setting below is used.
+  keysSecret:
+    name: ""
+    key: keys
+  # Base URLs of express nodes clients reach directly (ASPEN_EXPRESS_URLS).
+  # With standalone.enabled, list standalone.ingress.host's URL here
+  # (https://<host>).
+  urls: []
+  # A CDN whose origin is the express nodes (ASPEN_CDN_URL) and what it
+  # answers past the end of an object (ASPEN_CDN_PAST_END: 416 or 206).
+  cdnUrl: ""
+  cdnPastEnd: "416"
+  ttlSeconds: 600
+  windowSeconds: 300
+  # Serve /-/express from `aspen serve` itself: auto (when urls names
+  # <publicUrl>/-/express), true (a CDN's origin) or false.
+  serve: auto
+  # Standalone `aspen express` nodes with a disk cache.
+  standalone:
+    enabled: false
+    replicaCount: 2
+    cacheBytes: 10737418240
+    cacheSizeLimit: 12Gi
+    resources:
+      requests: {cpu: 250m, memory: 256Mi}
+      limits: {memory: 1Gi}
+    service:
+      type: ClusterIP
+      port: 80
+    # Express URLs are signed path segments under the node's root, so the
+    # nodes get their own host rather than a path on the Git host.
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      host: ""
+      tls: []
+
+# Prometheus metrics (docs/OBSERVABILITY.md) on their own port, never on
+# the Service the ingress uses. Scrape the pods directly; the annotations
+# below are for annotation-based scrape configs.
+metrics:
+  port: 9464
+  podAnnotations: true
+  # A NetworkPolicy for the server pods: Git (HTTP, and SSH when enabled)
+  # stays open to every source, the metrics port only to the peers in
+  # `from` (NetworkPolicyPeer entries; required when enabled). Needs a
+  # network plugin that enforces NetworkPolicy. For example:
+  #   from:
+  #     - namespaceSelector:
+  #         matchLabels: {kubernetes.io/metadata.name: monitoring}
+  #       podSelector:
+  #         matchLabels: {app.kubernetes.io/name: prometheus}
+  networkPolicy:
+    enabled: false
+    from: []
+
+# Git over SSH (docs/SSH.md). Clients pin the host key, so it comes from a
+# Secret (an OpenSSH private key, Ed25519 or ECDSA:
+# `ssh-keygen -t ed25519 -N '' -f host_key`), the same on every replica.
+ssh:
+  enabled: false
+  hostKeySecret:
+    name: ""
+    key: host_key
+  service:
+    # A LoadBalancer or NodePort Service gets `externalTrafficPolicy: Local`,
+    # so Aspen sees each client's address: its SSH limits key on the TCP
+    # peer. A load balancer that sends traffic straight to pod IPs bypasses
+    # that policy and must preserve client addresses itself, e.g. with the
+    # AWS Load Balancer Controller's IP targets:
+    #   service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true
+    # Aspen does not parse proxy protocol; do not enable it.
+    type: LoadBalancer
+    port: 22
+    annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  # For workload identity, e.g.
+  # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/aspen
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  # Long clones need generous proxy timeouts and no body-size limit, for
+  # example with ingress-nginx:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  annotations: {}
+  host: ""
+  tls: []
+
+resources:
+  requests: {cpu: 500m, memory: 1Gi}
+  limits: {memory: 6Gi}
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Long clones and pushes finish before the pod is stopped, up to this long.
+terminationGracePeriodSeconds: 300
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# Extra environment variables (ASPEN_LOG, ...) and sources. A name that looks
+# like a secret (*SECRET*, *TOKEN*, *PASSWORD*, *_KEY) must use valueFrom,
+# never a plain value.
+extraEnv: []
+extraEnvFrom: []

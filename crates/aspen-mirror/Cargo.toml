@@ -1,0 +1,39 @@
+[package]
+name = "aspen-mirror"
+description = "Mirror mode: Aspen in front of GitHub, GitLab or any smart-HTTP Git server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+# pkt-lines and side-band for the client side of the protocol.
+aspen-proto = { path = "../aspen-proto" }
+# Basic credentials, and GitHub App JWTs (base64url) and PEM keys.
+base64 = "0.22"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# The upstream client: the same reqwest build aspen-blob and aspen-express
+# use (rustls on `ring`, system roots); `stream` streams packs both ways.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+# GitHub App JWTs are RS256, signed with ring (already in the tree through
+# rustls); see the B3 decisions row on why not jsonwebtoken.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = { workspace = true }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
+
+[dev-dependencies]
+# Job-queue tests run the service against the real SQLite store (issue #188).
+aspen-meta = { path = "../aspen-meta" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

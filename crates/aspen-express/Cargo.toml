@@ -1,0 +1,33 @@
+[package]
+name = "aspen-express"
+description = "Aspen's pack express: signed, immutable, cacheable packfile-URI downloads served from a regional disk cache in front of the blob store, with consistent-hash routing and CDN mode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+hmac = "0.13"
+# Health probes of express nodes and CDN edges. The same reqwest build
+# aspen-blob uses (rustls on `ring`, system roots), so it adds no new crates.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha1 = "0.11"
+sha2 = "0.11"
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# Tests serve from a real local blob store.
+aspen-blob = { path = "../aspen-blob" }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[lints]
+workspace = true

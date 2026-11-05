@@ -1,0 +1,12 @@
+# Written by the Aspen Hetzner Terraform module. TLS from Let's Encrypt,
+# HTTP/2 and HTTP/3 to clients, plain HTTP to Aspen on the compose network.
+{
+	email ${acme_email}
+}
+
+${domain_name} {
+	reverse_proxy aspen:7070 {
+		# Stream clone and push bodies as they come.
+		flush_interval -1
+	}
+}

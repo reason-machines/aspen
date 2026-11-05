@@ -1,0 +1,19 @@
+Aspen {{ .Chart.AppVersion }} is starting as {{ include "aspen.fullname" . }} ({{ .Values.replicaCount }} replicas).
+
+Create a repository and a token (the token is printed once):
+
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "aspen.fullname" . }} -- aspen repo create acme/app
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "aspen.fullname" . }} -- \
+    aspen token create --subject me --grant write:acme/app
+
+Then push:
+{{- if .Values.publicUrl }}
+
+  git push https://me:<token>@{{ trimPrefix "https://" (trimPrefix "http://" .Values.publicUrl) }}/acme/app.git main
+{{- else }}
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "aspen.fullname" . }} 7070:{{ .Values.service.port }}
+  git push http://me:<token>@127.0.0.1:7070/acme/app.git main
+{{- end }}
+
+Check it with: helm test -n {{ .Release.Namespace }} {{ .Release.Name }}

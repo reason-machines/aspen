@@ -1,0 +1,27 @@
+[package]
+name = "aspen-compact"
+description = "Aspen's background worker: builds the cover skip list (levels 1 to 4) over each ref's version history, repacks full covers into self-contained compaction packs, writes deferred commit index rows, and garbage-collects orphaned packs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+aspen-pack = { path = "../aspen-pack" }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# Tests run the compactor against the real stores (SQLite and a local
+# directory) and check results with stock git.
+aspen-blob = { path = "../aspen-blob" }
+aspen-meta = { path = "../aspen-meta" }
+aspen-planner = { path = "../aspen-planner" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,118 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "stale-branch",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:46013/bench.git"
+  },
+  "params": {
+    "points": [
+      10,
+      100,
+      1000,
+      10000
+    ],
+    "protocol": 2,
+    "repeats": 5,
+    "repo_changes_per_commit": 50,
+    "repo_commits": 200,
+    "repo_file_bytes": 8192,
+    "repo_files": 5000,
+    "repo_seed": 1
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793753152614,
+  "wall_seconds": 314.398465783,
+  "latencies_ms": {
+    "stale_fetch_n10": {
+      "count": 5,
+      "min": 32.486965,
+      "mean": 32.9756824,
+      "p50": 32.790131,
+      "p90": 34.002776999999995,
+      "p99": 34.002776999999995,
+      "max": 34.002776999999995
+    },
+    "stale_fetch_n100": {
+      "count": 5,
+      "min": 38.134401999999994,
+      "mean": 38.4813604,
+      "p50": 38.425011000000005,
+      "p90": 38.768589999999996,
+      "p99": 38.768589999999996,
+      "max": 38.768589999999996
+    },
+    "stale_fetch_n1000": {
+      "count": 5,
+      "min": 47.435524,
+      "mean": 47.6385988,
+      "p50": 47.543743,
+      "p90": 47.931066,
+      "p99": 47.931066,
+      "max": 47.931066
+    },
+    "stale_fetch_n10000": {
+      "count": 5,
+      "min": 81.186173,
+      "mean": 81.6644288,
+      "p50": 81.67421399999999,
+      "p90": 82.046847,
+      "p99": 82.046847,
+      "max": 82.046847
+    },
+    "trunk_push": {
+      "count": 10000,
+      "min": 28.884838,
+      "mean": 31.02105941730006,
+      "p50": 30.774475,
+      "p90": 32.359814,
+      "p99": 35.140440000000005,
+      "max": 41.320145000000004
+    },
+    "trunk_push_first_tenth": {
+      "count": 1000,
+      "min": 28.884838,
+      "mean": 30.300687015000012,
+      "p50": 30.025609000000003,
+      "p90": 31.242606,
+      "p99": 34.835871,
+      "max": 40.072826
+    },
+    "trunk_push_last_tenth": {
+      "count": 1000,
+      "min": 30.072152000000003,
+      "mean": 31.42687752200001,
+      "p50": 31.047224,
+      "p90": 32.827151,
+      "p99": 35.384895,
+      "max": 39.906713
+    }
+  },
+  "throughput": {
+    "trunk_pushes_per_second": 31.925682492872898
+  },
+  "counts": {
+    "fetches_ok": 20,
+    "received_bytes.n10": 439,
+    "received_bytes.n100": 439,
+    "received_bytes.n1000": 445,
+    "received_bytes.n10000": 409,
+    "trunk_pushes": 10000
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

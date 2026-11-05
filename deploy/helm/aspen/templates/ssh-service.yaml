@@ -1,0 +1,29 @@
+{{- if .Values.ssh.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aspen.fullname" . }}-ssh
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with .Values.ssh.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.ssh.service.type }}
+  {{- if has .Values.ssh.service.type (list "LoadBalancer" "NodePort") }}
+  # Aspen's SSH limits key on the TCP peer. With `Cluster`, kube-proxy may
+  # forward through another node and replace the client's address with that
+  # node's, so every client would share one node's limits (issue #120).
+  externalTrafficPolicy: Local
+  {{- end }}
+  selector:
+    {{- include "aspen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  ports:
+    - name: ssh
+      port: {{ .Values.ssh.service.port }}
+      targetPort: ssh
+      protocol: TCP
+{{- end }}

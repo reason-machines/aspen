@@ -1,0 +1,32 @@
+{{- if .Values.metrics.networkPolicy.enabled }}
+# Git stays open to every source; the metrics port (C5: load and job
+# counters, no repository data) only to the configured scrapers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aspen.fullname" . }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aspen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  policyTypes: [Ingress]
+  # Named ports (the container's `http`, `ssh` and `metrics`), so the policy
+  # follows the Deployment's port numbers.
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+        {{- if .Values.ssh.enabled }}
+        - port: ssh
+          protocol: TCP
+        {{- end }}
+    - ports:
+        - port: metrics
+          protocol: TCP
+      from:
+        {{- toYaml .Values.metrics.networkPolicy.from | nindent 8 }}
+{{- end }}

@@ -1,0 +1,39 @@
+# Forgejo with Postgres, configured entirely through environment variables so
+# no install wizard runs. Credentials here are throwaway and local-only; the
+# benchmark user is created by target.sh with a random password.
+name: aspen-bench-forgejo
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: forgejo
+      POSTGRES_PASSWORD: forgejo
+      POSTGRES_DB: forgejo
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "forgejo"]
+      interval: 2s
+      retries: 30
+  forgejo:
+    image: ${FORGEJO_IMAGE:-codeberg.org/forgejo/forgejo:17.0.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: forgejo
+      FORGEJO__database__PASSWD: forgejo
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__server__ROOT_URL: http://127.0.0.1:${BENCH_PORT:-3001}/
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__server__START_SSH_SERVER: "false"
+      FORGEJO__server__LFS_START_SERVER: "false"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__repository__DEFAULT_BRANCH: main
+      FORGEJO__log__LEVEL: Warn
+    ports:
+      - "127.0.0.1:${BENCH_PORT:-3001}:3000"

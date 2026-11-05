@@ -1,0 +1,137 @@
+{{- if .Values.express.standalone.enabled -}}
+{{- $e := .Values.express.standalone -}}
+{{- $name := printf "%s-express" (include "aspen.fullname" .) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: express
+spec:
+  replicas: {{ $e.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aspen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: express
+  template:
+    metadata:
+      labels:
+        {{- include "aspen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: express
+    spec:
+      serviceAccountName: {{ include "aspen.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: express
+          image: {{ include "aspen.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["express"]
+          ports:
+            - name: http
+              containerPort: 7071
+              protocol: TCP
+          env:
+            - name: ASPEN_EXPRESS_LISTEN
+              value: "0.0.0.0:7071"
+            {{- include "aspen.blobEnv" . | nindent 12 }}
+            - name: ASPEN_EXPRESS_CACHE_DIR
+              value: /var/cache/aspen-express
+            - name: ASPEN_EXPRESS_CACHE_BYTES
+              value: {{ $e.cacheBytes | int64 | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /-/health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /-/health, port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml $e.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/aspen-express
+      volumes:
+        - name: cache
+          # Node disk; a lost cache only costs refills from the bucket.
+          emptyDir:
+            sizeLimit: {{ $e.cacheSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: express
+spec:
+  type: {{ $e.service.type }}
+  selector:
+    {{- include "aspen.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: express
+  ports:
+    - name: http
+      port: {{ $e.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if $e.ingress.enabled }}
+{{- if not $e.ingress.host }}
+{{- fail "express.standalone.ingress.host is required when express.standalone.ingress.enabled" }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: express
+  {{- with $e.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $e.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with $e.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $e.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}
+                port: {name: http}
+{{- end }}
+{{- end }}

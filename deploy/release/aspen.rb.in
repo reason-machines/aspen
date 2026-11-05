@@ -1,0 +1,72 @@
+# Homebrew formula for Aspen, rendered by deploy/release/release.py from the
+# release's archives and checksums. Do not edit the rendered copy by hand.
+class Aspen < Formula
+  desc "Git server for agent-scale traffic"
+  homepage "https://github.com/reason-machines/aspen"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "@URL_aarch64-apple-darwin@"
+      sha256 "@SHA256_aarch64-apple-darwin@"
+    end
+    on_intel do
+      url "@URL_x86_64-apple-darwin@"
+      sha256 "@SHA256_x86_64-apple-darwin@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "@URL_aarch64-unknown-linux-gnu@"
+      sha256 "@SHA256_aarch64-unknown-linux-gnu@"
+    end
+    on_intel do
+      url "@URL_x86_64-unknown-linux-gnu@"
+      sha256 "@SHA256_x86_64-unknown-linux-gnu@"
+    end
+  end
+
+  depends_on "git" => :test
+
+  def install
+    bin.install "aspen"
+  end
+
+  # `brew services start aspen`: a development server on 127.0.0.1:7070 with
+  # its data under Homebrew's var directory.
+  service do
+    run [opt_bin/"aspen", "dev", "--data-dir", var/"aspen"]
+    keep_alive true
+    log_path var/"log/aspen.log"
+    error_log_path var/"log/aspen.log"
+  end
+
+  test do
+    assert_match "aspen #{version}", shell_output("#{bin}/aspen --version")
+    port = free_port
+    pid = spawn bin/"aspen", "dev", "--listen", "127.0.0.1:#{port}", "--data-dir", testpath/"data"
+    begin
+      healthy = false
+      30.times do
+        healthy = system bin/"aspen", "healthcheck", "--url", "http://127.0.0.1:#{port}/readyz"
+        break if healthy
+
+        sleep 1
+      end
+      assert healthy, "aspen dev did not become ready"
+      system "git", "init", "-q", "-b", "main", "work"
+      (testpath/"work/hello.txt").write "hello\n"
+      system "git", "-C", "work", "add", "hello.txt"
+      system "git", "-C", "work", "-c", "user.name=brew", "-c", "user.email=brew@example.com",
+             "commit", "-q", "-m", "hello"
+      system "git", "-C", "work", "push", "-q", "http://127.0.0.1:#{port}/demo.git", "main"
+      system "git", "clone", "-q", "http://127.0.0.1:#{port}/demo.git", "clone"
+      assert_equal "hello\n", (testpath/"clone/hello.txt").read
+    ensure
+      Process.kill("TERM", pid)
+      Process.wait(pid)
+    end
+  end
+end

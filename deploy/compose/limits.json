@@ -1,0 +1,4 @@
+{
+  "read": {"burst": 100, "per_second": 20},
+  "push": {"burst": 20, "per_second": 5}
+}

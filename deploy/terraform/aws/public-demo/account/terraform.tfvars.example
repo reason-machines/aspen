@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (ignored by git) and fill in. See ../README.md.
+
+aws_account_id = "123456789012"      # the account dedicated to the demo
+region         = "us-east-1"
+zone_name      = "aspen.example.com" # a subdomain of a domain Reason already owns
+
+budget_limit_usd     = 300
+cdn_budget_limit_usd = 100
+budget_alert_emails  = ["ops@example.com"]

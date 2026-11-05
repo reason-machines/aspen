@@ -1,0 +1,47 @@
+[package]
+name = "aspen-fuzz"
+description = "Fuzz targets for Aspen's untrusted-input surfaces (pkt-line and the push and fetch parsers, pack ingest, verify_pack, the stitcher, the planner, the HTTP route and SSH command parsers, gzip request bodies, JWT verification), the seed-corpus generator, and the stable replay used by required CI. The libFuzzer harness lives in fuzz/libfuzzer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The library and binary have no unit tests; without these their empty
+# test binaries would still link aspen-server in required CI. The replay
+# and reach tests are the integration tests in tests/.
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "aspen-fuzz"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+aspen-core = { path = "../crates/aspen-core" }
+aspen-pack = { path = "../crates/aspen-pack" }
+aspen-planner = { path = "../crates/aspen-planner" }
+aspen-proto = { path = "../crates/aspen-proto" }
+# The HTTP and SSH front ends (issue #139). aspen-fuzz is tooling, so it may
+# depend on a composition root; `fuzzing` exposes the server's crate-private
+# SSH command parser and body readers.
+aspen-auth = { path = "../crates/aspen-auth" }
+aspen-server = { path = "../crates/aspen-server", features = ["fuzzing"] }
+# Tokens the jwt target signs, with the crates aspen-auth verifies them with.
+base64 = "0.22"
+ring = "0.17"
+serde_json.workspace = true
+# Gzip bodies for gzip_body, with the backend aspen-server reads them with.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# The same exact versions aspen-pack pins: object IDs and zlib streams for
+# the packs the targets build.
+gix-hash = { version = "=0.28.1", features = ["sha1"] }
+gix-zlib = "=0.4.0"
+tempfile.workspace = true
+
+[lints]
+workspace = true

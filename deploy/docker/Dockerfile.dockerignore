@@ -1,0 +1,11 @@
+# BuildKit reads this file for builds that use deploy/docker/Dockerfile.
+# Keep the context to what `cargo build` needs.
+**/target
+**/node_modules
+demo/place/dist
+.git
+.github
+deploy
+docs
+**/.env
+**/.terraform

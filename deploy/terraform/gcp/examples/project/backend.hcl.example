@@ -1,0 +1,2 @@
+bucket = "acme-aspen-tfstate"
+prefix = "aspen"

@@ -1,0 +1,119 @@
+# The libFuzzer harness for aspen-fuzz's targets: one thin binary per
+# target. It is its own workspace (excluded from the root one) because it
+# needs a nightly toolchain and libfuzzer-sys; required CI never builds it.
+# Run it with cargo-fuzz from the repository root, for example:
+#
+#   cargo +nightly fuzz run --fuzz-dir fuzz/libfuzzer pkt_line
+#
+# fuzz/README.md has the full instructions; fuzz/run.sh runs every target.
+
+[package]
+name = "aspen-fuzz-libfuzzer"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aspen-fuzz = { path = ".." }
+libfuzzer-sys = "=0.4.13"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "pkt_line"
+path = "fuzz_targets/pkt_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receive_request"
+path = "fuzz_targets/receive_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_command"
+path = "fuzz_targets/v2_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upload_v0"
+path = "fuzz_targets/upload_v0.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_bytes"
+path = "fuzz_targets/pack_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_ingest"
+path = "fuzz_targets/pack_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_formats"
+path = "fuzz_targets/pack_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stitch"
+path = "fuzz_targets/stitch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "planner"
+path = "fuzz_targets/planner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_route"
+path = "fuzz_targets/git_route.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_command"
+path = "fuzz_targets/ssh_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip_body"
+path = "fuzz_targets/gzip_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt"
+path = "fuzz_targets/jwt.rs"
+test = false
+doc = false
+bench = false

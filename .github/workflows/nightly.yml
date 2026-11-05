@@ -1,0 +1,298 @@
+# Slow suites, run nightly and on demand. Failures here don't block merges;
+# whoever is on point fixes them or files an issue the next morning.
+#
+# Placeholders for suites that later plan nodes add (docs/PLAN.md):
+#   - chaos suite: D1 (chaos job below; long runs in chaos-soak.yml)
+#   - fuzzing: D3
+#   - benchmarks with regression checks: A7 (bench job below), D2
+#   - compose smoke and container image build: A8 (deploy job below)
+#   - npm advisories for the place demo's dev tooling: A9 (place-audit below)
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  all-tests:
+    name: all tests, including ignored
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # depth_limit_of_old_git fails instead of skipping if the step below
+      # stops providing ASPEN_OLD_GIT.
+      ASPEN_REQUIRE_OLD_GIT: "1"
+      # aspen-pack's a_pack_over_2_gib_indexes_byte_identical_to_git needs about
+      # 7 GiB; the root disk under target/ runs out (No space left on device),
+      # so it writes to /mnt, as in the bench job.
+      ASPEN_LARGE_PACK_DIR: /mnt/aspen-large
+    steps:
+      # /mnt alone was not enough (#177): next to the whole debug workspace
+      # build, MinIO and the old-git image, the root disk still ran out while
+      # the over-2-GiB test ran. Drop preinstalled SDKs this job never uses.
+      - name: Free disk space
+        run: |
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / /mnt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start MinIO for the S3 blob store tests
+        run: crates/aspen-blob/scripts/test-minio.sh
+      # aspen-pack's depth_limit_of_old_git measures stitched delta depth
+      # against an old git (docs/PLAN.md decisions log, A2 depth row).
+      # Git is built with prefix /opt/git but runs from $RUNNER_TEMP; that is
+      # fine because the test only uses built-in commands.
+      - name: Build git 2.30.9 for ASPEN_OLD_GIT
+        run: |
+          docker build --quiet --build-arg GIT_VERSION=2.30.9 -t aspen-old-git testkit/images/git
+          id=$(docker create aspen-old-git)
+          docker cp "$id:/opt/git" "$RUNNER_TEMP/git-2.30"
+          docker rm "$id"
+          old="$RUNNER_TEMP/git-2.30/bin/git"
+          test "$("$old" --version)" = "git version 2.30.9"
+          echo "ASPEN_OLD_GIT=$old" >> "$GITHUB_ENV"
+      - run: sudo mkdir -p /mnt/aspen-large && sudo chown "$(id -u)" /mnt/aspen-large
+      - run: cargo test --workspace --locked --no-fail-fast -- --include-ignored
+      - name: Disk usage after the tests
+        if: always()
+        run: df -h / /mnt
+
+  # D1: every chaos scenario (tests/chaos/README.md) against real
+  # `aspen serve` processes on Postgres (the runner's binaries) and MinIO.
+  # Required CI runs only the short `smoke` scenario.
+  chaos:
+    name: chaos suite (every scenario)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: git --version
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start MinIO
+        run: crates/aspen-blob/scripts/test-minio.sh
+      - run: cargo build --locked --release -p aspen-cli -p aspen-chaos
+      - name: Run every scenario (3 instances, 6 clients, 2 epochs of 30 s each)
+        run: |
+          target/release/aspen-chaos run --scenario all --epochs 2 --epoch 30s \
+            --out "$RUNNER_TEMP/chaos"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: chaos-logs
+          path: ${{ runner.temp }}/chaos
+          retention-days: 7
+          if-no-files-found: ignore
+
+  interop-distro-git:
+    # The required smoke uses the latest Git; this covers the older Git that
+    # ships with the runner image.
+    name: interop smoke (runner's packaged git)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: git --version
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked -p aspen-interop --test smoke
+
+  # A1b: the v0 upload-pack interop tests against live libgit2 (pygit2) and
+  # go-git. Required CI runs only stock git live and replays the committed
+  # transcripts of the other two; here both must be present, so a missing
+  # client fails instead of being skipped.
+  interop-v0-clients:
+    name: interop v0 upload-pack (pygit2, go-git)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ASPEN_PROTO_REQUIRE_CLIENTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Client paths
+        run: |
+          echo "ASPEN_PYGIT2_PYTHON=$RUNNER_TEMP/pygit2/bin/python" >> "$GITHUB_ENV"
+          echo "ASPEN_GO_GIT_CLIENT=$RUNNER_TEMP/aspen-v0-client" >> "$GITHUB_ENV"
+      - run: git --version
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: crates/aspen-proto/tests/clients/go-git/go.mod
+          cache-dependency-path: crates/aspen-proto/tests/clients/go-git/go.sum
+      - name: Build the go-git client
+        working-directory: crates/aspen-proto/tests/clients/go-git
+        run: go build -o "$ASPEN_GO_GIT_CLIENT" .
+      - name: Install pygit2 (libgit2)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pygit2"
+          "$ASPEN_PYGIT2_PYTHON" -m pip install --quiet pygit2==1.20.1
+      - run: cargo test --locked -p aspen-proto --test interop -- v0_
+
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  # A8: docker compose smoke and the Aspen container image build. The same
+  # workflow runs on pull requests that touch deploy/.
+  deploy:
+    name: deploy
+    uses: ./.github/workflows/deploy.yml
+
+  # --- A7: benchmarks (bench/README.md) -------------------------------------
+  # Each baseline server runs in Docker on the same runner as the load
+  # generator, so these numbers catch regressions; they are not the published
+  # comparison (that is D2, on identical dedicated instances). GitLab needs
+  # ~4 GB and several minutes to boot, so it only runs on manual dispatch.
+  bench:
+    name: bench (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    # The slowest entry (forgejo; gitlab on manual runs) took 16 minutes on
+    # run 41787717247; bench/README.md ("Nightly job") has every entry's time.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["local","git-http-backend","gitea","forgejo","aspen","aspen-no-compaction","gitlab"]' || '["local","git-http-backend","gitea","forgejo","aspen","aspen-no-compaction"]') }}
+    env:
+      BENCH_PROFILE: nightly
+      BENCH_ENV: github-ubuntu-24.04
+      BENCH_OUT: ${{ github.workspace }}/bench-results/${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: git --version && docker --version && nproc && free -m
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Bring up the target, run the workloads, tear down
+        run: bench/baselines/run.sh "${{ matrix.target }}" all
+      - name: Print the results
+        if: always()
+        run: |
+          for f in "$BENCH_OUT"/*.json; do
+            [ -f "$f" ] || continue
+            echo "::group::$f"; cat "$f"; echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.target }}
+          path: bench-results/${{ matrix.target }}
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Compare with the stored baselines
+        run: bench/baselines/run.sh "${{ matrix.target }}" check
+      # D2: Aspen's .idx against git index-pack's for a pack past 2 GiB
+      # (64-bit offsets). Needs about 7 GiB of disk, so it writes to /mnt.
+      # Runs even when the baseline comparison above fails.
+      - name: .idx past 2 GiB matches git index-pack
+        if: always() && matrix.target == 'local'
+        run: |
+          sudo mkdir -p /mnt/aspen-large && sudo chown "$(id -u)" /mnt/aspen-large
+          ASPEN_LARGE_PACK_DIR=/mnt/aspen-large cargo test --release --locked -p aspen-pack --lib -- --ignored over_2_gib --nocapture
+
+  # A9: cargo deny does not see demo/place. Its shipped bundle has no runtime
+  # dependencies, but its pinned dev tooling (Vite, TypeScript, Vitest, Biome,
+  # yaml) runs in CI and on contributors' machines, so check it for advisories.
+  place-audit:
+    name: place npm audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: demo/place
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: demo/place/.nvmrc
+      - run: npm audit --audit-level=high
+
+  # --- A6: client matrix and long differential run (testkit/) ---------------
+  client-matrix:
+    # One job per client and server: build the client's image from
+    # testkit/images/ and run the scenario against stock `git http-backend`
+    # and against a real Aspen (`aspen dev`, node L0). A failure on Aspen
+    # only is an Aspen interop bug: file it (label follow-up) with the log.
+    name: client matrix (${{ matrix.client }}, ${{ matrix.server }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [git-2.30, git-2.39, git-2.43, git-2.47, git-latest, jgit, libgit2, go-git, gitoxide]
+        server: [stock, aspen]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: matrix.server == 'aspen'
+        run: cargo build --locked -p aspen-cli
+      - run: testkit/images/run-matrix.sh ${{ matrix.server == 'aspen' && '--aspen target/debug/aspen' || '' }} ${{ matrix.client }}
+
+  differential-long:
+    # The differential oracle for much longer than required CI runs it, with a
+    # fresh random seed each night. A divergence prints the seed and a replay
+    # command; file it with that output. The `aspen` rows run the real server
+    # (node L0): `aspen serve` from this checkout on SQLite, or on a throwaway
+    # PostgreSQL cluster from the runner's preinstalled binaries. They step
+    # over the filed divergences named by `--known` (each counted in the
+    # report); remove a `--known` once its issue is fixed. Trunk stays
+    # protected against Aspen, which refuses trunk deletes and forced trunk
+    # updates by default (spike S2). `--plain-url-pushes` also pushes and
+    # races through the plain repository URL, where Aspen decides
+    # fast-forwards itself (#135); the branch-scoped row cannot take it,
+    # since its repository URL refuses updates of hidden refs.
+    name: differential oracle, long (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default shape
+            args: --sequences 200 --steps 30 --plain-url-pushes
+          - name: wide, trunk deletable
+            args: --sequences 80 --steps 40 --clones 5 --branches 6 --delete-trunk
+          - name: branch-scoped (Aspen's URL layout)
+            args: --sequences 100 --steps 30 --candidate scoped
+          - name: aspen, sqlite
+            args: --sequences 200 --steps 30 --candidate aspen --plain-url-pushes
+          - name: aspen, sqlite, wide
+            args: --sequences 80 --steps 40 --clones 5 --branches 6 --candidate aspen --plain-url-pushes
+          - name: aspen, postgres
+            postgres: true
+            # Explicit, so a missing URL is an error rather than SQLite.
+            args: --sequences 100 --steps 30 --candidate aspen --plain-url-pushes --aspen-database-url "$ASPEN_DIFF_DATABASE_URL"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the latest stable Git
+        run: |
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update -q
+          sudo apt-get install -yq git
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release -p aspen-testkit -p aspen-cli
+      - name: Start a throwaway PostgreSQL
+        if: matrix.postgres
+        run: |
+          url=$(testkit/scripts/throwaway-postgres.sh /tmp/aspen-pg)
+          test -n "$url"
+          echo "ASPEN_DIFF_DATABASE_URL=$url" >> "$GITHUB_ENV"
+      - run: target/release/aspen-testkit diff ${{ matrix.args }}

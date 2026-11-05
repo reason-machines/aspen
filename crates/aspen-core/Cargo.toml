@@ -1,0 +1,19 @@
+[package]
+name = "aspen-core"
+description = "Shared types and traits for Aspen. Depends on no other Aspen crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+# Only for RACE_LOSS_REASONS, so `ng` texts stay in step with the oracle.
+aspen-testkit = { path = "../../testkit" }
+
+[lints]
+workspace = true

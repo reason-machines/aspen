@@ -1,0 +1,171 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "stale-branch",
+  "target": {
+    "label": "aspen-no-compaction",
+    "url": "http://127.0.0.1:8086/bench-stale-branch-1793752053.git"
+  },
+  "params": {
+    "points": [
+      10,
+      100,
+      1000,
+      10000
+    ],
+    "protocol": 2,
+    "push_url": "branch-scoped",
+    "repeats": 5,
+    "repo_changes_per_commit": 50,
+    "repo_commits": 200,
+    "repo_file_bytes": 8192,
+    "repo_files": 5000,
+    "repo_seed": 1
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793752061545,
+  "wall_seconds": 1036.91940148,
+  "latencies_ms": {
+    "plan_n10": {
+      "count": 5,
+      "min": 1.2420000000000764,
+      "mean": 1.4136000000000148,
+      "p50": 1.3760000000000439,
+      "p90": 1.5929999999999556,
+      "p99": 1.5929999999999556,
+      "max": 1.5929999999999556
+    },
+    "plan_n100": {
+      "count": 5,
+      "min": 12.172000000000072,
+      "mean": 12.294599999999999,
+      "p50": 12.360999999999954,
+      "p90": 12.380999999999975,
+      "p99": 12.380999999999975,
+      "max": 12.380999999999975
+    },
+    "plan_n1000": {
+      "count": 5,
+      "min": 110.47500000000011,
+      "mean": 110.9604,
+      "p50": 110.80699999999999,
+      "p90": 111.375,
+      "p99": 111.375,
+      "max": 111.375
+    },
+    "plan_n10000": {
+      "count": 5,
+      "min": 558.242,
+      "mean": 562.5318,
+      "p50": 563.2909999999999,
+      "p90": 564.781,
+      "p99": 564.781,
+      "max": 564.781
+    },
+    "stale_fetch_n10": {
+      "count": 5,
+      "min": 66.131148,
+      "mean": 67.9077838,
+      "p50": 67.30288800000001,
+      "p90": 71.15849200000001,
+      "p99": 71.15849200000001,
+      "max": 71.15849200000001
+    },
+    "stale_fetch_n100": {
+      "count": 5,
+      "min": 78.57325900000001,
+      "mean": 79.6755408,
+      "p50": 78.734361,
+      "p90": 82.86732500000001,
+      "p99": 82.86732500000001,
+      "max": 82.86732500000001
+    },
+    "stale_fetch_n1000": {
+      "count": 5,
+      "min": 182.12182299999998,
+      "mean": 182.37039,
+      "p50": 182.433395,
+      "p90": 182.599866,
+      "p99": 182.599866,
+      "max": 182.599866
+    },
+    "stale_fetch_n10000": {
+      "count": 5,
+      "min": 662.193501,
+      "mean": 667.0408967999999,
+      "p50": 666.625943,
+      "p90": 670.440508,
+      "p99": 670.440508,
+      "max": 670.440508
+    },
+    "trunk_push": {
+      "count": 10000,
+      "min": 18.904615,
+      "mean": 102.85152492090025,
+      "p50": 103.709734,
+      "p90": 171.095953,
+      "p99": 191.126365,
+      "max": 262.669554
+    },
+    "trunk_push_first_tenth": {
+      "count": 1000,
+      "min": 18.904615,
+      "mean": 27.814098196,
+      "p50": 27.697647,
+      "p90": 33.928393,
+      "p99": 39.459194000000004,
+      "max": 51.883259
+    },
+    "trunk_push_last_tenth": {
+      "count": 1000,
+      "min": 164.022021,
+      "mean": 180.53617596499993,
+      "p50": 179.608184,
+      "p90": 191.04112800000001,
+      "p99": 201.780324,
+      "max": 222.90285200000002
+    }
+  },
+  "throughput": {
+    "trunk_pushes_per_second": 9.692320151968508
+  },
+  "counts": {
+    "chain_skips.n10": 0,
+    "chain_skips.n100": 0,
+    "chain_skips.n1000": 0,
+    "chain_skips.n10000": 0,
+    "fetches_ok": 20,
+    "loaded_versions.n10": 33,
+    "loaded_versions.n100": 225,
+    "loaded_versions.n1000": 2017,
+    "loaded_versions.n10000": 10002,
+    "plans.n10": 1,
+    "plans.n100": 1,
+    "plans.n1000": 1,
+    "plans.n10000": 1,
+    "received_bytes.n10": 438,
+    "received_bytes.n100": 439,
+    "received_bytes.n1000": 443,
+    "received_bytes.n10000": 408,
+    "trunk_pushes": 10000,
+    "visited.n10": 11,
+    "visited.n100": 101,
+    "visited.n1000": 1001,
+    "visited.n10000": 10001
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

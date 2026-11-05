@@ -1,0 +1,11 @@
+# Remote state for this deployment. Copy to backend.hcl (ignored by git) and
+# run `terraform init -backend-config=backend.hcl`.
+#
+# Create the state bucket once, in the same dedicated account, with versioning
+# and default encryption turned on (deploy/README.md shows the commands).
+
+bucket       = "REPLACE-ME-aspen-tfstate"
+key          = "aspen/staging/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true # S3-native locking; no DynamoDB table needed

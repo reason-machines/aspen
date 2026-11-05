@@ -1,0 +1,91 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:44655/bench.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "pushes_per_writer": null,
+    "repo_changes_per_commit": 10,
+    "repo_commits": 20,
+    "repo_file_bytes": 4096,
+    "repo_files": 200,
+    "repo_seed": 1,
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": "29c5bb990e8e992eeebda64b61feb49337253bf3",
+    "git_version": "git version 2.56.0",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "7.0.0-1017-azure",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "cpus": 2,
+    "memory_bytes": 8317927424,
+    "ci": "github-actions",
+    "runner": "GitHub Actions 1000276797"
+  },
+  "started_at_unix_ms": 1793684929362,
+  "wall_seconds": 30.815490576,
+  "latencies_ms": {
+    "push": {
+      "count": 431,
+      "min": 285.282265,
+      "mean": 972.6994888097443,
+      "p50": 930.078497,
+      "p90": 1450.764748,
+      "p99": 2038.4409099999998,
+      "max": 2425.811812
+    },
+    "push_to_fetch": {
+      "count": 431,
+      "min": 484.774589,
+      "mean": 1744.1803250301623,
+      "p50": 1577.051747,
+      "p90": 2711.443868,
+      "p99": 3817.157762,
+      "max": 5245.35477
+    },
+    "reader_fetch": {
+      "count": 431,
+      "min": 388.365068,
+      "mean": 1704.6318776682135,
+      "p50": 1520.341882,
+      "p90": 2666.990156,
+      "p99": 3751.777285,
+      "max": 5120.057582
+    },
+    "reader_queue": {
+      "count": 431,
+      "min": 0.104515,
+      "mean": 22.374866668213453,
+      "p50": 4.181653,
+      "p90": 62.209616000000004,
+      "p99": 158.303784,
+      "max": 271.078594
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 13.986472126316734
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 431,
+    "reader_fetches": 431,
+    "readers_created": 37,
+    "seen": 431,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

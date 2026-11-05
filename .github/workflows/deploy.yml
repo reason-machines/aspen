@@ -1,0 +1,120 @@
+# Deployment checks that need Docker: bring the compose stack up and check it,
+# and build the Aspen and place container images. They pull images and compile a release
+# build, so they stay out of required CI. They run on pull requests that touch
+# deploy/, nightly (called from nightly.yml) and on demand.
+name: Deploy
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "demo/place/**"
+      - ".github/workflows/deploy.yml"
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # One job, so the image is built once: check it, then run the compose stack
+  # and the Helm chart on kind with that exact image.
+  image-and-e2e:
+    name: image, compose smoke, helm on kind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build the image (default target, compiled from this checkout)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          tags: aspen:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: the image runs aspen serve as a non-root user
+        run: |
+          docker run --rm aspen:ci --version
+          docker run --rm aspen:ci serve --help >/dev/null
+          user="$(docker image inspect --format '{{.Config.User}}' aspen:ci)"
+          cmd="$(docker image inspect --format '{{json .Config.Cmd}}' aspen:ci)"
+          echo "user: $user, cmd: $cmd"
+          [ "$user" = "10001:10001" ]
+          [ "$cmd" = '["serve"]' ]
+          [ "$(docker run --rm --entrypoint id aspen:ci -u)" = 10001 ]
+          docker image ls aspen:ci --format 'size: {{.Size}}'
+      - name: the release target packages a prebuilt binary
+        run: |
+          mkdir -p dist/linux-amd64
+          id="$(docker create aspen:ci)"
+          docker cp "$id:/usr/local/bin/aspen" dist/linux-amd64/aspen
+          docker rm "$id" >/dev/null
+          docker buildx build -f deploy/docker/Dockerfile --target release \
+            --build-context dist=dist --platform linux/amd64 --load -t aspen:release .
+          docker run --rm aspen:release --version
+          [ "$(docker image inspect --format '{{.Config.User}}' aspen:release)" = "10001:10001" ]
+          [ "$(docker run --rm --entrypoint stat aspen:release -c %u /var/lib/aspen/spool)" = 10001 ]
+      - name: compose smoke (Aspen + PostgreSQL + MinIO, push and clone)
+        run: ASPEN_IMAGE=aspen:ci deploy/compose/smoke.sh
+      - name: install kind and helm
+        run: |
+          .github/scripts/install-tool.sh kind "$RUNNER_TEMP/bin"
+          .github/scripts/install-tool.sh helm "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      - name: helm chart on kind (2 replicas, push and clone, lose a pod)
+        run: |
+          kind create cluster --name aspen --wait 120s
+          kind load docker-image aspen:ci --name aspen
+          deploy/helm/ci/kind-e2e.sh aspen:ci
+
+  # The place demo's image (target `place`), which deploy/terraform/aws/public-demo
+  # runs: the page, the API and canvas.git from one process, stopped with
+  # SIGTERM like ECS stops it.
+  place-image:
+    name: place image (page, API, git push, SIGTERM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build the place image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: place
+          tags: aspen-place:ci
+          load: true
+          cache-from: type=gha,scope=place
+          cache-to: type=gha,scope=place,mode=max
+      - name: serve the page, the API and canvas.git; push a tile; stop with SIGTERM
+        run: |
+          set -eu
+          [ "$(docker image inspect --format '{{.Config.User}}' aspen-place:ci)" = "10001:10001" ]
+          docker run -d --name place -p 127.0.0.1:7080:7080 \
+            -e PLACE_AGENTS=0 -e PLACE_SHUTDOWN_DRAIN_SECONDS=3 aspen-place:ci
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:7080/api/v1/config >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:7080/api/v1/config
+          curl -fsS http://127.0.0.1:7080/ | grep -qi '<!doctype html>'
+          work="$(mktemp -d)"
+          git clone -q http://127.0.0.1:7080/canvas.git "$work/canvas"
+          mkdir -p "$work/canvas/tiles"
+          printf '#d6262b\n' >"$work/canvas/tiles/1_1.txt"
+          git -C "$work/canvas" add tiles
+          git -C "$work/canvas" -c user.name=CI -c user.email=ci@example.test commit -qm paint
+          git -C "$work/canvas" push -q origin HEAD:refs/heads/paint/ci
+          docker stop --timeout 60 place
+          status="$(docker inspect --format '{{.State.ExitCode}}' place)"
+          docker logs place
+          [ "$status" = 0 ]
+          docker logs place 2>&1 | grep -q 'aspen-place: stopped'

@@ -1,0 +1,29 @@
+[package]
+name = "aspen-bench"
+description = "Load generator and baselines for Git HTTP servers (Aspen and others)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aspen-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Tooling crate: it may use other tooling crates. `aspen-interop` provides the
+# in-process `git http-backend` bridge behind `--url local`.
+aspen-interop = { path = "../tests/interop" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+# The smallest valid configuration; used by the chart checks and `helm lint`.
+database:
+  url: postgres://aspen@postgres.example.internal:5432/aspen?sslmode=require
+  passwordSecret:
+    name: aspen-db
+blob:
+  url: s3://aspen-packs
+  env:
+    AWS_REGION: us-east-1

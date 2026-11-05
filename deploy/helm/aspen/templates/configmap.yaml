@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aspen.fullname" . }}
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+data:
+  # aspen_auth::PolicyConfig; no secrets belong here (OIDC JWKS are public).
+  policy.json: {{ .Values.policy | toJson | quote }}
+  limits.json: {{ .Values.limits | toJson | quote }}

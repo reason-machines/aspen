@@ -1,0 +1,21 @@
+{
+  "rules": [
+    { "metric": "errors.count", "better": "lower", "max_regression_pct": 0, "abs_slack": 0 },
+    { "metric": "wall_seconds", "better": "ignore" },
+    { "metric": "counts.received_bytes_per_fetch", "better": "lower", "max_regression_pct": 10, "abs_slack": 1024 },
+    { "metric": "counts.visited.*", "better": "lower", "max_regression_pct": 50, "abs_slack": 8 },
+    { "metric": "counts.loaded_versions.*", "better": "lower", "max_regression_pct": 50, "abs_slack": 16 },
+    { "metric": "counts.received_bytes.*", "better": "lower", "max_regression_pct": 10, "abs_slack": 1024 },
+    { "metric": "counts.*.*", "better": "ignore" },
+    { "metric": "counts.*", "better": "ignore" },
+    { "metric": "latencies_ms.reader_queue.*", "better": "ignore" },
+    { "metric": "latencies_ms.*.count", "better": "ignore" },
+    { "metric": "latencies_ms.*.min", "better": "ignore" },
+    { "metric": "latencies_ms.*.max", "better": "ignore" },
+    { "metric": "latencies_ms.*.mean", "better": "ignore" },
+    { "metric": "latencies_ms.*.p50", "better": "lower", "max_regression_pct": 75, "abs_slack": 10 },
+    { "metric": "latencies_ms.*.p90", "better": "lower", "max_regression_pct": 100, "abs_slack": 20 },
+    { "metric": "latencies_ms.*.p99", "better": "lower", "max_regression_pct": 150, "abs_slack": 50 },
+    { "metric": "throughput.*", "better": "higher", "max_regression_pct": 50, "abs_slack": 0 }
+  ]
+}

@@ -1,0 +1,22 @@
+[package]
+name = "aspen-interop"
+description = "Interop tests: stock Git clients against a Git HTTP server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-testkit = { path = "../../testkit" }
+
+[dev-dependencies]
+# The Aspen smoke cases: a fetch from stores seeded with
+# `aspen_server::testing`, and a push through receive-pack (B1).
+aspen-auth = { path = "../../crates/aspen-auth" }
+aspen-core = { path = "../../crates/aspen-core" }
+aspen-server = { path = "../../crates/aspen-server", features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

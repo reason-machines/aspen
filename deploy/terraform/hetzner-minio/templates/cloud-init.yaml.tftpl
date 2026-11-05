@@ -1,0 +1,54 @@
+#cloud-config
+# Written by the Aspen Hetzner Terraform module. Runs once, at first boot.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+
+write_files:
+  - path: /opt/aspen/compose.yaml
+    permissions: "0644"
+    content: ${jsonencode(compose)}
+  - path: /opt/aspen/Caddyfile
+    permissions: "0644"
+    content: ${jsonencode(caddyfile)}
+  - path: /opt/aspen/policy.json
+    permissions: "0644"
+    content: ${jsonencode(policy_json)}
+  - path: /opt/aspen/minio-init.sh
+    permissions: "0755"
+    content: ${jsonencode(minio_init)}
+  - path: /opt/aspen/init-env.sh
+    permissions: "0700"
+    content: ${jsonencode(init_env)}
+  - path: /etc/systemd/system/aspen.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Aspen (docker compose)
+      Requires=docker.service ${replace(trimprefix(data_dir, "/"), "/", "-")}.mount
+      After=docker.service network-online.target ${replace(trimprefix(data_dir, "/"), "/", "-")}.mount
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      WorkingDirectory=/opt/aspen
+      ExecStartPre=/opt/aspen/init-env.sh ${data_dir}/.env
+      ExecStart=/usr/bin/docker compose --env-file ${data_dir}/.env -f /opt/aspen/compose.yaml up -d --remove-orphans
+      ExecStop=/usr/bin/docker compose --env-file ${data_dir}/.env -f /opt/aspen/compose.yaml down
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # The volume is attached after the server is created; wait for it.
+  - [sh, -c, "for i in $(seq 1 120); do [ -e ${volume_device} ] && break; sleep 5; done; [ -e ${volume_device} ]"]
+  - mkdir -p ${data_dir}
+  - [sh, -c, "grep -q '${volume_device}' /etc/fstab || echo '${volume_device} ${data_dir} ext4 discard,nofail,defaults 0 0' >> /etc/fstab"]
+  - systemctl daemon-reload
+  - [sh, -c, "mountpoint -q ${data_dir} || mount ${data_dir}"]
+  - mkdir -p ${data_dir}/spool ${data_dir}/postgres ${data_dir}/minio ${data_dir}/caddy
+  # The images run as these users: Aspen 10001, Chainguard MinIO 65532.
+  - chown 10001:10001 ${data_dir}/spool
+  - chown 65532:65532 ${data_dir}/minio
+  - systemctl enable --now aspen.service

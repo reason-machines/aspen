@@ -1,0 +1,36 @@
+[package]
+name = "aspen-auth"
+description = "Aspen's access control: API tokens, OIDC/JWT, per-repository grants, rate limits and push quotas."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aspen-core = { path = "../aspen-core" }
+# Base64url decoding of JWT segments and JWK key material.
+base64 = "0.22"
+# Token secrets come from the operating system's generator.
+getrandom = "0.4"
+# JWT signatures (RS256, ES256) are checked with ring, which is already in the
+# tree through rustls. jsonwebtoken 10+ needs aws-lc-rs (a C/CMake build) or
+# the `rsa` crate (RUSTSEC-2023-0071, no fix); see docs/PLAN.md, decisions log.
+ring = "0.17"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Token digests (SHA-256) and their constant-time comparison.
+sha2 = "0.11"
+subtle = "2.6"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The tests sign JWTs with these.
+base64 = "0.22"
+ring = "0.17"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

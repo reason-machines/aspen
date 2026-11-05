@@ -1,0 +1,77 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "fetch-storm",
+  "target": {
+    "label": "aspen",
+    "url": "http://127.0.0.1:8086/bench-fetch-storm-depth1-1793754138.git"
+  },
+  "params": {
+    "depth": 1,
+    "jobs": 1000,
+    "mode": "cold",
+    "protocol": 2,
+    "push_url": "branch-scoped",
+    "repo_source_tip": "777489f9e09c8d0dd6b12f9d90de6376330577a2",
+    "rounds": 2
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793754399820,
+  "wall_seconds": 128.659204499,
+  "latencies_ms": {
+    "fetch": {
+      "count": 961,
+      "min": 9035.68014,
+      "mean": 49080.32403772636,
+      "p50": 51570.869334999996,
+      "p90": 70487.380226,
+      "p99": 73087.220957,
+      "max": 73225.819363
+    }
+  },
+  "throughput": {
+    "fetches_per_second": 7.469345110146934,
+    "received_mib_per_second": 88.84529352671747
+  },
+  "counts": {
+    "fetches_ok": 961,
+    "received_bytes": 11986025619,
+    "received_bytes_per_fetch": 12472451
+  },
+  "errors": {
+    "count": 1039,
+    "samples": [
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry",
+      "fetch storm: git fetch --quiet failed (exit status: 128): fatal: remote error: internal storage error; retry"
+    ]
+  }
+}

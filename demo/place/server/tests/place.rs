@@ -1,0 +1,1478 @@
+//! `place` end to end: stock `git` and HTTP against the assembled app.
+//! Each test states the invariant it pins.
+
+mod support;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::json;
+use support::*;
+
+const RED: &str = "#d6262b";
+const BLUE: &str = "#3690ea";
+const YELLOW: &str = "#ffd635";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_git_push_paints_a_branch_and_the_merger_fast_forwards_main() {
+    let app = App::start(|_| {}).await;
+    let main_before = app
+        .tip("refs/heads/main")
+        .await
+        .expect("main is created at start");
+    let w = app.clone_work("ada").await;
+    assert!(
+        w.path.join("README.md").exists(),
+        "main starts with a README"
+    );
+    w.paint(&[(1, 1, RED), (2, 1, BLUE)], "two tiles");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    assert!(ok, "{out}");
+
+    // The push is on the canvas as an overlay and in the feed.
+    let canvas = app.get("/api/v1/canvas").await;
+    let overlay = &canvas["branches"][0];
+    assert_eq!(overlay["name"], "paint/ada");
+    assert_eq!(
+        overlay["actor"],
+        json!({ "kind": "git", "label": "paint/ada" })
+    );
+    assert_eq!(overlay["tiles"].as_array().unwrap().len(), 2);
+    let mut feed = app.events("?after=0", &[]).await;
+    let got = feed
+        .until(Duration::from_secs(5), |e| e.kind == "push")
+        .await;
+    let push = &got.last().unwrap().data;
+    assert_eq!(
+        push["tiles"],
+        json!([{ "x": 1, "y": 1, "color": RED }, { "x": 2, "y": 1, "color": BLUE }])
+    );
+    let push_seq = push["seq"].as_u64().unwrap();
+
+    // The merger folds it into main as one commit on top of main's tip.
+    let merge_seq = app.place.merge_once().await.unwrap().expect("a merge");
+    let merge = feed
+        .until(Duration::from_secs(5), |e| e.kind == "merge")
+        .await;
+    let merge = &merge.last().unwrap().data;
+    assert_eq!(merge["seq"].as_u64(), Some(merge_seq));
+    assert_eq!(merge["throughSeq"].as_u64(), Some(push_seq));
+    assert_eq!(merge["branches"], json!(["paint/ada"]));
+    let main_after = app.tip("refs/heads/main").await.unwrap();
+    assert_eq!(merge["commit"], main_after);
+    let check = app.clone_work("check").await;
+    let parents = check.git(&["rev-list", "--parents", "-n1", "HEAD"]);
+    assert_eq!(
+        parents.split_whitespace().collect::<Vec<_>>(),
+        [&main_after[..], &main_before[..]]
+    );
+    assert_eq!(
+        std::fs::read(check.path.join("tiles/1_1.txt")).unwrap(),
+        b"#d6262b\n"
+    );
+    assert_eq!(
+        std::fs::read(check.path.join("tiles/2_1.txt")).unwrap(),
+        b"#3690ea\n"
+    );
+    // Only tile files changed, and the history is valid for stock git.
+    let changed = check.git(&["diff", "--name-only", &main_before, "HEAD"]);
+    assert_eq!(
+        changed.lines().collect::<Vec<_>>(),
+        ["tiles/1_1.txt", "tiles/2_1.txt"]
+    );
+    check.git(&["fsck", "--strict", "--no-progress"]);
+
+    // main's pixels and the merged overlay.
+    let canvas = app.get("/api/v1/canvas").await;
+    assert_eq!(canvas["mergedThroughSeq"].as_u64(), Some(push_seq));
+    assert_eq!(canvas["branches"], json!([]));
+    let pixels = canvas["pixels"].as_str().unwrap();
+    assert_eq!(
+        &pixels[16 + 1..16 + 3],
+        "5c",
+        "red is palette 5, blue 12 (c)"
+    );
+    // Nothing pending: no empty merge commit.
+    assert_eq!(app.place.merge_once().await.unwrap(), None);
+    assert_eq!(app.tip("refs/heads/main").await.unwrap(), main_after);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_merger_replays_pushes_in_seq_order_and_main_stays_linear() {
+    let app = App::start(|_| {}).await;
+    let a = app.clone_work("a").await;
+    let b = app.clone_work("b").await;
+    a.paint(&[(3, 3, RED), (4, 4, RED)], "a");
+    assert!(a.push(&[&app.url(), "HEAD:refs/heads/paint/a"]).await.0);
+    b.paint(&[(3, 3, BLUE)], "b");
+    assert!(b.push(&[&app.url(), "HEAD:refs/heads/paint/b"]).await.0);
+    // a repaints the tile b painted, after b: a's later push wins.
+    a.paint(&[(3, 3, YELLOW)], "a again");
+    assert!(a.push(&[&app.url(), "HEAD:refs/heads/paint/a"]).await.0);
+    app.place.merge_once().await.unwrap().unwrap();
+    let c = app.clone_work("c").await;
+    assert_eq!(
+        std::fs::read(c.path.join("tiles/3_3.txt")).unwrap(),
+        b"#ffd635\n"
+    );
+    assert_eq!(
+        std::fs::read(c.path.join("tiles/4_4.txt")).unwrap(),
+        b"#d6262b\n"
+    );
+    // Two commits on main, each with one parent.
+    let log = c.git(&["log", "--format=%p", "main"]);
+    let parents: Vec<usize> = log.lines().map(|l| l.split_whitespace().count()).collect();
+    assert_eq!(parents, [1, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_tile_rule_is_enforced_through_git_push_and_a_refused_push_stores_no_ref() {
+    let app = App::start(|_| {}).await;
+    let w = app.clone_work("w").await;
+    // One commit with five problems: all five are reported, one per line.
+    w.write("README.md", b"changed\n");
+    w.write("tiles/1_1.txt", b"#D6262B\n");
+    w.write("tiles/2_2.txt", b"#d6262b\r\n");
+    w.write("tiles/99_1.txt", b"#d6262b\n");
+    w.write("tiles/01_1.txt", b"#d6262b\n");
+    w.write("tiles/3_3.txt", b"#123456\n");
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "bad"]);
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/bad"]).await;
+    assert!(!ok, "{out}");
+    for line in [
+        "README.md: only files under tiles/ may change",
+        "tiles/01_1.txt: tile files are named tiles/<x>_<y>.txt",
+        "tiles/1_1.txt: use lowercase hex digits",
+        "tiles/2_2.txt: use LF line endings, not CRLF",
+        "tiles/3_3.txt: #123456 is not in the palette",
+        "tiles/99_1.txt: (99, 1) is outside the 16x16 canvas",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
+    }
+    assert!(out.contains("6 problems with this push"), "{out}");
+    assert_eq!(
+        app.current("refs/heads/paint/bad").await,
+        None,
+        "nothing is written"
+    );
+
+    // Modes, deletes, merges and refs, each on its own.
+    let fresh = |name: &'static str| {
+        let app = &app;
+        async move { app.clone_work(name).await }
+    };
+    let exec = fresh("exec").await;
+    exec.write("tiles/1_1.txt", b"#d6262b\n");
+    exec.git(&["add", "-A"]);
+    exec.git(&["update-index", "--chmod=+x", "tiles/1_1.txt"]);
+    exec.git(&["commit", "-q", "-m", "x"]);
+    let (ok, out) = exec.push(&[&app.url(), "HEAD:refs/heads/paint/x"]).await;
+    assert!(!ok && out.contains("not mode 100755"), "{out}");
+
+    let link = fresh("link").await;
+    std::os::unix::fs::symlink("../README.md", link.path.join("tiles/1_1.txt")).ok();
+    if !link.path.join("tiles").exists() {
+        std::fs::create_dir_all(link.path.join("tiles")).unwrap();
+        std::os::unix::fs::symlink("../README.md", link.path.join("tiles/1_1.txt")).unwrap();
+    }
+    link.git(&["add", "-A"]);
+    link.git(&["commit", "-q", "-m", "link"]);
+    let (ok, out) = link.push(&[&app.url(), "HEAD:refs/heads/paint/link"]).await;
+    assert!(!ok && out.contains("not mode 120000"), "{out}");
+
+    // A merge commit, and a delete of a tile main has.
+    let m = fresh("merge").await;
+    m.paint(&[(5, 5, RED)], "paint");
+    assert!(m.push(&[&app.url(), "HEAD:refs/heads/paint/m"]).await.0);
+    app.place.merge_once().await.unwrap().unwrap();
+    m.git(&["checkout", "-q", "-b", "side", "HEAD~1"]);
+    m.paint(&[(6, 6, RED)], "side");
+    m.git(&["checkout", "-q", "-"]);
+    m.git(&["merge", "-q", "--no-edit", "side"]);
+    let (ok, out) = m.push(&[&app.url(), "HEAD:refs/heads/paint/m2"]).await;
+    assert!(
+        !ok && out.contains("merge commits are not accepted"),
+        "{out}"
+    );
+    let d = fresh("delete").await;
+    d.git(&["rm", "-q", "tiles/5_5.txt"]);
+    d.git(&["commit", "-q", "-m", "rm"]);
+    let (ok, out) = d.push(&[&app.url(), "HEAD:refs/heads/paint/d"]).await;
+    assert!(
+        !ok && out.contains("tiles/5_5.txt: tiles can be repainted but not deleted"),
+        "{out}"
+    );
+
+    // Refs: main, the server's namespaces, tags. The anonymous policy may
+    // write only refs/heads/*, so the tag goes with a token that may write
+    // any ref, to reach the rules themselves.
+    let r = fresh("refs").await;
+    r.paint(&[(7, 7, RED)], "ok");
+    let token = app.token("dev", &["write:canvas"]);
+    let header = format!("http.extraHeader=Authorization: Bearer {token}");
+    for (target, text, auth) in [
+        (
+            "HEAD:refs/heads/main",
+            "main is written by the merger bot",
+            false,
+        ),
+        (
+            "HEAD:refs/heads/main",
+            "main is written by the merger bot",
+            true,
+        ),
+        (
+            "HEAD:refs/heads/visitors/abc",
+            "belong to the web page and its agents",
+            false,
+        ),
+        (
+            "HEAD:refs/heads/swarm/agent-0001",
+            "belong to the web page and its agents",
+            false,
+        ),
+        (
+            "HEAD:refs/heads/agent/moss-12",
+            "belong to the web page and its agents",
+            true,
+        ),
+        ("HEAD:refs/tags/v1", "permission denied", false),
+        ("HEAD:refs/tags/v1", "only branches", true),
+    ] {
+        let mut args = vec![];
+        if auth {
+            args.extend(["-c", header.as_str()]);
+        }
+        let (ok, out) = r.push_with(&args, &[&app.url(), target]).await;
+        assert!(!ok && out.contains(text), "{target}: {out}");
+    }
+    // The same commit is fine on the pusher's own branch.
+    assert!(r.push(&[&app.url(), "HEAD:refs/heads/paint/r"]).await.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_value() {
+    // TILES.md's worked example with a cap of 4 tiles per push.
+    let app = App::start(|c| c.rules.tiles_per_push = 4).await;
+    let w = app.clone_work("ada").await;
+    let t0 = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    w.paint(&[(0, 0, RED), (1, 0, RED), (2, 0, RED)], "A1");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    // The merger moves trunk meanwhile.
+    app.place.merge_once().await.unwrap().unwrap();
+    // A2 on A1: the branch is not advertised, so git sends a zero old
+    // value; the server excludes its stored tip A1, so 2 tiles count.
+    w.paint(&[(3, 0, RED), (4, 0, RED)], "A2");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    assert!(ok, "counted A1 again: {out}");
+    // A3 alone paints 5 tiles: refused.
+    w.paint(
+        &[
+            (5, 0, BLUE),
+            (6, 0, BLUE),
+            (7, 0, BLUE),
+            (8, 0, BLUE),
+            (9, 0, BLUE),
+        ],
+        "A3",
+    );
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    assert!(
+        !ok && out.contains("this push changes 5 tiles; the limit is 4"),
+        "{out}"
+    );
+    // A rewrite on T0 (4 tiles), force-pushed: only B1 counts.
+    w.git(&["reset", "-q", "--hard", &t0]);
+    w.paint(
+        &[
+            (0, 5, YELLOW),
+            (1, 5, YELLOW),
+            (2, 5, YELLOW),
+            (3, 5, YELLOW),
+        ],
+        "B1",
+    );
+    let (ok, out) = w
+        .push(&["-o", "force", &app.url(), "+HEAD:refs/heads/paint/ada"])
+        .await;
+    assert!(ok, "{out}");
+    let canvas = app.get("/api/v1/canvas").await;
+    let overlay = canvas["branches"].as_array().unwrap();
+    // A2's two tiles (still unmerged) and B1's four, newest per position.
+    assert_eq!(overlay[0]["tiles"].as_array().unwrap().len(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_pushes_are_limited_per_address_and_branch() {
+    let app = App::start(|c| c.pushes_per_minute = 2).await;
+    let w = app.clone_work("w").await;
+    for i in 0..2 {
+        w.paint(&[(i, 0, RED)], "ok");
+        let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q"]).await;
+        assert!(ok, "{out}");
+    }
+    w.paint(&[(5, 0, RED)], "third");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q"]).await;
+    assert!(
+        !ok && out.contains("rate limited: 2 pushes a minute per address and branch"),
+        "{out}"
+    );
+    // Another branch has its own budget.
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q2"]).await;
+    assert!(ok, "{out}");
+}
+
+/// Invariant (issue #121): the API's per-address limits read
+/// `X-Forwarded-For` only from a trusted proxy and parse its entries
+/// strictly. A client whose connection does not come from a trusted proxy
+/// is its TCP address whatever it claims; behind a trusted proxy, an entry
+/// with a port is the same client as one without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_limits_key_on_the_address_a_trusted_proxy_recorded() {
+    use aspen_server::access::ClientAddr;
+    async fn session(app: &App, xff: &str) -> u16 {
+        app.http(
+            "POST",
+            "/api/v1/sessions",
+            &[("x-forwarded-for", xff)],
+            None,
+        )
+        .await
+        .status
+    }
+    // Loopback (the test client) is not in this list, so the header is
+    // ignored and every session counts against 127.0.0.1.
+    let app = App::start(|c| {
+        c.sessions_per_minute = 2;
+        c.client_addr = ClientAddr::from_settings(1, Some("10.0.0.0/8")).unwrap();
+    })
+    .await;
+    assert_eq!(session(&app, "203.0.113.1").await, 201);
+    assert_eq!(session(&app, "203.0.113.2").await, 201);
+    assert_eq!(session(&app, "203.0.113.3").await, 429);
+    // Loopback is a trusted proxy by default: the recorded client counts,
+    // with or without a port.
+    let app = App::start(|c| {
+        c.sessions_per_minute = 2;
+        c.client_addr = ClientAddr::from_settings(1, None).unwrap();
+    })
+    .await;
+    assert_eq!(session(&app, "203.0.113.1").await, 201);
+    assert_eq!(session(&app, "6.6.6.6, 203.0.113.1:4711").await, 201);
+    assert_eq!(session(&app, "203.0.113.1:4712").await, 429);
+    assert_eq!(session(&app, "203.0.113.2").await, 201);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_strokes_are_real_commits_on_the_visitors_branch() {
+    let app = App::start(|c| c.pushes_per_minute = 3).await;
+    let s = app.http("POST", "/api/v1/sessions", &[], None).await;
+    assert_eq!(s.status, 201, "{}", s.text());
+    let s = s.json();
+    let (branch, token) = (
+        s["branch"].as_str().unwrap().to_owned(),
+        s["token"].as_str().unwrap().to_owned(),
+    );
+    assert!(branch.starts_with("visitors/"));
+    assert!(token.len() >= 16);
+    let auth = format!("Bearer {token}");
+    let h = [("Authorization", auth.as_str())];
+    let main = app.tip("refs/heads/main").await.unwrap();
+
+    let stroke = json!({ "branch": branch, "tiles": [{ "x": 2, "y": 3, "color": RED }], "message": "hello" });
+    let r = app.http("POST", "/api/v1/pushes", &h, Some(&stroke)).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let first = r.json();
+    assert_eq!(first["parent"], main, "a branch's first push sits on main");
+    assert_eq!(first["quota"]["remaining"], 2);
+    let commit = first["commit"].as_str().unwrap().to_owned();
+    assert_eq!(
+        app.tip(&format!("refs/heads/{branch}")).await.as_deref(),
+        Some(&commit[..])
+    );
+
+    // The commit is a real one: fetch it with stock git and read the tile.
+    let w = app.clone_work("look").await;
+    w.run(&["fetch", "-q", &app.url(), &format!("refs/heads/{branch}")])
+        .await;
+    assert_eq!(w.git(&["show", "FETCH_HEAD:tiles/2_3.txt"]), "#d6262b\n");
+    assert_eq!(
+        w.git(&["log", "-1", "--format=%s", "FETCH_HEAD"]).trim(),
+        "hello"
+    );
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/pushes",
+            &h,
+            Some(&json!({ "branch": branch, "tiles": [{ "x": 4, "y": 4, "color": BLUE }] })),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_eq!(
+        r.json()["parent"].as_str(),
+        Some(&commit[..]),
+        "the next one sits on the branch"
+    );
+
+    // The contract's errors.
+    let r = app.http("POST", "/api/v1/pushes", &[], Some(&stroke)).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (401, json!("unauthorized"))
+    );
+    let other = json!({ "branch": "visitors/zzz", "tiles": [{ "x": 1, "y": 1, "color": RED }] });
+    let r = app.http("POST", "/api/v1/pushes", &h, Some(&other)).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (403, json!("forbidden"))
+    );
+    let dup = json!({ "branch": branch, "tiles": [{ "x": 1, "y": 1, "color": RED }, { "x": 1, "y": 1, "color": RED }] });
+    let r = app.http("POST", "/api/v1/pushes", &h, Some(&dup)).await;
+    assert_eq!(r.status, 422);
+    assert_eq!(r.json()["rejections"][0]["code"], "duplicate-tile");
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/pushes",
+            &h,
+            Some(&json!({ "branch": branch, "tiles": "no" })),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, json!("bad-request"))
+    );
+    // The third accepted push uses the last of 3 a minute; the fourth is 429.
+    let ok = json!({ "branch": branch, "tiles": [{ "x": 5, "y": 5, "color": RED }] });
+    assert_eq!(
+        app.http("POST", "/api/v1/pushes", &h, Some(&ok))
+            .await
+            .status,
+        201
+    );
+    let r = app.http("POST", "/api/v1/pushes", &h, Some(&ok)).await;
+    assert_eq!(r.status, 429);
+    assert!(r.header("retry-after").is_some());
+    assert_eq!(r.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let q = app.http("GET", "/api/v1/quota", &h, None).await.json();
+    assert_eq!(q["remaining"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_event_stream_lines_up_with_snapshots_resumes_and_resyncs() {
+    let app = App::start(|c| c.event_backlog = 3).await;
+    let w = app.clone_work("w").await;
+    for i in 0..5 {
+        w.paint(&[(i, 0, RED)], "p");
+        assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/e"]).await.0);
+    }
+    let snap = app.get("/api/v1/canvas").await;
+    assert_eq!(snap["seq"], 5);
+    // Live from the snapshot: nothing old, then the next event.
+    let mut live = app.events("?after=5", &[]).await;
+    assert_eq!(live.status, 200);
+    assert!(
+        live.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type")
+                && v.starts_with("text/event-stream"))
+    );
+    w.paint(&[(9, 9, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/e"]).await.0);
+    let e = live.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (e.id, e.kind.as_str(), e.data["seq"].as_u64()),
+        (Some(6), "push", Some(6))
+    );
+    assert!(live.text().is_empty() || !live.text().contains("id: 5"));
+    // Resume with Last-Event-ID inside the backlog (4, 5, 6 kept).
+    let mut again = app.events("", &[("Last-Event-ID", "4")]).await;
+    let got: Vec<u64> = vec![
+        again
+            .next(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .id
+            .unwrap(),
+        again
+            .next(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .id
+            .unwrap(),
+    ];
+    assert_eq!(got, [5, 6]);
+    // Too old: one resync event naming the current seq.
+    let mut old = app.events("?after=1", &[]).await;
+    let e = old.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (e.kind.as_str(), e.data["seq"].as_u64()),
+        ("resync", Some(6))
+    );
+    // From the future (a client of an earlier server run): resync too.
+    let mut future = app.events("?after=99", &[]).await;
+    assert_eq!(
+        future.next(Duration::from_secs(5)).await.unwrap().kind,
+        "resync"
+    );
+    let bad = app.http("GET", "/api/v1/events?after=-1", &[], None).await;
+    assert_eq!(bad.status, 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kill_switch_takes_an_admin_grant_and_stops_the_swarm_and_ambient_agents() {
+    let app = App::start(|c| {
+        c.ambient_agents = 3;
+        c.swarm.pushes_per_second_cap = 4;
+        c.swarm.max_agents = 5;
+        c.swarm.ramp_ms = 1;
+        c.swarm.run_seconds = 60;
+    })
+    .await;
+    let operator = format!("Bearer {}", app.token("ops", &["admin:canvas"]));
+    let writer = format!("Bearer {}", app.token("dev", &["write:canvas"]));
+    let engage = json!({ "engaged": true, "reason": "Maintenance" });
+    for headers in [
+        vec![],
+        vec![("Authorization", writer.as_str())],
+        vec![("Authorization", "Bearer mock-operator-token")],
+    ] {
+        let r = app
+            .http("POST", "/api/v1/admin/kill-switch", &headers, Some(&engage))
+            .await;
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (403, json!("forbidden")),
+            "{headers:?}"
+        );
+    }
+
+    let started = app.http("POST", "/api/v1/swarm", &[], None).await;
+    assert_eq!(started.status, 202, "{}", started.text());
+    assert_eq!(started.json()["state"], "running");
+    let mut feed = app.events("?after=0", &[]).await;
+    // Agents paint for real until the switch is engaged.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut seen_swarm = false;
+    let mut seen_ambient = false;
+    while !(seen_swarm && seen_ambient) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agents did not push"
+        );
+        app.place.agents_tick();
+        while let Some(e) = feed.next(Duration::from_millis(100)).await {
+            if e.kind == "push" {
+                let b = e.data["branch"].as_str().unwrap();
+                seen_swarm |= b.starts_with("swarm/");
+                seen_ambient |= b.starts_with("agent/");
+            }
+        }
+    }
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/admin/kill-switch",
+            &[("Authorization", operator.as_str())],
+            Some(&engage),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let status = r.json();
+    assert_eq!(status["state"], "disabled");
+    assert_eq!(
+        status["killSwitch"],
+        json!({ "engaged": true, "reason": "Maintenance" })
+    );
+    // Let pushes already in flight land, then nothing new may start.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while app.place.agent_pushes_in_flight() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agent pushes never finished"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    while feed.next(Duration::from_millis(200)).await.is_some() {}
+    let quiet_from = app.get("/api/v1/canvas").await["seq"].as_u64().unwrap();
+    for _ in 0..30 {
+        app.place.agents_tick();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    while let Some(e) = feed.next(Duration::from_millis(300)).await {
+        assert!(
+            e.kind != "push" || e.data["seq"].as_u64().unwrap() <= quiet_from,
+            "an agent pushed after the kill switch: {e:?}"
+        );
+    }
+    let r = app.http("POST", "/api/v1/swarm", &[], None).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (503, json!("kill-switch"))
+    );
+    assert!(r.header("retry-after").is_some());
+    // Releasing it lets a later run start (after the cooldown).
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/admin/kill-switch",
+            &[("Authorization", operator.as_str())],
+            Some(&json!({ "engaged": false })),
+        )
+        .await;
+    assert_eq!(r.json()["killSwitch"]["engaged"], false);
+    assert_eq!(
+        app.http("POST", "/api/v1/swarm", &[], None).await.json()["error"],
+        "cooldown"
+    );
+}
+
+/// Invariant (C7 review obligation 1, D4 review): bad operator
+/// credentials drain the same failed-authentication bucket Git requests
+/// from the address draw on. Once it is empty, the kill switch answers 429
+/// before it checks a credential (no token lookup, and a valid operator
+/// token is refused too), and so does Git.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_operator_credentials_drain_the_git_failure_bucket() {
+    let limits = aspen_auth::LimitsConfig {
+        auth_failures: Some(aspen_auth::RateLimit {
+            burst: 3,
+            per_second: 0.001,
+        }),
+        ..aspen_auth::LimitsConfig::default()
+    };
+    let app = App::start_with_limits(limits, |_| {}).await;
+    let good = app.token("ops", &["admin:canvas"]);
+    // The right token id with a wrong secret: a store lookup, then a
+    // refusal.
+    let mut wrong = good.clone();
+    let last = if wrong.ends_with('0') { "1" } else { "0" };
+    wrong.replace_range(wrong.len() - 1.., last);
+    let operator = format!("Bearer {good}");
+    let bad = format!("Bearer {wrong}");
+    let engage = json!({ "engaged": true });
+    async fn kill(app: &App, auth: &str, engage: &serde_json::Value) -> Response {
+        app.http(
+            "POST",
+            "/api/v1/admin/kill-switch",
+            &[("Authorization", auth)],
+            Some(engage),
+        )
+        .await
+    }
+    for _ in 0..3 {
+        assert_eq!(kill(&app, &bad, &engage).await.status, 403);
+    }
+    assert_eq!(app.tokens.lookups(), 3);
+    for auth in [&bad, &operator] {
+        let r = kill(&app, auth, &engage).await;
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (429, json!("rate-limited")),
+            "{}",
+            r.text()
+        );
+        assert!(r.header("retry-after").is_some());
+    }
+    assert_eq!(app.tokens.lookups(), 3, "a limited credential was checked");
+    assert!(!app.place.with_state(|s| s.kill.engaged));
+    // The Git guard sees the same bucket.
+    use base64::Engine as _;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x:{good}"));
+    let auth = format!("Basic {basic}");
+    let git = app
+        .http(
+            "GET",
+            "/canvas.git/info/refs?service=git-upload-pack",
+            &[("Authorization", auth.as_str())],
+            None,
+        )
+        .await;
+    assert_eq!(git.status, 429, "{}", git.text());
+    assert_eq!(app.tokens.lookups(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_swarm_is_one_global_run_capped_by_the_server() {
+    let app = App::start(|c| {
+        c.swarm.pushes_per_second_cap = 5;
+        c.swarm.max_agents = 50;
+        c.swarm.ramp_ms = 1;
+        c.swarm.run_seconds = 2;
+        c.swarm.cooldown_seconds = 1;
+        c.swarm_starts_per_hour = 2;
+    })
+    .await;
+    assert_eq!(
+        app.http("POST", "/api/v1/swarm", &[], None).await.status,
+        202
+    );
+    // A second start while it runs is refused, whatever the client sends.
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/swarm",
+            &[],
+            Some(&json!({ "maxAgents": 100000 })),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (429, json!("cooldown"))
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
+    while tokio::time::Instant::now() < deadline {
+        app.place.agents_tick();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Let in-flight pushes land.
+    while app.place.agent_pushes_in_flight() > 0 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = app.get("/api/v1/swarm").await;
+    let pushes = status["pushes"].as_u64().unwrap();
+    assert!(pushes >= 1, "the swarm pushed nothing");
+    assert!(
+        pushes <= 5 * 2 + 1,
+        "{pushes} pushes in a 2 s run capped at 5/s"
+    );
+    let branches = app.get("/api/v1/branches").await;
+    let swarm_pushes: usize = branches["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["name"].as_str().unwrap().starts_with("swarm/"))
+        .count();
+    assert!(swarm_pushes >= 1);
+    // Cooldown over: one more start for this address, then the hourly cap.
+    assert_eq!(
+        app.http("POST", "/api/v1/swarm", &[], None).await.status,
+        202
+    );
+    for _ in 0..30 {
+        app.place.agents_tick();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    app.place.agents_tick();
+    let r = app.http("POST", "/api/v1/swarm", &[], None).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (429, json!("rate-limited")),
+        "{}",
+        r.text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_pushes_and_strokes_leave_nothing_waiting_in_the_hook() {
+    let app = App::start(|_| {}).await;
+    let w = app.clone_work("w").await;
+    let empty = aspen_place::place::HookBacklog {
+        accepted: 0,
+        committed: 0,
+    };
+    for n in 0..5 {
+        w.paint(&[(n, 3, RED)], "p");
+        let (ok, out) = w
+            .push(&[&app.url(), &format!("HEAD:refs/heads/paint/n{n}")])
+            .await;
+        assert!(ok, "{out}");
+        assert_eq!(app.place.hook_backlog(), empty, "after git push {n}");
+    }
+    // The server's own writes take their entries back too.
+    let s = app.http("POST", "/api/v1/sessions", &[], None).await.json();
+    let auth = format!("Bearer {}", s["token"].as_str().unwrap());
+    let stroke = json!({ "branch": s["branch"], "tiles": [{ "x": 9, "y": 9, "color": RED }] });
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/pushes",
+            &[("Authorization", &auth)],
+            Some(&stroke),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_eq!(app.place.hook_backlog(), empty, "after a web stroke");
+    assert_eq!(
+        app.get("/api/v1/branches").await["branches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_deleted_behind_the_services_back_still_expires() {
+    use aspen_core::meta::{CommitOutcome, MetaStore, PushCommit, RefWrite};
+    use aspen_core::refs::{Deps, RefValue};
+
+    let app = App::start(|c| c.branch_ttl = Duration::from_millis(300)).await;
+    let w = app.clone_work("w").await;
+    w.paint(&[(2, 2, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/gone"]).await.0);
+    app.place.merge_once().await.unwrap().unwrap();
+    // Deleted straight in the metadata store (another instance, an
+    // operator): the hook never hears of it, so expiry's delete is
+    // refused with `no such ref`.
+    let current = app.current("refs/heads/paint/gone").await.unwrap();
+    let deleted = app
+        .meta
+        .commit_push(&PushCommit {
+            repo: app.place.repo().id,
+            writes: vec![RefWrite {
+                name: current.name.clone(),
+                expected: Some(current.id),
+                value: RefValue::Deleted,
+                deps: Deps::default(),
+                commits: Vec::new(),
+                jobs: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(deleted, CommitOutcome::Committed(_)));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(app.place.expire_once().await.unwrap(), 1);
+    assert_eq!(app.get("/api/v1/branches").await["branches"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branches_expire_only_after_their_tiles_merge_and_their_ttl() {
+    let app = App::start(|c| c.branch_ttl = Duration::from_millis(800)).await;
+    let w = app.clone_work("w").await;
+    w.paint(&[(1, 1, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/x"]).await.0);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Past its TTL but unmerged: kept.
+    assert_eq!(app.place.expire_once().await.unwrap(), 0);
+    assert!(app.tip("refs/heads/paint/x").await.is_some());
+    app.place.merge_once().await.unwrap().unwrap();
+    let mut feed = app
+        .events(
+            &format!("?after={}", app.get("/api/v1/canvas").await["seq"]),
+            &[],
+        )
+        .await;
+    assert_eq!(app.place.expire_once().await.unwrap(), 1);
+    assert_eq!(app.tip("refs/heads/paint/x").await, None, "deleted in Git");
+    let e = feed.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (e.kind.as_str(), e.data["branch"].clone()),
+        ("expire", json!("paint/x"))
+    );
+    // Exactly one expire event, from the delete's own commit.
+    assert!(feed.next(Duration::from_millis(300)).await.is_none());
+    assert_eq!(app.get("/api/v1/branches").await["branches"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_reloads_main_and_branches_from_git_and_resumes_painting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let (pixels, token_branch) = {
+        let app = App::start_in(path.clone(), None, |_| {}).await;
+        let w = app.clone_work("w").await;
+        w.paint(&[(1, 2, RED), (3, 4, BLUE)], "p");
+        assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/r"]).await.0);
+        app.place.merge_once().await.unwrap().unwrap();
+        // A web stroke left unmerged.
+        let s = app.http("POST", "/api/v1/sessions", &[], None).await.json();
+        let auth = format!("Bearer {}", s["token"].as_str().unwrap());
+        let stroke =
+            json!({ "branch": s["branch"], "tiles": [{ "x": 7, "y": 7, "color": YELLOW }] });
+        assert_eq!(
+            app.http(
+                "POST",
+                "/api/v1/pushes",
+                &[("Authorization", &auth)],
+                Some(&stroke)
+            )
+            .await
+            .status,
+            201
+        );
+        (
+            app.get("/api/v1/canvas").await["pixels"].clone(),
+            s["branch"].as_str().unwrap().to_owned(),
+        )
+    };
+    let app = App::start_in(path, Some(dir), |_| {}).await;
+    let snap = app.get("/api/v1/canvas").await;
+    assert_eq!(snap["pixels"], pixels, "main's tiles come back from Git");
+    let names: Vec<String> = app.get("/api/v1/branches").await["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        names.contains(&"paint/r".to_owned()) && names.contains(&token_branch),
+        "{names:?}"
+    );
+    // The server can still write on a branch it did not write this run:
+    // it reads the branch's tree from Git.
+    let painted = app
+        .place
+        .paint(
+            &token_branch,
+            aspen_place::state::Actor::agent("t"),
+            &[aspen_place::rules::Tile {
+                x: 8,
+                y: 8,
+                color: 0,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    let w = app.clone_work("after").await;
+    w.run(&[
+        "fetch",
+        "-q",
+        &app.url(),
+        &format!("refs/heads/{token_branch}"),
+    ])
+    .await;
+    assert_eq!(
+        w.git(&["show", "FETCH_HEAD:tiles/7_7.txt"]),
+        "#ffd635\n",
+        "the earlier stroke is kept"
+    );
+    assert_eq!(w.git(&["show", "FETCH_HEAD:tiles/8_8.txt"]), "#ffffff\n");
+    assert_eq!(
+        w.git(&["rev-parse", "FETCH_HEAD"]).trim(),
+        painted.commit.to_string()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_background_loop_merges_on_its_own_and_cors_preflight_answers() {
+    let app = App::start(|c| c.merge_interval = Duration::from_millis(200)).await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+    let w = app.clone_work("w").await;
+    w.paint(&[(2, 2, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/bg"]).await.0);
+    let mut feed = app.events("?after=0", &[]).await;
+    feed.until(Duration::from_secs(5), |e| e.kind == "merge")
+        .await;
+    let r = app
+        .http(
+            "OPTIONS",
+            "/api/v1/pushes",
+            &[("Origin", "https://example.org")],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 204);
+    assert_eq!(r.header("access-control-allow-origin"), Some("*"));
+    assert!(
+        r.header("access-control-allow-headers")
+            .unwrap()
+            .contains("Authorization")
+    );
+    let r = app.http("GET", "/api/v1/nope", &[], None).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (404, json!("not-found"))
+    );
+    let _ = stop.send(());
+    run.await.unwrap();
+}
+
+/// Wraps the real place hook. Asked about the stroke on `paint/stroke`
+/// (caller key `place:internal`), it first runs more than `MAX_ACCEPTED` Git checks
+/// through the place hook that pass and never commit (each on its own new
+/// branch, as an `--atomic` push of many branches with a refused peer
+/// leaves them), then answers for the stroke itself.
+#[derive(Debug)]
+struct FloodingHook {
+    inner: aspen_place::hook::PlaceHook,
+    /// `main`'s tip, which each flood update is a branch on top of.
+    main: std::sync::OnceLock<aspen_core::id::ObjectId>,
+    flooded: std::sync::atomic::AtomicBool,
+}
+
+impl aspen_server::receive::hook::PushHook for FloodingHook {
+    fn check<'a>(
+        &'a self,
+        update: aspen_server::receive::hook::HookUpdate<'a>,
+        objects: &'a mut dyn aspen_server::receive::hook::HookObjects,
+    ) -> aspen_server::receive::hook::HookFuture<
+        'a,
+        Result<aspen_server::receive::hook::HookVerdict, aspen_core::error::StoreError>,
+    > {
+        use aspen_server::receive::hook::{Caller, HookUpdate, HookVerdict};
+        Box::pin(async move {
+            if update.caller.key == aspen_place::hook::INTERNAL_KEY
+                && update.name.as_str() == "refs/heads/paint/stroke"
+                && !self.flooded.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Every flood entry is strictly newer than the stroke's,
+                // so evicting the oldest would take the stroke's first.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let caller = Caller {
+                    principal: "anonymous".into(),
+                    key: "ip:203.0.113.9".into(),
+                };
+                for n in 0..aspen_place::hook::MAX_ACCEPTED + 10 {
+                    let name =
+                        aspen_core::name::RefName::new(format!("refs/heads/flood/{n}")).unwrap();
+                    let flood = HookUpdate {
+                        caller: &caller,
+                        name: &name,
+                        stored: None,
+                        trunk: self.main.get().copied(),
+                        ..update
+                    };
+                    let verdict = self.inner.check(flood, &mut *objects).await.unwrap();
+                    assert_eq!(verdict, HookVerdict::Accept, "flood {n}");
+                }
+            }
+            self.inner.check(update, objects).await
+        })
+    }
+
+    fn committed<'a>(
+        &'a self,
+        repo: &'a aspen_core::repo::Repo,
+        caller: &'a aspen_server::receive::hook::Caller,
+        updates: &'a [aspen_server::receive::hook::CommittedUpdate],
+    ) -> aspen_server::receive::hook::HookFuture<'a, ()> {
+        self.inner.committed(repo, caller, updates)
+    }
+}
+
+#[derive(Debug)]
+struct NoOperators;
+
+impl aspen_place::place::Operators for NoOperators {
+    fn is_operator<'a>(
+        &'a self,
+        _authorization: Option<&'a [u8]>,
+        _address: Option<std::net::IpAddr>,
+    ) -> aspen_server::receive::hook::HookFuture<'a, Result<bool, aspen_auth::LimitError>> {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+/// Invariant: Git checks that never commit, however many, cannot evict an
+/// in-flight stroke's entry. The stroke still gets its sequence number
+/// and its tiles, and the Git entries stay capped at `MAX_ACCEPTED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_checks_that_never_commit_cannot_evict_a_pending_stroke() {
+    use aspen_place::hook::{MAX_ACCEPTED, PlaceHook};
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("meta.db").display());
+    let meta = aspen_meta::SqlStore::connect(&url).await.unwrap();
+    meta.migrate().await.unwrap();
+    let blobs = aspen_blob::LocalBlobStore::open(dir.path().join("blobs")).unwrap();
+    let config = support::config();
+    let repo = aspen_place::place::ensure_repo(&meta, &config.repo)
+        .await
+        .unwrap();
+    let shared = aspen_place::place::shared(&repo, &config);
+    let hook = Arc::new(FloodingHook {
+        inner: PlaceHook(shared.clone()),
+        main: Default::default(),
+        flooded: Default::default(),
+    });
+    let mut receive = aspen_server::receive::ReceiveConfig::new(
+        dir.path().join("spool"),
+        aspen_pack::MaxObjectBytes::new(16 << 20).unwrap(),
+        aspen_pack::MaxInflatedBytes::new(256 << 20).unwrap(),
+    );
+    receive.hook = Some(hook.clone());
+    let server = aspen_server::Server::new(
+        meta.clone(),
+        blobs,
+        aspen_server::ServerConfig::new(aspen_pack::MaxObjectBytes::new(16 << 20).unwrap()),
+    )
+    .with_receive_pack(receive)
+    .unwrap();
+    let svc = server.receive_pack().unwrap().clone();
+    let place = aspen_place::Place::open(
+        config,
+        shared.clone(),
+        meta,
+        svc,
+        repo,
+        Arc::new(NoOperators),
+    )
+    .await
+    .unwrap();
+    hook.main.set(place.with_state(|s| s.main.commit)).unwrap();
+
+    let painted = place
+        .paint(
+            "paint/stroke",
+            Actor::agent("stroke"),
+            &[Tile {
+                x: 4,
+                y: 5,
+                color: 1,
+            }],
+            "",
+        )
+        .await
+        .expect("the stroke commits and gets its sequence number");
+    assert!(
+        hook.flooded.load(std::sync::atomic::Ordering::SeqCst),
+        "the flood ran"
+    );
+    let branch = place.with_state(|s| s.branches.get("paint/stroke").cloned());
+    let branch = branch.expect("the stroke's branch is on the canvas");
+    assert_eq!(branch.head, painted.commit);
+    // The flood's own entries never committed and stay capped.
+    assert_eq!(
+        place.hook_backlog(),
+        aspen_place::place::HookBacklog {
+            accepted: MAX_ACCEPTED,
+            committed: 0,
+        }
+    );
+}
+
+/// Paints one tile through the web API, as a fresh session; returns the
+/// push's `seq`.
+async fn web_stroke(app: &App, x: u32) -> u64 {
+    let s = app.http("POST", "/api/v1/sessions", &[], None).await;
+    assert_eq!(s.status, 201, "{}", s.text());
+    let s = s.json();
+    let auth = format!("Bearer {}", s["token"].as_str().unwrap());
+    let stroke = json!({ "branch": s["branch"], "tiles": [{ "x": x, "y": 0, "color": RED }] });
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/pushes",
+            &[("Authorization", auth.as_str())],
+            Some(&stroke),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    r.json()["seq"].as_u64().unwrap()
+}
+
+/// Invariant (#124, C7 review obligation 2): open event streams are capped
+/// per client address and in all, both checked when a stream opens; a
+/// refused stream is 429 with `Retry-After`, and a stream whose client went
+/// away gives its slot back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_streams_are_capped_per_address_and_in_total() {
+    let app = App::start(|c| {
+        c.max_event_streams_per_address = 2;
+        c.max_event_streams = 3;
+        // Tests speak for several addresses through X-Forwarded-For, sent
+        // from loopback, which the default trusted proxies include.
+        c.client_addr = aspen_server::access::ClientAddr::from_settings(1, None).unwrap();
+    })
+    .await;
+    let from = |ip: &'static str| [("X-Forwarded-For", ip)];
+    let a1 = app.events("", &from("192.0.2.1")).await;
+    let a2 = app.events("", &from("192.0.2.1")).await;
+    assert_eq!((a1.status, a2.status), (200, 200));
+    let a3 = app.events("", &from("192.0.2.1")).await;
+    assert_eq!(
+        a3.status,
+        429,
+        "a third stream from one address: {}",
+        a3.text()
+    );
+    // The refusal is the contract's Error body (read in full; the stream
+    // reader only decodes chunked bodies).
+    let r = app
+        .http("GET", "/api/v1/events", &from("192.0.2.1"), None)
+        .await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (429, json!("rate-limited"))
+    );
+    assert!(
+        a3.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("retry-after") && v.parse::<u64>().is_ok())
+    );
+    // An IPv6 caller counts by its /64: two addresses in one /64 share.
+    let v1 = app.events("", &from("2001:db8:1:2::1")).await;
+    assert_eq!(v1.status, 200);
+    // Three open in all: a new address is refused too.
+    let c = app.events("", &from("192.0.2.3")).await;
+    assert_eq!(c.status, 429, "a fourth stream in all: {}", c.text());
+    // A client that hangs up frees its slot once a write to it fails, here
+    // on the next events (in production at the latest on a heartbeat).
+    drop((a1, a2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut x = 0;
+    loop {
+        web_stroke(&app, x % 16).await;
+        x += 1;
+        let c = app.events("", &from("192.0.2.3")).await;
+        if c.status == 200 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "closed streams never gave their slots back"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let v2 = app.events("", &from("2001:db8:1:2::2")).await;
+    let v3 = app.events("", &from("2001:db8:1:2::3")).await;
+    assert_eq!(
+        (v2.status, v3.status),
+        (200, 429),
+        "one /64 holds at most two"
+    );
+    // v1, v2 and the last loop stream (dropped, but holding its slot until
+    // a write to it fails) fill the total too, so the refusal must name the
+    // per-address cap, or a broken /64 key would pass unnoticed.
+    let refused = app
+        .http("GET", "/api/v1/events", &from("2001:db8:1:2::4"), None)
+        .await;
+    assert_eq!(refused.status, 429);
+    let message = refused.json()["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains("from this address"),
+        "refused by the per-address cap, not the total: {message}"
+    );
+}
+
+/// Invariant (#124): a stream ends at its age limit, which frees its slot,
+/// and a client that reconnects with the `seq` of the last event it saw
+/// misses nothing that happened while it was away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_streams_end_at_their_age_limit_and_resume_without_loss() {
+    let app = App::start(|c| {
+        c.event_stream_max_age = Duration::from_secs(1);
+        c.max_event_streams_per_address = 1;
+    })
+    .await;
+    let from = app.get("/api/v1/canvas").await["seq"].as_u64().unwrap();
+    // Pushed before the stream opens and replayed from `after`, so a slow
+    // push cannot outlast the 1 s stream.
+    let first = web_stroke(&app, 1).await;
+    let opened = tokio::time::Instant::now();
+    let mut s = app.events(&format!("?after={from}"), &[]).await;
+    assert_eq!(s.status, 200);
+    // The one slot is taken while it runs.
+    assert_eq!(app.events("", &[]).await.status, 429);
+    let e = s.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e.id, Some(first));
+    assert!(
+        s.ended(Duration::from_secs(5)).await,
+        "the stream never ended"
+    );
+    let age = opened.elapsed();
+    assert!(
+        age >= Duration::from_millis(900),
+        "ended after {age:?}, before its 1 s age limit"
+    );
+    // Missed while disconnected, then replayed on resume.
+    let second = web_stroke(&app, 2).await;
+    let mut again = app.events(&format!("?after={}", e.id.unwrap()), &[]).await;
+    assert_eq!(again.status, 200, "the ended stream kept its slot");
+    let e = again.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!((e.id, e.kind.as_str()), (Some(second), "push"));
+}
+
+/// Invariant (#124, C7 review obligation 3): the busy check and the
+/// address's start charge are one step, so a burst of concurrent starts
+/// from one address starts one run and spends one of its starts, and
+/// refused starts spend none: over `STARTS` bursts the address gets
+/// exactly `STARTS` runs, then is refused as `rate-limited`.
+///
+/// Each burst is lined up behind the web sessions' lock, which the start
+/// charge takes. Before #124 the handler checked "busy", then charged the
+/// start under that lock, then started the run, three separate steps, so
+/// every start of a burst passed the check and spent a start while one ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_swarm_starts_from_one_address_spend_one_start() {
+    const STARTS: usize = 3;
+    const BURST: usize = 8;
+    let app = App::start(|c| {
+        c.swarm.pushes_per_second_cap = 1;
+        c.swarm.max_agents = 1;
+        c.swarm.run_seconds = 3600;
+        c.swarm.cooldown_seconds = 0;
+        c.swarm_starts_per_hour = STARTS;
+    })
+    .await;
+    for round in 1..=STARTS + 1 {
+        let place = app.place.clone();
+        let hold = tokio::task::spawn_blocking(move || {
+            let _sessions = place.lock_sessions();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let responses = burst(&app.base, "POST", "/api/v1/swarm", BURST).await;
+        hold.await.unwrap();
+        let mut accepted = 0;
+        let mut refusals = Vec::new();
+        for r in responses {
+            match r.status {
+                202 => accepted += 1,
+                429 => refusals.push(r.json()["error"].as_str().unwrap().to_owned()),
+                other => panic!("round {round}: {other}: {}", r.text()),
+            }
+        }
+        if round <= STARTS {
+            assert_eq!(
+                (accepted, refusals.iter().all(|e| e == "cooldown")),
+                (1, true),
+                "round {round} of {STARTS}: one run, the rest refused as busy \
+                 without spending a start: {refusals:?}"
+            );
+        } else {
+            assert_eq!(accepted, 0);
+            assert!(
+                refusals.iter().all(|e| e == "rate-limited"),
+                "after {STARTS} runs: {refusals:?}"
+            );
+        }
+        // End the run; with no cooldown the next burst may start one.
+        app.place
+            .with_state(|s| s.end_swarm_run(aspen_place::state::now_ms()));
+    }
+}
+
+/// Every merge is a push to `main`, and a clone plans the whole of
+/// `main`'s history. Without Aspen's background worker each of those
+/// pushes stays its own pack, so a clone stitches one stored pack per
+/// merge, one blob read after another: the public demo's `main` reached
+/// 4,941 packs and a full clone took 253 s. The worker `build` returns
+/// repacks them into covers, which the planner picks instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_background_worker_compacts_main_into_covers() {
+    use aspen_core::meta::MetaStore;
+    use aspen_core::name::RefName;
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+
+    let app = App::start(|_| {}).await;
+    // The default layout covers every 16 versions of a ref at level 1.
+    for i in 0..20u32 {
+        app.place
+            .paint(
+                "paint/compact",
+                Actor::agent("compact"),
+                &[Tile {
+                    x: i % 16,
+                    y: i / 16,
+                    color: (i % 8) as u8,
+                }],
+                "stroke",
+            )
+            .await
+            .unwrap();
+        app.place.merge_once().await.unwrap().expect("a merge");
+    }
+    let main = RefName::new("refs/heads/main").unwrap();
+    let covered = |covers: &[aspen_core::meta::Cover]| covers.iter().any(|c| c.pack.is_some());
+    let before = app.meta.covers(app.place.repo().id, &main).await.unwrap();
+    assert!(!covered(&before), "nothing compacts before the worker runs");
+
+    let mut worker = app.worker.lock().await;
+    let mut ran = 0;
+    while let Some(outcome) = worker.run_one().await.unwrap() {
+        assert!(
+            matches!(outcome, aspen_compact::JobOutcome::Done { .. }),
+            "{outcome:?}"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "pushes enqueue compaction and indexing jobs");
+    let after = app.meta.covers(app.place.repo().id, &main).await.unwrap();
+    assert!(
+        covered(&after),
+        "main's first 16 versions are one pack: {after:?}"
+    );
+
+    // The compacted history still clones.
+    let check = app.clone_work("check").await;
+    assert_eq!(
+        check.git(&["rev-parse", "HEAD"]).trim(),
+        app.tip("refs/heads/main").await.unwrap()
+    );
+}
+
+/// Ambient strokes alone are merged at most once per
+/// `ambient_merge_interval`, a person's push is merged on the next run and
+/// takes them along, and an ambient agent's branch is deleted as soon as
+/// its strokes are in `main`. Every merge adds a whole `tiles/` tree to
+/// `main`, and every advertised branch's strokes go to every clone: on the
+/// public demo a merge every 3 s and ever-growing agent branches made a
+/// full clone grow by hundreds of megabytes a day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ambient_strokes_merge_rarely_and_their_branches_go_once_merged() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+
+    let app = App::start(|c| {
+        c.merge_interval = Duration::from_millis(100);
+        c.ambient_merge_interval = Duration::from_secs(3600);
+    })
+    .await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+    let place = app.place.clone();
+    let stroke = |x| {
+        let place = place.clone();
+        async move {
+            place
+                .paint(
+                    "agent/wren-12",
+                    Actor::agent("agent/wren-12"),
+                    &[Tile { x, y: 0, color: 3 }],
+                    "Ambient stroke",
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let mut feed = app.events("?after=0", &[]).await;
+
+    // The first ambient-only merge runs at once; the branch then goes.
+    stroke(1).await;
+    feed.until(Duration::from_secs(5), |e| e.kind == "expire")
+        .await;
+    assert_eq!(app.tip("refs/heads/agent/wren-12").await, None);
+    let main = app.tip("refs/heads/main").await;
+
+    // The next one waits for the interval.
+    stroke(2).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(app.tip("refs/heads/main").await, main, "not merged alone");
+    assert!(app.tip("refs/heads/agent/wren-12").await.is_some());
+
+    // A person's push is merged on the next run, with the ambient stroke.
+    let w = app.clone_work("w").await;
+    w.paint(&[(5, 5, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/bg"]).await.0);
+    let merged = feed
+        .until(Duration::from_secs(5), |e| {
+            e.kind == "merge" && e.data["branches"].as_array().is_some_and(|b| b.len() == 2)
+        })
+        .await;
+    assert!(!merged.is_empty());
+    feed.until(Duration::from_secs(5), |e| e.kind == "expire")
+        .await;
+    assert_eq!(app.tip("refs/heads/agent/wren-12").await, None);
+    assert!(
+        app.tip("refs/heads/paint/bg").await.is_some(),
+        "a person's branch keeps the TTL"
+    );
+    let _ = stop.send(());
+    run.await.unwrap();
+}

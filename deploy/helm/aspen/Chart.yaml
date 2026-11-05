@@ -1,0 +1,17 @@
+apiVersion: v2
+name: aspen
+description: >-
+  Aspen, a self-hostable Git server for agent-scale traffic: `aspen serve`
+  (Git over HTTP) and, optionally, standalone `aspen express` pack caches.
+  Bring your own PostgreSQL and S3-compatible bucket.
+type: application
+# The chart's own version. Bump it with any change under deploy/helm/aspen.
+version: 0.1.0
+# The Aspen release the chart deploys by default (image tag v<appVersion>).
+# Bump it with the workspace version; CI and the release workflow check that
+# the two agree (and match the release tag) but never set them.
+appVersion: "0.0.0"
+home: https://github.com/reason-machines/aspen
+sources:
+  - https://github.com/reason-machines/aspen
+kubeVersion: ">=1.27.0-0"

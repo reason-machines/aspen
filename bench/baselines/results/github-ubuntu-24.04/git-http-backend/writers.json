@@ -1,0 +1,91 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "git-http-backend",
+    "url": "http://127.0.0.1:8081/bench-writers-1793684953.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "pushes_per_writer": null,
+    "repo_changes_per_commit": 10,
+    "repo_commits": 20,
+    "repo_file_bytes": 4096,
+    "repo_files": 200,
+    "repo_seed": 1,
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": "29c5bb990e8e992eeebda64b61feb49337253bf3",
+    "git_version": "git version 2.56.0",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "7.0.0-1017-azure",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpus": 2,
+    "memory_bytes": 8317935616,
+    "ci": "github-actions",
+    "runner": "GitHub Actions 1000276802"
+  },
+  "started_at_unix_ms": 1793684954124,
+  "wall_seconds": 30.944762183,
+  "latencies_ms": {
+    "push": {
+      "count": 502,
+      "min": 187.445403,
+      "mean": 908.851981041833,
+      "p50": 947.069231,
+      "p90": 1163.765924,
+      "p99": 1301.8117650000002,
+      "max": 1386.2442429999999
+    },
+    "push_to_fetch": {
+      "count": 502,
+      "min": 348.913546,
+      "mean": 1736.4061745358579,
+      "p50": 1685.673601,
+      "p90": 2725.029402,
+      "p99": 3230.6104530000002,
+      "max": 3327.7039849999996
+    },
+    "reader_fetch": {
+      "count": 502,
+      "min": 345.15522500000003,
+      "mean": 1733.0472988286863,
+      "p50": 1685.555033,
+      "p90": 2721.580496,
+      "p99": 3228.22844,
+      "max": 3327.590244
+    },
+    "reader_queue": {
+      "count": 502,
+      "min": 0.048042,
+      "mean": 3.322171336653386,
+      "p50": 0.36595,
+      "p90": 4.047987,
+      "p99": 75.60721199999999,
+      "max": 127.148418
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 16.222454612231008
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 502,
+    "reader_fetches": 502,
+    "readers_created": 43,
+    "seen": 502,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

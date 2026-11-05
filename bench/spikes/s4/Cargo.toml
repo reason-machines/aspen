@@ -1,0 +1,25 @@
+# Spike S4 (docs/PLAN.md): streaming gix-pack ingest of a multi-GB pack.
+#
+# This is a throwaway measurement harness, deliberately kept out of the main
+# Cargo workspace (it has its own `[workspace]` table and lockfile) so it adds
+# nothing to required CI. The production ingest lives in `crates/aspen-pack`.
+[package]
+name = "aspen-spike-s4"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+gix-pack = { version = "=0.77.0", default-features = false, features = ["streaming-input", "parallel", "sha1"] }
+gix-hash = { version = "=0.28.1", features = ["sha1"] }
+gix-object = "=0.66.1"
+gix-utils = { version = "=0.5.2", features = ["progress"] }
+gix-error = "=0.5.2"
+gix-zlib = "=0.4.0"
+serde_json = "1"
+
+[profile.release]
+debug = "line-tables-only"

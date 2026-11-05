@@ -1,0 +1,24 @@
+[package]
+name = "aspen-chaos"
+description = "Chaos suite: real aspen serve processes under injected faults (killed processes, S3 and database faults, network partitions), checked for lost pushes, unfetchable refs and non-linearizable ref histories."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aspen-chaos"
+path = "src/main.rs"
+
+# A black-box suite: it drives the `aspen` binary and stock `git` over the
+# network and reads (and ends job leases in) Postgres with `psql`, so it
+# depends on no product crate, only on the test kit.
+[dependencies]
+aspen-testkit = { path = "../../testkit" }
+clap.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

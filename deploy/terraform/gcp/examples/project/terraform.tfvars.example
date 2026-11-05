@@ -1,0 +1,8 @@
+project_id          = "acme-aspen"
+region              = "us-central1"
+domain_name         = "git.example.com"
+dns_managed_zone    = "example-com"
+container_image     = "us-docker.pkg.dev/acme-aspen/ghcr/reason-machines/aspen:v0.1.0"
+billing_account     = "000000-000000-000000"
+budget_alert_emails = ["ops@example.com"]
+# express_keys_secret_id = "aspen-express-keys"

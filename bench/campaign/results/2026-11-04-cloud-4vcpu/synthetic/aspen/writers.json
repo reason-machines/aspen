@@ -1,0 +1,92 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "aspen",
+    "url": "http://127.0.0.1:8086/bench-writers-1793753719.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "push_url": "branch-scoped",
+    "pushes_per_writer": null,
+    "repo_changes_per_commit": 10,
+    "repo_commits": 20,
+    "repo_file_bytes": 4096,
+    "repo_files": 200,
+    "repo_seed": 1,
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793753720114,
+  "wall_seconds": 30.224508642,
+  "latencies_ms": {
+    "push": {
+      "count": 1925,
+      "min": 41.409501,
+      "mean": 206.1337888249352,
+      "p50": 201.27667899999997,
+      "p90": 293.921548,
+      "p99": 391.95766399999997,
+      "max": 771.762628
+    },
+    "push_to_fetch": {
+      "count": 1925,
+      "min": 45.527349,
+      "mean": 208.21072806805194,
+      "p50": 201.696598,
+      "p90": 281.54547099999996,
+      "p99": 384.489948,
+      "max": 506.76062
+    },
+    "reader_fetch": {
+      "count": 1925,
+      "min": 44.107686,
+      "mean": 198.23492884415575,
+      "p50": 191.946304,
+      "p90": 270.902726,
+      "p99": 374.666915,
+      "max": 506.061502
+    },
+    "reader_queue": {
+      "count": 1925,
+      "min": 0.036149,
+      "mean": 9.916150883636368,
+      "p50": 7.391158999999999,
+      "p90": 22.075154,
+      "p99": 41.050125,
+      "max": 64.39715
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 63.69003456105879
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 1925,
+    "reader_fetches": 1925,
+    "readers_created": 32,
+    "seen": 1925,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}

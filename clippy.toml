@@ -1,0 +1,3 @@
+# Tests may unwrap and panic freely; production code should not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,0 +1,612 @@
+openapi: 3.1.0
+info:
+  title: place API
+  version: 1.0.0
+  summary: Canvas state, branch overlays, painting and the live event stream for the place demo.
+  description: |
+    `place` is a shared pixel canvas stored in a real Git repository. Each
+    tile is a file, `tiles/<x>_<y>.txt`, holding one palette color (see
+    `docs/TILES.md` for the exact format and push rules). Visitors paint
+    through this API; anyone can also clone the repository and `git push`.
+    Both paths produce the same thing: a commit on the pusher's own branch.
+    A merger bot folds every branch into `main` every few seconds.
+
+    This document is the contract between the web front end in `demo/place`
+    and the back end (plan node C7). The mock in `demo/place/mock` implements
+    it, and `demo/place/test/contract.test.ts` checks the mock's responses
+    against the schemas below.
+
+    Conventions:
+
+    - All paths are relative to the server URL, `/api/v1`.
+    - Request and response bodies are JSON (`application/json; charset=utf-8`),
+      except `GET /events`, which is `text/event-stream`.
+    - Timestamps are RFC 3339 strings in UTC.
+    - Colors are lowercase `#rrggbb` strings from the palette in `GET /config`.
+    - Every push and every merge gets a sequence number (`seq`) from one
+      counter, strictly increasing. Streams and snapshots use it to line up.
+    - Every non-2xx response has an `Error` body. 429 and 503 responses also
+      carry a `Retry-After` header in seconds.
+    - Responses are not cacheable (`Cache-Control: no-store`), and the API
+      sends `Access-Control-Allow-Origin: *` so the page can live on another
+      origin.
+servers:
+  - url: /api/v1
+    description: Same origin as the page.
+tags:
+  - name: canvas
+  - name: painting
+  - name: events
+  - name: swarm
+paths:
+  /config:
+    get:
+      tags: [canvas]
+      operationId: getConfig
+      summary: Canvas size, palette, limits and links.
+      description: Static for the lifetime of the canvas. Clients fetch it once at start.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Config" }
+  /canvas:
+    get:
+      tags: [canvas]
+      operationId: getCanvas
+      summary: Snapshot of main plus every branch's unmerged tiles.
+      description: |
+        To stay current, read this snapshot, then open `GET /events?after=<seq>`
+        with the snapshot's `seq`. Events with a `seq` at or below it are
+        already included.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CanvasSnapshot" }
+  /branches:
+    get:
+      tags: [canvas]
+      operationId: listBranches
+      summary: Live branches, including ones whose tiles have all merged but which have not expired.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [branches]
+                properties:
+                  branches:
+                    type: array
+                    items: { $ref: "#/components/schemas/BranchSummary" }
+  /sessions:
+    post:
+      tags: [painting]
+      operationId: createSession
+      summary: Gives this visitor a branch of their own and a token to push to it.
+      description: |
+        The server picks the branch name (`visitors/<id>`). The token is a
+        bearer secret; clients keep it in session storage and send it as
+        `Authorization: Bearer <token>`. Sessions are rate limited per client
+        address.
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /quota:
+    get:
+      tags: [painting]
+      operationId: getQuota
+      summary: The calling session's push quota.
+      security: [{ session: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quota" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /pushes:
+    post:
+      tags: [painting]
+      operationId: push
+      summary: Paints one stroke as one commit on the session's branch.
+      description: |
+        The server writes each tile as `tiles/<x>_<y>.txt` in one commit on
+        top of the branch (or on top of `main` for the branch's first push)
+        and updates the branch. The same rules as a `git push` apply
+        (`docs/TILES.md`); a stroke additionally may not name one tile twice.
+        The response arrives before or after the stream delivers the same
+        push; clients deduplicate by `seq`.
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PushRequest" }
+      responses:
+        "201":
+          description: Pushed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The session may not push to this branch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            The stroke breaks a tile rule. `error` is `rejected` and
+            `rejections` lists every problem found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /events:
+    get:
+      tags: [events]
+      operationId: streamEvents
+      summary: Server-sent events for pushes, merges, branch expiry and the swarm.
+      description: |
+        A `text/event-stream` (WHATWG HTML, server-sent events). Each event
+        has `id: <seq>`, `event: <type>` and `data: <JSON>`, where the JSON
+        matches `Event` and its `type` equals the SSE event name. The server
+        sends `retry: <ms>` first and a comment line at least every 15 s.
+
+        Resuming: pass the last `seq` seen as `after`, or let `EventSource`
+        send `Last-Event-ID`. The server first replays every event after it,
+        then streams live. If it no longer has those events, it sends one
+        `resync` event; the client reloads `GET /canvas` and reconnects with
+        the snapshot's `seq`. Without `after`, the stream starts at the live
+        edge.
+
+        Swarm pushes can reach `SwarmStatus.pushesPerSecondCap` events per
+        second; clients should batch rendering.
+
+        The server limits how many streams one client address, and all
+        clients together, may hold open (more get 429 with `Retry-After`;
+        retry no sooner than that), and ends each stream after at most a
+        maximum age (10 minutes by default). A client whose stream ends
+        reconnects with the `seq` of the last event it saw and misses
+        nothing.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string, pattern: "^[0-9]+$" }
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/Event" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /swarm:
+    get:
+      tags: [swarm]
+      operationId: getSwarm
+      summary: State of the "Unleash 1,000 agents" load burst.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwarmStatus" }
+    post:
+      tags: [swarm]
+      operationId: startSwarm
+      summary: Starts one bounded run of simulated agents, each pushing to its own branch.
+      description: |
+        A run ramps up to `maxAgents` agents over a few seconds and lasts
+        `runSeconds`. The whole swarm never exceeds `pushesPerSecondCap`
+        pushes per second. After a run, the swarm cools down before the next
+        can start, and each client address may start a limited number of runs
+        per hour. While the operators' kill switch is engaged, starts fail with
+        503 and a running swarm stops at once.
+      responses:
+        "202":
+          description: Started.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwarmStatus" }
+        "429":
+          description: |
+            `error` is `cooldown` (a run is in progress or just ended) or
+            `rate-limited` (this address started too many runs).
+          headers:
+            Retry-After: { $ref: "#/components/headers/RetryAfter" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: The kill switch is engaged. `error` is `kill-switch`.
+          headers:
+            Retry-After: { $ref: "#/components/headers/RetryAfter" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /admin/kill-switch:
+    post:
+      tags: [swarm]
+      operationId: setKillSwitch
+      summary: Engages or releases the swarm kill switch. Operators only.
+      description: |
+        Not used by the public page. Engaging it ends a running swarm at once,
+        refuses new swarm starts and pauses every server-side simulated agent
+        (ambient agents included) until it is released. The real back end
+        decides how operators authenticate and must not use a static token in
+        production; the mock accepts a static bearer token.
+      security: [{ operator: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [engaged]
+              properties:
+                engaged: { type: boolean }
+                reason: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: The new swarm state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwarmStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403":
+          description: Not an operator.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+components:
+  securitySchemes:
+    session:
+      type: http
+      scheme: bearer
+      description: The `token` from `POST /sessions`.
+    operator:
+      type: http
+      scheme: bearer
+  headers:
+    RetryAfter:
+      description: Seconds until the request may succeed.
+      schema: { type: integer, minimum: 1 }
+  responses:
+    BadRequest:
+      description: The body is not valid JSON or does not match the schema.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or unknown session token. Create a new session.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests. Wait `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Color:
+      type: string
+      pattern: "^#[0-9a-f]{6}$"
+      description: Lowercase hex color from the palette.
+    Oid:
+      type: string
+      pattern: "^[0-9a-f]{40}$"
+      description: A Git commit id (SHA-1).
+    Timestamp:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
+    BranchName:
+      type: string
+      description: Short branch name without `refs/heads/`, e.g. `visitors/k3x9pq2` or `paint/ada`.
+      minLength: 1
+      maxLength: 100
+    PaletteEntry:
+      type: object
+      additionalProperties: false
+      required: [color, name]
+      properties:
+        color: { $ref: "#/components/schemas/Color" }
+        name: { type: string }
+    Tile:
+      type: object
+      additionalProperties: false
+      required: [x, y, color]
+      properties:
+        x: { type: integer, minimum: 0 }
+        y: { type: integer, minimum: 0 }
+        color: { $ref: "#/components/schemas/Color" }
+    OverlayTile:
+      type: object
+      additionalProperties: false
+      required: [x, y, color, seq]
+      properties:
+        x: { type: integer, minimum: 0 }
+        y: { type: integer, minimum: 0 }
+        color: { $ref: "#/components/schemas/Color" }
+        seq: { type: integer, minimum: 1, description: The push that painted it. }
+    Limits:
+      type: object
+      additionalProperties: false
+      required: [tilesPerPush, pushesPerMinute, branchTtlSeconds]
+      properties:
+        tilesPerPush: { type: integer, minimum: 1, description: Most tiles one push may change. }
+        pushesPerMinute: { type: integer, minimum: 1, description: Pushes per session per rolling minute. }
+        branchTtlSeconds:
+          type: integer
+          minimum: 1
+          description: A branch idle this long is deleted once its tiles have merged.
+    Config:
+      type: object
+      additionalProperties: false
+      required: [cloneUrl, dashboardUrl, canvas, limits, mergeIntervalMs]
+      properties:
+        cloneUrl:
+          type: string
+          description: What to pass to `git clone`, e.g. `https://place.example.com/canvas.git`. The domain is deployment configuration.
+        dashboardUrl:
+          type: [string, "null"]
+          description: The live metrics dashboard, or null when there is none.
+        canvas:
+          type: object
+          additionalProperties: false
+          required: [width, height, palette]
+          properties:
+            width: { type: integer, minimum: 1, maximum: 4096 }
+            height: { type: integer, minimum: 1, maximum: 4096 }
+            palette:
+              type: array
+              minItems: 2
+              maxItems: 36
+              items: { $ref: "#/components/schemas/PaletteEntry" }
+        limits: { $ref: "#/components/schemas/Limits" }
+        mergeIntervalMs: { type: integer, minimum: 1 }
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [kind, label]
+      properties:
+        kind:
+          type: string
+          enum: [visitor, agent, git]
+          description: "`visitor` painted on the page, `agent` is a simulated or swarm agent, `git` pushed with a Git client."
+        label: { type: string }
+    BranchOverlay:
+      type: object
+      additionalProperties: false
+      required: [name, actor, head, tiles, updatedAt, expiresAt]
+      properties:
+        name: { $ref: "#/components/schemas/BranchName" }
+        actor: { $ref: "#/components/schemas/Actor" }
+        head: { $ref: "#/components/schemas/Oid" }
+        tiles:
+          type: array
+          description: The branch's tiles that are not in main yet, one per position (newest wins).
+          items: { $ref: "#/components/schemas/OverlayTile" }
+        updatedAt: { $ref: "#/components/schemas/Timestamp" }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+    CanvasSnapshot:
+      type: object
+      additionalProperties: false
+      required: [seq, mergedThroughSeq, mainCommit, width, height, pixels, branches]
+      properties:
+        seq: { type: integer, minimum: 0, description: The last event this snapshot includes. }
+        mergedThroughSeq: { type: integer, minimum: 0, description: Every push with seq at or below this is in main. }
+        mainCommit: { $ref: "#/components/schemas/Oid" }
+        width: { type: integer, minimum: 1 }
+        height: { type: integer, minimum: 1 }
+        pixels:
+          type: string
+          pattern: "^[.0-9a-z]*$"
+          description: |
+            main's tiles, row-major (index `y * width + x`), one character
+            each: `.` for a tile never painted, otherwise the palette index in
+            base 36 (`0`-`9`, then `a`-`z`). Length is `width * height`.
+        branches:
+          type: array
+          description: Branches with at least one unmerged tile.
+          items: { $ref: "#/components/schemas/BranchOverlay" }
+    BranchSummary:
+      type: object
+      additionalProperties: false
+      required: [name, actor, head, pendingTiles, updatedAt, expiresAt]
+      properties:
+        name: { $ref: "#/components/schemas/BranchName" }
+        actor: { $ref: "#/components/schemas/Actor" }
+        head: { $ref: "#/components/schemas/Oid" }
+        pendingTiles: { type: integer, minimum: 0 }
+        updatedAt: { $ref: "#/components/schemas/Timestamp" }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+    Quota:
+      type: object
+      additionalProperties: false
+      required: [pushesPerMinute, remaining, resetAt, tilesPerPush]
+      properties:
+        pushesPerMinute: { type: integer, minimum: 1 }
+        remaining: { type: integer, minimum: 0 }
+        resetAt: { $ref: "#/components/schemas/Timestamp" }
+        tilesPerPush: { type: integer, minimum: 1 }
+    Session:
+      type: object
+      additionalProperties: false
+      required: [branch, token, expiresAt, quota]
+      properties:
+        branch: { $ref: "#/components/schemas/BranchName" }
+        token: { type: string, minLength: 16 }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+        quota: { $ref: "#/components/schemas/Quota" }
+    PushRequest:
+      type: object
+      additionalProperties: false
+      required: [branch, tiles]
+      properties:
+        branch: { $ref: "#/components/schemas/BranchName" }
+        tiles:
+          type: array
+          minItems: 1
+          description: At most `limits.tilesPerPush` tiles, each position at most once.
+          items: { $ref: "#/components/schemas/Tile" }
+        message: { type: string, maxLength: 200, description: Optional commit message. }
+    PushResult:
+      type: object
+      additionalProperties: false
+      required: [seq, branch, commit, parent, tiles, quota]
+      properties:
+        seq: { type: integer, minimum: 1 }
+        branch: { $ref: "#/components/schemas/BranchName" }
+        commit: { $ref: "#/components/schemas/Oid" }
+        parent: { $ref: "#/components/schemas/Oid" }
+        tiles:
+          type: array
+          items: { $ref: "#/components/schemas/Tile" }
+        quota: { $ref: "#/components/schemas/Quota" }
+    SwarmStatus:
+      type: object
+      additionalProperties: false
+      required:
+        [state, agents, maxAgents, pushesPerSecondCap, runSeconds, pushes, startedAt, endsAt, cooldownUntil, killSwitch]
+      properties:
+        state:
+          type: string
+          enum: [idle, running, cooldown, disabled]
+          description: "`disabled` whenever the kill switch is engaged."
+        agents: { type: integer, minimum: 0, description: Agents pushing right now. }
+        maxAgents: { type: integer, minimum: 1 }
+        pushesPerSecondCap: { type: integer, minimum: 1 }
+        runSeconds: { type: integer, minimum: 1 }
+        pushes: { type: integer, minimum: 0, description: Pushes in the current or last run. }
+        startedAt: { type: [string, "null"] }
+        endsAt: { type: [string, "null"] }
+        cooldownUntil: { type: [string, "null"], description: Set while state is cooldown. }
+        killSwitch:
+          type: object
+          additionalProperties: false
+          required: [engaged, reason]
+          properties:
+            engaged: { type: boolean }
+            reason: { type: [string, "null"] }
+    Rejection:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - outside-tiles
+            - bad-tile-path
+            - out-of-bounds
+            - bad-mode
+            - delete-not-allowed
+            - bad-format
+            - color-not-in-palette
+            - too-many-tiles
+            - duplicate-tile
+            - empty-stroke
+            - merge-commit
+            - protected-ref
+            - bad-ref
+        path: { type: string, description: The file, commit or ref the rejection is about. }
+        message: { type: string, description: One line for a person reading `git push` output. }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [bad-request, unauthorized, forbidden, not-found, rejected, rate-limited, kill-switch, cooldown]
+        message: { type: string }
+        rejections:
+          type: array
+          items: { $ref: "#/components/schemas/Rejection" }
+        retryAfterSeconds: { type: integer, minimum: 1 }
+    PushEvent:
+      type: object
+      additionalProperties: false
+      required: [type, seq, branch, actor, commit, tiles, at]
+      properties:
+        type: { const: push }
+        seq: { type: integer, minimum: 1 }
+        branch: { $ref: "#/components/schemas/BranchName" }
+        actor: { $ref: "#/components/schemas/Actor" }
+        commit: { $ref: "#/components/schemas/Oid" }
+        tiles:
+          type: array
+          items: { $ref: "#/components/schemas/Tile" }
+        at: { $ref: "#/components/schemas/Timestamp" }
+    MergeEvent:
+      type: object
+      additionalProperties: false
+      required: [type, seq, commit, throughSeq, tiles, branches, at]
+      properties:
+        type: { const: merge }
+        seq: { type: integer, minimum: 1 }
+        commit: { $ref: "#/components/schemas/Oid" }
+        throughSeq: { type: integer, minimum: 1, description: Every push with seq at or below this is now in main. }
+        tiles:
+          type: array
+          description: main's new color for every tile this merge changed.
+          items: { $ref: "#/components/schemas/Tile" }
+        branches:
+          type: array
+          items: { $ref: "#/components/schemas/BranchName" }
+        at: { $ref: "#/components/schemas/Timestamp" }
+    ExpireEvent:
+      type: object
+      additionalProperties: false
+      required: [type, seq, branch, at]
+      properties:
+        type: { const: expire }
+        seq: { type: integer, minimum: 1 }
+        branch: { $ref: "#/components/schemas/BranchName" }
+        at: { $ref: "#/components/schemas/Timestamp" }
+    SwarmEvent:
+      type: object
+      additionalProperties: false
+      required: [type, seq, status, at]
+      properties:
+        type: { const: swarm }
+        seq: { type: integer, minimum: 1 }
+        status: { $ref: "#/components/schemas/SwarmStatus" }
+        at: { $ref: "#/components/schemas/Timestamp" }
+    ResyncEvent:
+      type: object
+      additionalProperties: false
+      required: [type, seq, at]
+      properties:
+        type: { const: resync }
+        seq: { type: integer, minimum: 0 }
+        at: { $ref: "#/components/schemas/Timestamp" }
+    Event:
+      oneOf:
+        - { $ref: "#/components/schemas/PushEvent" }
+        - { $ref: "#/components/schemas/MergeEvent" }
+        - { $ref: "#/components/schemas/ExpireEvent" }
+        - { $ref: "#/components/schemas/SwarmEvent" }
+        - { $ref: "#/components/schemas/ResyncEvent" }
+      discriminator:
+        propertyName: type

@@ -1,0 +1,31 @@
+# `helm test <release>`: the server answers /readyz through its Service, which
+# means it is up and its database answers.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "aspen.fullname" . }}-test-readyz
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: readyz
+      image: {{ include "aspen.image" . | quote }}
+      args:
+        - healthcheck
+        - --url
+        - http://{{ include "aspen.fullname" . }}:{{ .Values.service.port }}/readyz
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]

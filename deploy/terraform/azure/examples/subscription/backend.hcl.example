@@ -1,0 +1,5 @@
+resource_group_name  = "tfstate"
+storage_account_name = "acmetfstate"
+container_name       = "tfstate"
+key                  = "aspen.tfstate"
+use_azuread_auth     = true

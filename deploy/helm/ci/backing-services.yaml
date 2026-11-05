@@ -1,0 +1,105 @@
+# Throwaway PostgreSQL and MinIO for the chart's end-to-end test on kind
+# (deploy/helm/ci/kind-e2e.sh). Not for production: no persistence, no TLS.
+# Secrets are created by the script with random values.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - {name: POSTGRES_USER, value: aspen}
+            - {name: POSTGRES_DB, value: aspen}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: aspen-db, key: password}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aspen", "-d", "aspen", "-h", "127.0.0.1"]
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: {app: postgres}
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  selector:
+    matchLabels: {app: minio}
+  template:
+    metadata:
+      labels: {app: minio}
+    spec:
+      containers:
+        - name: minio
+          # The image compose uses (deploy/compose/compose.yaml).
+          image: cgr.dev/chainguard/minio:latest-dev@sha256:604ce09e2099ab20704a4c3bf25863bbb9bdaa643e7f522dc652098a6284bd6a
+          args: ["server", "/data", "--address", ":9000"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: {name: aspen-s3, key: AWS_ACCESS_KEY_ID}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: aspen-s3, key: AWS_SECRET_ACCESS_KEY}
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet: {path: /minio/health/live, port: 9000}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector: {app: minio}
+  ports:
+    - port: 9000
+---
+# Creates the pack bucket once MinIO answers (retried until it does).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: make-bucket
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: cgr.dev/chainguard/minio:latest-dev@sha256:604ce09e2099ab20704a4c3bf25863bbb9bdaa643e7f522dc652098a6284bd6a
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              mc alias set m http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null &&
+              mc mb --ignore-existing m/aspen-packs
+          env:
+            - {name: MC_CONFIG_DIR, value: /tmp/mc}
+          envFrom:
+            - secretRef: {name: aspen-s3}

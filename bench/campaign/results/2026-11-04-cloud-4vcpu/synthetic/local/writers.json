@@ -1,0 +1,91 @@
+{
+  "schema": "aspen-bench.result/v1",
+  "workload": "writers",
+  "target": {
+    "label": "local",
+    "url": "http://127.0.0.1:41311/bench.git"
+  },
+  "params": {
+    "commit_bytes": 512,
+    "duration_secs": 30.0,
+    "interval_ms": 0,
+    "max_readers": 64,
+    "protocol": 2,
+    "pushes_per_writer": null,
+    "repo_changes_per_commit": 10,
+    "repo_commits": 20,
+    "repo_file_bytes": 4096,
+    "repo_files": 200,
+    "repo_seed": 1,
+    "visibility_timeout_secs": 30.0,
+    "writers": 16
+  },
+  "environment": {
+    "aspen_bench_version": "0.0.0",
+    "aspen_commit": null,
+    "git_version": "git version 2.39.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.1.189-sc",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpus": 4,
+    "memory_bytes": 8349429760,
+    "ci": null,
+    "runner": null
+  },
+  "started_at_unix_ms": 1793753767692,
+  "wall_seconds": 30.548096909,
+  "latencies_ms": {
+    "push": {
+      "count": 1116,
+      "min": 68.529091,
+      "mean": 363.23151893010737,
+      "p50": 358.66362699999996,
+      "p90": 472.505513,
+      "p99": 574.986106,
+      "max": 648.3198289999999
+    },
+    "push_to_fetch": {
+      "count": 1116,
+      "min": 168.609925,
+      "mean": 780.1719177553757,
+      "p50": 757.993935,
+      "p90": 1111.969524,
+      "p99": 1385.764853,
+      "max": 1599.5631700000001
+    },
+    "reader_fetch": {
+      "count": 1116,
+      "min": 167.541558,
+      "mean": 751.584392652331,
+      "p50": 729.447846,
+      "p90": 1071.489957,
+      "p99": 1352.448332,
+      "max": 1568.2777319999998
+    },
+    "reader_queue": {
+      "count": 1116,
+      "min": 0.07535,
+      "mean": 22.860654412186378,
+      "p50": 19.986062999999998,
+      "p90": 42.313692,
+      "p99": 94.90438,
+      "max": 167.808235
+    }
+  },
+  "throughput": {
+    "pushes_per_second": 36.53255400244612
+  },
+  "counts": {
+    "pushes_failed": 0,
+    "pushes_ok": 1116,
+    "reader_fetches": 1116,
+    "readers_created": 40,
+    "seen": 1116,
+    "unseen": 0
+  },
+  "errors": {
+    "count": 0,
+    "samples": []
+  }
+}
