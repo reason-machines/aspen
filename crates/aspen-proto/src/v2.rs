@@ -53,9 +53,12 @@ impl V2Advertisement {
 
     /// The `fetch=` feature list. `shallow` is always advertised (S5:
     /// without it, `actions/checkout`'s depth-1 fetch fails); `filter` never
-    /// is (S5: clients then fall back to a full fetch).
+    /// is (S5: clients then fall back to a full fetch). `wait-for-done` is
+    /// always advertised: `git push` with `push.negotiate` runs a
+    /// negotiation-only fetch (`git fetch --negotiate-only`) that Git gives
+    /// up on without it, and the push then resends the branch's history.
     pub fn fetch_features(&self) -> String {
-        let mut f = String::from("shallow");
+        let mut f = String::from("shallow wait-for-done");
         if self.packfile_uris {
             f.push_str(" packfile-uris");
         }
@@ -176,6 +179,11 @@ pub struct FetchArgs {
     pub include_tag: bool,
     /// `server-option=` capability values, in order.
     pub server_options: Vec<String>,
+    /// `wait-for-done`: answer every round without `done` with
+    /// acknowledgments only, never `ready`. `git fetch --negotiate-only`
+    /// (run by `git push` with `push.negotiate`) sends it with haves and no
+    /// wants, and reads the `ACK`s as the commits the push may leave out.
+    pub wait_for_done: bool,
 }
 
 /// One v2 command request.
@@ -465,6 +473,7 @@ impl CommandParser {
             ("thin-pack", None) => r.thin_pack = true,
             ("ofs-delta", None) => r.ofs_delta = true,
             ("no-progress", None) => s.args.no_progress = true,
+            ("wait-for-done", None) => s.args.wait_for_done = true,
             ("include-tag", None) => s.args.include_tag = true,
             ("packfile-uris", Some(v)) if self.advert.packfile_uris => {
                 check_len("packfile-uris", v, MAX_VALUE_LEN)?;
@@ -636,6 +645,10 @@ pub enum ResponseError {
     /// A [`WireError`] meant for another surface.
     #[error("error for surface {0:?} used in a fetch response")]
     WrongSurface(Surface),
+    /// `ready` to a client that sent `wait-for-done`: it expects the
+    /// response to end after the acknowledgments until it sends `done`.
+    #[error("ready for a client that sent wait-for-done")]
+    ReadyWhileWaitingForDone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -665,6 +678,7 @@ enum Stage {
 #[derive(Debug)]
 pub struct FetchResponse {
     done: bool,
+    wait_for_done: bool,
     shallow: bool,
     uri_protocols: Vec<String>,
     no_progress: bool,
@@ -676,6 +690,7 @@ impl FetchResponse {
     pub fn new(args: &FetchArgs) -> Self {
         Self {
             done: args.request.done,
+            wait_for_done: args.wait_for_done,
             shallow: args.request.is_shallow(),
             uri_protocols: args.request.packfile_uri_protocols.clone(),
             no_progress: args.no_progress,
@@ -708,6 +723,9 @@ impl FetchResponse {
     ) -> Result<(), ResponseError> {
         if self.done {
             return Err(ResponseError::AcknowledgmentsAfterDone);
+        }
+        if self.wait_for_done && acks.ready {
+            return Err(ResponseError::ReadyWhileWaitingForDone);
         }
         self.enter(Stage::Acked, "acknowledgments")?;
         let w = |out: &mut Vec<u8>, l: &str| pkt::write_text(out, l).expect("short line");
@@ -931,7 +949,7 @@ mod tests {
                 "version 2",
                 "agent=aspen/test",
                 "ls-refs=unborn",
-                "fetch=shallow",
+                "fetch=shallow wait-for-done",
                 "server-option",
                 "object-format=sha1",
                 "0000"
@@ -940,7 +958,10 @@ mod tests {
         let mut a = advert();
         a.packfile_uris = true;
         a.no_ref_delta = true;
-        assert_eq!(a.fetch_features(), "shallow packfile-uris no-ref-delta");
+        assert_eq!(
+            a.fetch_features(),
+            "shallow wait-for-done packfile-uris no-ref-delta"
+        );
         assert!(
             !a.fetch_features().contains("filter"),
             "filter is never advertised (S5)"
@@ -1064,7 +1085,6 @@ mod tests {
             "packfile-uris https",
             "want-ref refs/heads/main",
             "sideband-all",
-            "wait-for-done",
             "frobnicate",
         ] {
             assert_eq!(
@@ -1565,6 +1585,52 @@ mod tests {
         r.start_packfile(&mut out).unwrap();
         r.finish(&mut out).unwrap();
         assert_eq!(lines(&out), ["packfile", "0000"]);
+    }
+
+    /// Invariant: `git fetch --negotiate-only` (what `git push` runs with
+    /// `push.negotiate`) is parsed as Git 2.39 sends it: `wait-for-done`,
+    /// haves and no wants. Its answer is acknowledgments that end the
+    /// response, never `ready` (Git then expects a pack it never asked for).
+    #[test]
+    fn negotiation_only_fetch_gets_acknowledgments_and_never_ready() {
+        let wire = request(&[
+            "command=fetch",
+            "agent=git/2.39.5",
+            "object-format=sha1",
+            "0001",
+            "wait-for-done",
+            &format!("have {}", oid(1)),
+            &format!("have {}", oid(2)),
+            "0000",
+        ]);
+        let Command::Fetch(f) = parse_with(advert(), &wire).unwrap() else {
+            panic!("a fetch")
+        };
+        assert!(f.wait_for_done);
+        assert!(f.request.wants.is_empty() && !f.request.done);
+        assert_eq!(f.request.haves, [oid(1), oid(2)]);
+
+        let mut out = Vec::new();
+        let mut r = FetchResponse::new(&f);
+        let ready = Acknowledgments {
+            common: vec![oid(2)],
+            ready: true,
+        };
+        assert_eq!(
+            r.acknowledgments(&mut out, &ready),
+            Err(ResponseError::ReadyWhileWaitingForDone)
+        );
+        assert!(out.is_empty());
+        let acks = Acknowledgments {
+            common: vec![oid(2)],
+            ready: false,
+        };
+        r.acknowledgments(&mut out, &acks).unwrap();
+        assert_eq!(
+            lines(&out),
+            ["acknowledgments", &format!("ACK {}", oid(2)), "0000"]
+        );
+        assert!(r.is_finished());
     }
 
     /// Invariant: a shallow request always gets shallow-info before the

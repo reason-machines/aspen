@@ -27,6 +27,8 @@
 #![deny(missing_docs)]
 
 mod base_cache;
+pub mod boundary;
+pub mod chains;
 pub mod changed;
 mod declared;
 pub mod entries;

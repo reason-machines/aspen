@@ -10,6 +10,9 @@ publish.workspace = true
 
 [dependencies]
 aspen-core = { path = "../aspen-core" }
+# The stream type of sqlx's executor trait, which the counting connection
+# implements (src/conn.rs); already in the tree through sqlx.
+futures-core = { version = "0.3", default-features = false }
 # One implementation over sqlx's `Any` driver serves both dialects, so the
 # Postgres and SQLite stores cannot drift apart (see src/lib.rs). TLS is
 # rustls with the system's root certificates: the AWS deploy connects with

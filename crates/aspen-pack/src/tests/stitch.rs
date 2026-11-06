@@ -242,6 +242,78 @@ fn a_dropped_base_moves_the_kept_delta_onto_the_first_copy() {
     check_output(&out, &[&a, &b], dir.path());
 }
 
+/// Plans `segs` leaving `out` out and stitches them.
+fn stitch_leaving_out(
+    segs: &[&Seg],
+    out: &[ObjectId],
+) -> Result<(Vec<u8>, crate::stitch::StitchOutcome), FetchError> {
+    let plan = StitchPlan::leaving_out(
+        segs.iter()
+            .enumerate()
+            .map(|(i, s)| SegmentIds {
+                pack: pack_id(i as i64 + 1),
+                checksum: *s.table.checksum(),
+                ids: s.pairs().into_iter(),
+            })
+            .collect(),
+        out.iter().copied().collect(),
+    )
+    .map_err(FetchError::Store)?;
+    let mut bytes = Vec::new();
+    let mut st = Stitcher::new(plan, &mut bytes);
+    for s in segs {
+        st.begin_segment(s.table.clone())?;
+        st.feed(&s.bytes, &mut bytes)?;
+        st.end_segment()?;
+    }
+    let outcome = st.finish(&mut bytes)?;
+    Ok((bytes, outcome))
+}
+
+/// Invariant (layered shallow answers): every copy of a left-out object is
+/// dropped, from every segment, and the header count says so; the output
+/// still indexes on its own with stock Git. A kept delta against a
+/// left-out entry is refused, never sent thin.
+#[test]
+fn left_out_objects_are_dropped_from_every_segment() {
+    let dir = scratch();
+    let x = Obj::blob("x ".repeat(200));
+    let y = Obj::blob(format!("{}y", "x ".repeat(200)));
+    let z = Obj::blob("z ".repeat(100));
+    let w = Obj::blob("w ".repeat(100));
+    let a = Seg::new(
+        build_pack(&[Spec::Full(z.clone()), Spec::Full(w.clone())]),
+        dir.path(),
+    );
+    let b = Seg::new(
+        build_pack(&[
+            Spec::Full(x.clone()),
+            Spec::Ofs(0, y.clone()),
+            Spec::Full(z.clone()),
+        ]),
+        dir.path(),
+    );
+    let (out, outcome) = stitch_leaving_out(&[&a, &b], &[z.id()]).unwrap();
+    assert_eq!(outcome.left_out, 2, "both copies");
+    assert_eq!(outcome.object_count, 3);
+    let p = dir.path().join("left-out.pack");
+    std::fs::write(&p, &out).unwrap();
+    let v = verify_pack(
+        &p,
+        dir.path(),
+        crate::testutil::MAX_OBJECT,
+        crate::testutil::MAX_INFLATED,
+    )
+    .unwrap();
+    let got: BTreeSet<ObjectId> = v.table.entries().iter().map(|e| e.id).collect();
+    assert_eq!(got, [x.id(), y.id(), w.id()].into_iter().collect());
+    git_index_pack(&out, dir.path(), false).unwrap();
+
+    // Leaving out a kept delta's base would make the pack thin: refused.
+    let err = stitch_leaving_out(&[&a, &b], &[x.id()]).unwrap_err();
+    assert!(is_corrupt(&err), "{err}");
+}
+
 #[test]
 fn a_forward_base_in_a_stored_pack_fails_the_fetch_retryably_and_pages() {
     let dir = scratch();

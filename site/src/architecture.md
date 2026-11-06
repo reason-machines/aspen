@@ -55,9 +55,10 @@ version is *connected*: every object its tip reaches is in its closure.
 
 ## Pushing
 
-1. **Advertise.** The client is shown trunk only, plus up to 8 earlier
-   trunk tips as `.have` lines so a client that is behind does not resend
-   history. A [branch-scoped URL](using-git.md#urls) also shows that
+1. **Advertise.** The client is shown trunk only, plus earlier trunk tips
+   as `.have` lines (every one of the newest 64, then tips about a quarter
+   apart back to the start of trunk's history) so a client that is behind
+   does not resend history. A [branch-scoped URL](using-git.md#urls) also shows that
    branch.
 2. **Receive.** The pack streams to a local spool file while it is parsed:
    every entry is inflated and checksummed, with SHA-1 collision detection.

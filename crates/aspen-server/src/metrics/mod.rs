@@ -78,6 +78,14 @@ pub struct Metrics {
     /// Recorded exact shallow packs built from the previous recorded pack
     /// and the packs pushed since, not the full closure.
     shallow_builds_incremental: AtomicU64,
+    /// Shallow fetches served a layered answer.
+    shallow_layered: AtomicU64,
+    /// Objects written to layered answers' patch packs.
+    shallow_layered_patched: AtomicU64,
+    /// Time eligible shallow fetches spent choosing their packs, and the
+    /// longest such time (microseconds).
+    shallow_wait: Histogram,
+    shallow_wait_max_us: AtomicU64,
 }
 
 /// Why a shallow fetch that could have used exact packs was served the
@@ -126,6 +134,9 @@ pub(crate) enum ShallowServed {
     /// No build was waited for, and at least one want's full closure was
     /// already exact.
     Closure,
+    /// At least one want was served its layered answer: an earlier
+    /// version's exact pack, the packs pushed since and a patch.
+    Layered,
 }
 
 /// How an exact shallow pack build ended (node C8).
@@ -201,6 +212,10 @@ impl Default for Metrics {
             shallow_build_time: Histogram::new(&DURATION_MICROS, MICROS_PER_SECOND),
             shallow_limit_evictions: AtomicU64::new(0),
             shallow_builds_incremental: AtomicU64::new(0),
+            shallow_layered: AtomicU64::new(0),
+            shallow_layered_patched: AtomicU64::new(0),
+            shallow_wait: Histogram::new(&DURATION_MICROS, MICROS_PER_SECOND),
+            shallow_wait_max_us: AtomicU64::new(0),
         }
     }
 }
@@ -281,8 +296,39 @@ impl Metrics {
             ShallowServed::Recorded => &self.shallow_cached,
             ShallowServed::Built => &self.shallow_built,
             ShallowServed::Closure => &self.shallow_closure,
+            ShallowServed::Layered => &self.shallow_layered,
         };
         c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Shallow fetches served a layered answer.
+    pub fn shallow_layered(&self) -> u64 {
+        self.shallow_layered.load(Ordering::Relaxed)
+    }
+
+    /// A layered answer was computed with `n` objects in its patch pack.
+    pub(crate) fn shallow_layered_patched(&self, n: u64) {
+        self.shallow_layered_patched.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Objects written to layered answers' patch packs so far.
+    pub fn shallow_layered_patch_objects(&self) -> u64 {
+        self.shallow_layered_patched.load(Ordering::Relaxed)
+    }
+
+    /// How long an eligible shallow fetch spent choosing its packs (waiting
+    /// for builds, computing a layered answer).
+    pub(crate) fn shallow_wait(&self, took: Duration) {
+        let us = expo::micros(took);
+        self.shallow_wait.observe(us);
+        self.shallow_wait_max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// The longest time an eligible shallow fetch spent choosing its packs
+    /// since the last call (the first call: since the start), for tests
+    /// that bound it over one phase.
+    pub fn take_shallow_wait_max(&self) -> Duration {
+        Duration::from_micros(self.shallow_wait_max_us.swap(0, Ordering::Relaxed))
     }
 
     /// Shallow fetches served exactly because a want's full closure was
@@ -527,13 +573,25 @@ impl Metrics {
         expo::family(
             &mut s,
             "aspen_shallow_exact_fetches_total",
-            "Shallow fetches served exactly: from packs already recorded, after waiting for a build, or from a full closure that was already exact.",
+            "Shallow fetches served without the full history: from packs already recorded, after waiting for a build, from a full closure that was already exact, or from a layered answer (an earlier version's exact pack, the packs pushed since and a patch).",
             expo::Kind::Counter,
             [
                 (vec![("pack", "recorded")], get(&self.shallow_cached) as f64),
                 (vec![("pack", "built")], get(&self.shallow_built) as f64),
                 (vec![("pack", "closure")], get(&self.shallow_closure) as f64),
+                (vec![("pack", "layered")], get(&self.shallow_layered) as f64),
             ],
+        );
+        expo::counter(
+            &mut s,
+            "aspen_shallow_layered_patch_objects_total",
+            "Objects written to the patch packs of layered shallow answers: what an earlier version's exact pack and the packs pushed since lacked (reverts, merges).",
+            get(&self.shallow_layered_patched),
+        );
+        self.shallow_wait.render(
+            &mut s,
+            "aspen_shallow_wait_seconds",
+            "Time a shallow fetch that could use exact packs spent choosing them: waiting for builds and computing layered answers.",
         );
         expo::family(
             &mut s,

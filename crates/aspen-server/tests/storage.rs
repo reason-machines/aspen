@@ -456,6 +456,10 @@ fn one_pass_collects_more_than_one_batch() {
         env.shallow_fetch(&url, &tip, &format!("shallow-{n}"));
     }
     assert_eq!(s.metrics().shallow_builds_recorded(), VERSIONS as u64);
+    // Each version after the first was built from the previous one's
+    // recorded pack and a patch pack (a layered answer), which nothing names
+    // once its build is recorded: one more orphan pack per such build.
+    let patches = s.metrics().shallow_builds_incremental() as usize;
     let offset = Arc::new(AtomicI64::new(0));
     let gc = compactor(&s, &offset, |c| {
         c.gc_batch = 2;
@@ -469,8 +473,12 @@ fn one_pass_collects_more_than_one_batch() {
         VERSIONS as u64 - 1,
         "every superseded recording, in one pass"
     );
-    assert_eq!(report.packs_deleted.len(), VERSIONS - 1, "and every pack");
-    assert_eq!(report.deletes_finished, VERSIONS - 1);
+    assert_eq!(
+        report.packs_deleted.len(),
+        VERSIONS - 1 + patches,
+        "and every pack, the orphan patch packs included"
+    );
+    assert_eq!(report.deletes_finished, VERSIONS - 1 + patches);
     assert!(bucket_bytes(&s.blobs) < before);
     let again = s.block_on(gc.collect_garbage()).unwrap();
     assert_eq!(again.shallow_evicted, 0, "the current version's stays");
@@ -581,6 +589,9 @@ fn a_pass_past_its_budget_runs_one_batch_per_step() {
             .arg(format!("{tip}:refs/heads/main")));
         env.shallow_fetch(&url, &tip, &format!("shallow-{n}"));
     }
+    // Orphan patch packs of incremental builds (see
+    // `one_pass_collects_more_than_one_batch`).
+    let patches = s.metrics().shallow_builds_incremental() as usize;
     let offset = Arc::new(AtomicI64::new(0));
     let gc = compactor(&s, &offset, |c| {
         c.gc_batch = 2;
@@ -591,9 +602,8 @@ fn a_pass_past_its_budget_runs_one_batch_per_step() {
     let first = s.block_on(gc.collect_garbage()).unwrap();
     assert!(first.budget_spent, "{first:?}");
     assert_eq!(first.shallow_evicted, 2, "one batch: {first:?}");
-    assert_eq!(
-        first.packs_deleted.len(),
-        2,
+    assert!(
+        first.packs_deleted.len() >= 2,
         "the sweep still ran: {first:?}"
     );
     assert_eq!(
@@ -608,5 +618,5 @@ fn a_pass_past_its_budget_runs_one_batch_per_step() {
         deleted += r.packs_deleted.len();
     }
     assert_eq!(evicted, VERSIONS as u64 - 1, "later passes finish the work");
-    assert_eq!(deleted, VERSIONS - 1);
+    assert_eq!(deleted, VERSIONS - 1 + patches);
 }

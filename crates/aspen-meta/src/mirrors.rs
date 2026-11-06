@@ -132,7 +132,7 @@ fn oid_bytes(id: Option<ObjectId>) -> Option<Vec<u8>> {
 /// Inserts one `mirrors` row; a repository that already is a mirror is
 /// [`StoreError::Conflict`].
 async fn insert_mirror_row(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     row: &MirrorRow,
 ) -> Result<(), StoreError> {
     let sql = format!("INSERT INTO mirrors ({MIRROR_COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7)");

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use aspen_core::id::{ObjectId, RepoId};
+use aspen_core::ingest::ObjectKind;
 use aspen_core::pack::{CoverLevel, EntryKind, EntryTable, PackOrigin};
 
 use crate::LayoutError;
@@ -69,6 +70,7 @@ impl Src {
 fn options(cap: u32) -> RepackOptions {
     RepackOptions {
         max_delta_depth: cap,
+        max_tree_delta_depth: cap,
         max_object_bytes: MAX_OBJECT,
     }
 }
@@ -318,6 +320,72 @@ fn the_depth_cap_breaks_chains_that_add_up_across_sources() {
     let flat = run(&refs, 0, dir.path());
     assert_eq!(flat.pack.max_delta_depth, 0);
     assert_eq!(flat.pack.undeltified, 120);
+}
+
+/// Invariant (item 11): trees have their own, lower cap. Sources whose
+/// tree chains and blob chains add up to depth 120 across sources repack to
+/// trees at most `max_tree_delta_depth` deep and blobs at most
+/// `max_delta_depth`, as both the writer and an independent depth count over
+/// the output say; every object still reads back (`verify_pack` and stock
+/// git resolve each one).
+#[test]
+fn trees_are_capped_lower_than_blobs() {
+    let dir = scratch();
+    let (segments, per) = (4, 30);
+    let chain = |kind: ObjectKind, tag: &str| -> Vec<Obj> {
+        (0..=segments * per)
+            .map(|i| Obj {
+                kind,
+                data: format!("{}{i}\n", format!("{tag} line\n").repeat(20)).into_bytes(),
+            })
+            .collect()
+    };
+    let (trees, blobs) = (
+        chain(ObjectKind::Tree, "tree"),
+        chain(ObjectKind::Blob, "blob"),
+    );
+    let srcs: Vec<Src> = (0..segments)
+        .map(|s| {
+            let mut specs = Vec::new();
+            for objs in [&trees, &blobs] {
+                let at = specs.len();
+                let slice = &objs[s * per..=(s + 1) * per];
+                specs.push(Spec::Full(slice[0].clone()));
+                for (i, o) in slice.iter().enumerate().skip(1) {
+                    specs.push(Spec::Ofs(at + i - 1, o.clone()));
+                }
+            }
+            Src::new(&build_pack(&specs), dir.path())
+        })
+        .collect();
+    let refs: Vec<&Src> = srcs.iter().collect();
+    let sources: Vec<RepackSource<'_>> = refs.iter().map(|s| s.source()).collect();
+    let out = dir.path().join("tree-capped");
+    let pack = write_repack(
+        &sources,
+        &out,
+        &RepackOptions {
+            max_delta_depth: 50,
+            max_tree_delta_depth: 10,
+            max_object_bytes: MAX_OBJECT,
+        },
+    )
+    .unwrap();
+    let verified = verify_pack(&pack.pack_path, dir.path(), MAX_OBJECT, MAX_INFLATED).unwrap();
+    assert_eq!((pack.max_delta_depth, pack.max_tree_delta_depth), (50, 10));
+    assert_eq!(
+        (verified.max_delta_depth, verified.max_tree_delta_depth),
+        (50, 10)
+    );
+    // Blob chain of 120: whole at 0, 51, 102. Tree chain of 120: whole
+    // every 11th.
+    assert_eq!(pack.undeltified, 2 + 120 / 11);
+    // Not `--strict`: the made-up trees do not parse as trees.
+    git_index_pack(&std::fs::read(&pack.pack_path).unwrap(), dir.path(), false).unwrap();
+    // The default compaction setting for blobs is unchanged by the tree
+    // cap: with both at 50 the trees go as deep as the blobs.
+    let both = run(&refs, 50, dir.path());
+    assert_eq!(both.verified.max_tree_delta_depth, 50);
 }
 
 /// Invariant: the cap holds for a deep chain inside one stock git pack

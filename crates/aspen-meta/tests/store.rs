@@ -22,10 +22,10 @@ use aspen_core::id::{
 };
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
-    CommitLookup, CommitOutcome, CommitRow, CompactionHeat, Cover, CoverChain, JobEvent, JobKind,
-    JobState, JobTag, MAX_JOB_ATTEMPTS, MAX_JOB_HEAT, MetaStore, NewCommit, NewCover, NewJob,
-    PackTombstone, PushCommit, RefListQuery, RefWrite, SeqRange, ShallowDepth, ShallowRecorded,
-    VerifiedRange, VersionJob, VersionJobKind, have_tip_seqs,
+    CommitLookup, CommitOutcome, CommitRow, CompactionHeat, Cover, CoverChain, GC_LEASE, JobEvent,
+    JobKind, JobState, JobTag, Lease, MAX_JOB_ATTEMPTS, MAX_JOB_HEAT, MetaStore, NewCommit,
+    NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery, RefWrite,
+    SeqRange, ShallowDepth, ShallowRecorded, SweepBatch, VerifiedRange, VersionJob, VersionJobKind,
 };
 use aspen_core::name::{RefName, RefPattern, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackGeneration, PackOrigin, entry_table_len};
@@ -85,7 +85,14 @@ const CASES: &[(&str, CaseFn)] = cases![
     packs_register_idempotently_and_read_back_exactly,
     list_refs_filters_by_prefix_bytewise_and_paginates,
     list_refs_takes_any_number_of_prefixes,
+    ref_changes_since_a_cursor_are_exactly_the_refs_that_moved,
+    ref_changes_find_a_write_that_commits_after_a_later_one,
     versions_by_seq_serves_have_tips,
+    current_versions_reads_many_refs_in_one_statement,
+    current_and_recent_reads_a_window_after_a_seq,
+    reachable_versions_walks_dependencies_to_the_stops,
+    a_branch_push_commits_in_few_statements,
+    a_registration_that_waits_for_a_sweep_takes_the_next_generation,
     covers_are_ordered_by_level_then_first_seq,
     covers_at_reads_only_the_covers_it_names,
     tokens_round_trip_and_revoke_once,
@@ -120,6 +127,11 @@ const CASES: &[(&str, CaseFn)] = cases![
     a_push_naming_a_swept_pack_is_unavailable,
     a_cover_naming_a_swept_pack_is_unavailable,
     the_sweep_spares_a_pack_an_open_push_is_referencing,
+    the_sweep_resumes_where_it_stopped_in_bounded_batches,
+    a_pack_unnamed_behind_the_cursor_survives_its_grace_then_goes,
+    the_walk_never_passes_a_pack_an_open_transaction_holds,
+    the_audit_stamps_a_legacy_pack_behind_the_walk,
+    a_lease_has_one_holder_and_fences_a_stale_one,
     a_shallow_pack_is_recorded_once_and_read_back,
     a_shallow_pack_naming_a_swept_pack_is_unavailable,
     a_shallow_pack_stays_inside_its_repository,
@@ -1455,6 +1467,158 @@ async fn list_refs_filters_by_prefix_bytewise_and_paginates(c: Ctx) {
 /// dialects (#119). Pinned at `ls-refs`'s cap (1,024 prefixes) and far
 /// past it, paged with a limit that ends pages mid-way through the
 /// prefix list: every page equals a plain filter over the full listing.
+/// `ref_changes` as a map from ref to tip (`None` for a deletion),
+/// asserting the answer is complete.
+async fn changes(
+    s: &SqlStore,
+    repo: RepoId,
+    since: Option<&RefCursor>,
+) -> (
+    std::collections::BTreeMap<String, Option<ObjectId>>,
+    RefCursor,
+) {
+    let RefChanges {
+        cursor,
+        refs,
+        complete,
+    } = s
+        .ref_changes(repo, since, 1000)
+        .await
+        .unwrap()
+        .expect("SqlStore answers ref_changes");
+    assert!(complete);
+    let map = refs
+        .into_iter()
+        .map(|r| (r.name.as_str().to_owned(), r.tip))
+        .collect();
+    (map, cursor)
+}
+
+/// Invariant: a read from no cursor is every live ref of the repository
+/// and nothing else; a read from a cursor is exactly the refs whose
+/// current version the earlier read did not see, each once at its current
+/// tip (a deletion with none), however many times it moved, and nothing
+/// of another repository. Nothing new is an empty answer. More than
+/// `limit` refs is an incomplete answer of at most `limit`.
+async fn ref_changes_since_a_cursor_are_exactly_the_refs_that_moved(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let other = new_repo(s, "acme/other").await.id;
+    let p = pack(s, repo, 1).await;
+    let q = pack(s, other, 2).await;
+    advance(s, repo, "refs/heads/a", oid(1), p).await;
+    advance(s, repo, "refs/heads/b", oid(2), p).await;
+    let gone = advance(s, repo, "refs/heads/gone", oid(3), p).await;
+    committed(s, repo, vec![delete("refs/heads/gone", gone.id)]).await;
+    advance(s, other, "refs/heads/a", oid(9), q).await;
+
+    let (all, c0) = changes(s, repo, None).await;
+    assert_eq!(
+        all,
+        [
+            ("refs/heads/a".to_owned(), Some(oid(1))),
+            ("refs/heads/b".to_owned(), Some(oid(2))),
+        ]
+        .into()
+    );
+    let (none, c0b) = changes(s, repo, Some(&c0)).await;
+    assert!(none.is_empty(), "{none:?}");
+
+    advance(s, repo, "refs/heads/a", oid(4), p).await;
+    advance(s, repo, "refs/heads/a", oid(5), p).await;
+    let b = s
+        .current_version(repo, &rn("refs/heads/b"))
+        .await
+        .unwrap()
+        .unwrap();
+    committed(s, repo, vec![delete("refs/heads/b", b.id)]).await;
+    advance(s, repo, "refs/heads/d", oid(6), p).await;
+    advance(s, other, "refs/heads/z", oid(7), q).await;
+    let (moved, c1) = changes(s, repo, Some(&c0b)).await;
+    assert_eq!(
+        moved,
+        [
+            ("refs/heads/a".to_owned(), Some(oid(5))),
+            ("refs/heads/b".to_owned(), None),
+            ("refs/heads/d".to_owned(), Some(oid(6))),
+        ]
+        .into()
+    );
+    // The same cursor read again gives the same answer; the new one, none.
+    assert_eq!(changes(s, repo, Some(&c0b)).await.0, moved);
+    assert!(changes(s, repo, Some(&c1)).await.0.is_empty());
+
+    for (i, name) in ["refs/heads/x", "refs/heads/y", "refs/heads/w"]
+        .into_iter()
+        .enumerate()
+    {
+        advance(s, repo, name, oid(20 + u8::try_from(i).unwrap()), p).await;
+    }
+    let capped = s.ref_changes(repo, Some(&c1), 2).await.unwrap().unwrap();
+    assert!(!capped.complete);
+    assert_eq!(capped.refs.len(), 2);
+    let exact = s.ref_changes(repo, Some(&c1), 3).await.unwrap().unwrap();
+    assert!(exact.complete);
+    assert_eq!(exact.refs.len(), 3);
+    let full = s.ref_changes(repo, None, 4).await.unwrap().unwrap();
+    assert!(!full.complete, "a, d, x, y, w are live");
+    assert_eq!(full.refs.len(), 4);
+}
+
+/// Invariant: a version written by a transaction still open when a reader
+/// read is in the reader's next answer once it commits, even when a
+/// version with a later ID committed first (Postgres; SQLite runs one
+/// write at a time, so there the open write just commits later). A cursor
+/// of "the largest version ID seen" would miss it for good.
+async fn ref_changes_find_a_write_that_commits_after_a_later_one(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    advance(s, repo, MAIN, oid(1), p).await;
+    let (_, c0) = changes(s, repo, None).await;
+
+    // An open push of a new ref: its version ID is taken now.
+    let mut slow = raw_write_tx(s).await;
+    let slow_id: i64 = sqlx::query(
+        "INSERT INTO ref_versions (repo_id, ref_name, seq, tip_oid, closure_exact, pack_id) \
+         VALUES ($1, $2, 1, $3, 1, $4) RETURNING id",
+    )
+    .bind(repo.get())
+    .bind("refs/heads/slow")
+    .bind(oid(2).as_bytes().to_vec())
+    .bind(p.get())
+    .fetch_one(&mut *slow)
+    .await
+    .unwrap()
+    .get("id");
+    sqlx::query("INSERT INTO refs (repo_id, ref_name, version_id, seq) VALUES ($1, $2, $3, 1)")
+        .bind(repo.get())
+        .bind("refs/heads/slow")
+        .bind(slow_id)
+        .execute(&mut *slow)
+        .await
+        .unwrap();
+
+    let mut expect_first = std::collections::BTreeMap::new();
+    if s.dialect() == Dialect::Postgres {
+        // A later push commits first, with a larger version ID.
+        let fast = advance(s, repo, "refs/heads/fast", oid(3), p).await;
+        assert!(fast.id.get() > slow_id);
+        expect_first.insert("refs/heads/fast".to_owned(), Some(oid(3)));
+    }
+    let (first, c1) = changes(s, repo, Some(&c0)).await;
+    assert_eq!(first, expect_first, "the open write is not visible yet");
+
+    slow.commit().await.unwrap();
+    let (second, c2) = changes(s, repo, Some(&c1)).await;
+    assert_eq!(
+        second,
+        [("refs/heads/slow".to_owned(), Some(oid(2)))].into(),
+        "the late commit is found from the cursor read before it"
+    );
+    assert!(changes(s, repo, Some(&c2)).await.0.is_empty());
+}
+
 async fn list_refs_takes_any_number_of_prefixes(c: Ctx) {
     let s = &c.store;
     let repo = new_repo(s, "acme/r").await.id;
@@ -1534,7 +1698,8 @@ async fn list_refs_takes_any_number_of_prefixes(c: Ctx) {
 }
 
 /// The `.have` tips of a push advertisement are one lookup: the versions
-/// at `have_tip_seqs`, in the order asked, with missing ones left out.
+/// at the seqs asked (`have_tip_seqs`), in that order, with missing ones
+/// left out.
 async fn versions_by_seq_serves_have_tips(c: Ctx) {
     let s = &c.store;
     let repo = new_repo(s, "acme/r").await.id;
@@ -1544,14 +1709,14 @@ async fn versions_by_seq_serves_have_tips(c: Ctx) {
         versions.push(advance(s, repo, MAIN, oid(n), p).await);
     }
     advance(s, repo, "refs/heads/other", oid(50), p).await;
-    let wanted = have_tip_seqs(versions[9].seq, 8);
+    let seq = |n| Seq::new(n).unwrap();
+    let wanted = [seq(9), seq(8), seq(6), seq(2)];
     let got = s.versions_by_seq(repo, &rn(MAIN), &wanted).await.unwrap();
     assert_eq!(
         got.iter().map(|v| v.seq.get()).collect::<Vec<_>>(),
         vec![9, 8, 6, 2]
     );
     assert_eq!(got[0], versions[8]);
-    let seq = |n| Seq::new(n).unwrap();
     let got = s
         .versions_by_seq(repo, &rn(MAIN), &[seq(3), seq(99), seq(1)])
         .await
@@ -1563,6 +1728,313 @@ async fn versions_by_seq_serves_have_tips(c: Ctx) {
             .unwrap()
             .is_empty()
     );
+}
+
+/// `current_versions` answers every name in the order asked, `None` for a
+/// name with no `refs` row, deletions included, in one statement.
+async fn current_versions_reads_many_refs_in_one_statement(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let other = new_repo(s, "acme/o").await.id;
+    let p = pack(s, repo, 1).await;
+    let q = pack(s, other, 1).await;
+    let main = advance(s, repo, MAIN, oid(1), p).await;
+    let main = advance(s, repo, MAIN, oid(2), p).await.id.max(main.id);
+    let b = advance(s, repo, "refs/heads/b", oid(3), p).await;
+    let gone = committed(s, repo, vec![delete("refs/heads/b", b.id)])
+        .await
+        .remove(0);
+    advance(s, other, "refs/heads/x", oid(4), q).await;
+    let names = [rn("refs/heads/x"), rn(MAIN), rn("refs/heads/b"), rn(MAIN)];
+    let before = s.statements();
+    let got = s.current_versions(repo, &names).await.unwrap();
+    assert_eq!((s.statements() - before).queries, 1, "one statement");
+    let ids: Vec<_> = got.iter().map(|v| v.as_ref().map(|v| v.id)).collect();
+    assert_eq!(ids, vec![None, Some(main), Some(gone.id), Some(main)]);
+    for (n, v) in names.iter().zip(&got) {
+        assert_eq!(*v, s.current_version(repo, n).await.unwrap());
+    }
+    assert!(s.current_versions(repo, &[]).await.unwrap().is_empty());
+}
+
+/// `current_and_recent` returns the current version then the versions
+/// above `after` and at most `window` below it, newest first, in one
+/// statement; `None` for a ref with no row.
+async fn current_and_recent_reads_a_window_after_a_seq(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    let mut versions = Vec::new();
+    for n in 1..=10 {
+        versions.push(advance(s, repo, MAIN, oid(n), p).await);
+    }
+    advance(s, repo, "refs/heads/other", oid(50), p).await;
+    let seqs = |got: Option<Vec<RefVersion>>| -> Vec<u64> {
+        got.unwrap().iter().map(|v| v.seq.get()).collect()
+    };
+    let before = s.statements();
+    let all = s
+        .current_and_recent(repo, &rn(MAIN), None, 4)
+        .await
+        .unwrap();
+    assert_eq!((s.statements() - before).queries, 1, "one statement");
+    assert_eq!(all.as_ref().unwrap()[0], versions[9]);
+    assert_eq!(all.as_ref().unwrap()[1], versions[8]);
+    assert_eq!(seqs(all), vec![10, 9, 8, 7, 6]);
+    let seq = |n| Some(Seq::new(n).unwrap());
+    let after = s
+        .current_and_recent(repo, &rn(MAIN), seq(7), 4)
+        .await
+        .unwrap();
+    assert_eq!(seqs(after), vec![10, 9, 8]);
+    let caught_up = s
+        .current_and_recent(repo, &rn(MAIN), seq(10), 128)
+        .await
+        .unwrap();
+    assert_eq!(seqs(caught_up), vec![10]);
+    let whole = s
+        .current_and_recent(repo, &rn(MAIN), None, 128)
+        .await
+        .unwrap();
+    assert_eq!(seqs(whole), (1..=10).rev().collect::<Vec<_>>());
+    let none = s
+        .current_and_recent(repo, &rn(MAIN), None, 0)
+        .await
+        .unwrap();
+    assert_eq!(seqs(none), vec![10]);
+    assert_eq!(
+        s.current_and_recent(repo, &rn("refs/heads/nope"), None, 4)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// `reachable_versions` returns the versions asked for and those they
+/// reach through trunk and scoped dependencies, not past a stop, and at
+/// most `limit` besides the ones asked for, in one statement.
+async fn reachable_versions_walks_dependencies_to_the_stops(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    // Trunk t1..t6, each depending on the one before; a branch whose
+    // versions depend on the one before (scoped) and on t3 (trunk).
+    let mut trunk: Vec<RefVersion> = Vec::new();
+    for n in 1..=6u8 {
+        let mut w = live(MAIN, trunk.last().map(|v| v.id), oid(n), p);
+        w.deps.trunk = trunk.last().map(|v| v.id);
+        trunk.push(committed(s, repo, vec![w]).await.remove(0));
+    }
+    let mut branch: Vec<RefVersion> = Vec::new();
+    for n in 20..=22u8 {
+        let mut w = live("refs/heads/b", branch.last().map(|v| v.id), oid(n), p);
+        w.deps.trunk = Some(trunk[2].id);
+        w.deps.scoped_old = branch.last().map(|v| v.id);
+        branch.push(committed(s, repo, vec![w]).await.remove(0));
+    }
+    let ids = |mut v: Vec<RefVersion>| {
+        let mut ids: Vec<_> = v.drain(..).map(|v| v.id).collect();
+        ids.sort();
+        ids
+    };
+    let mut want: Vec<_> = trunk[..3].iter().chain(&branch).map(|v| v.id).collect();
+    want.sort();
+    let before = s.statements();
+    let got = s
+        .reachable_versions(&[branch[2].id], &[], 100)
+        .await
+        .unwrap();
+    assert_eq!((s.statements() - before).queries, 1, "one statement");
+    assert_eq!(ids(got.clone()), want);
+    for v in &got {
+        assert_eq!(Some(v.clone()), s.ref_version(v.id).await.unwrap());
+    }
+    // A stop is returned but not followed.
+    let got = s
+        .reachable_versions(&[branch[2].id], &[trunk[2].id, branch[0].id], 100)
+        .await
+        .unwrap();
+    let mut want = vec![trunk[2].id, branch[0].id, branch[1].id, branch[2].id];
+    want.sort();
+    assert_eq!(ids(got), want);
+    // The limit cuts what is reached, never what was asked for.
+    let got = s
+        .reachable_versions(&[trunk[5].id, branch[2].id], &[], 1)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(got.iter().any(|v| v.id == trunk[5].id));
+    assert!(got.iter().any(|v| v.id == branch[2].id));
+    let missing = RefVersionId::new(999_999).unwrap();
+    assert!(
+        s.reachable_versions(&[missing], &[], 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// What one branch push costs the store, counted by `statements`: on
+/// Postgres registering its pack and committing its version (with a commit
+/// row and a job) are one statement each and need no transaction; SQLite
+/// keeps its transactions. The rows are what the transactional path writes
+/// (`a_ref_history_is_one_chain_including_deletions` and friends check
+/// them in detail).
+async fn a_branch_push_commits_in_few_statements(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let base = pack(s, repo, 1).await;
+    let trunk = advance(s, repo, MAIN, oid(1), base).await;
+    let mut prev = None;
+    for n in 2..=4u8 {
+        let before = s.statements();
+        let p = s.register_pack(&push_pack(repo, n)).await.unwrap();
+        let registered = s.statements() - before;
+        let mut w = live("refs/heads/agent", prev, oid(n), p.id);
+        w.deps.trunk = Some(trunk.id);
+        w.deps.scoped_old = prev;
+        w.commits = vec![aspen_core::meta::NewCommit {
+            commit: oid(n),
+            parents: vec![oid(1)],
+            committer_time: 10,
+        }];
+        w.jobs = vec![aspen_core::meta::VersionJob {
+            kind: aspen_core::meta::VersionJobKind::Compact,
+            run_after: UnixMicros(0),
+        }];
+        let before = s.statements();
+        let v = committed(s, repo, vec![w]).await.remove(0);
+        let wrote = s.statements() - before;
+        match s.dialect() {
+            Dialect::Postgres => {
+                assert_eq!((registered.queries, registered.transaction_control), (1, 0));
+                assert_eq!((wrote.queries, wrote.transaction_control), (1, 0));
+            }
+            Dialect::Sqlite => {
+                assert_eq!(registered.transaction_control, 2, "BEGIN, COMMIT");
+                assert_eq!(wrote.transaction_control, 2, "BEGIN, COMMIT");
+            }
+        }
+        assert_eq!(v.deps.trunk, Some(trunk.id));
+        assert_eq!(v.deps.scoped_old, prev);
+        assert_eq!(v.value.pack(), Some(p.id));
+        assert_eq!(
+            s.current_version(repo, &rn("refs/heads/agent"))
+                .await
+                .unwrap(),
+            Some(v.clone())
+        );
+        let rows = s
+            .lookup_commits(
+                repo,
+                &aspen_core::ingest::SortedIds::from_unsorted(vec![oid(n)]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&rows[0], aspen_core::meta::CommitLookup::Indexed(r) if r.ref_version == v.id),
+            "{rows:?}"
+        );
+        prev = Some(v.id);
+    }
+    assert_eq!(count(s, "ref_versions").await, 4);
+    assert_eq!(count(s, "jobs").await, 3);
+    // Registering an existing pack again is one statement on Postgres too.
+    let before = s.statements();
+    s.register_pack(&push_pack(repo, 2)).await.unwrap();
+    if s.dialect() == Dialect::Postgres {
+        assert_eq!((s.statements() - before).total(), 1);
+    }
+
+    // Group commit: a batch of 4 branch pushes is one transaction, and on
+    // Postgres each push in it is one statement, with no savepoint.
+    let new: Vec<NewPack> = (10..14).map(|n| push_pack(repo, n)).collect();
+    let before = s.statements();
+    let packs: Vec<PackId> = s
+        .register_packs(&new)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.unwrap().id)
+        .collect();
+    let registered = s.statements() - before;
+    let pushes: Vec<PushCommit> = packs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut w = live(&format!("refs/heads/g{i}"), None, oid(30 + i as u8), *p);
+            w.deps.trunk = Some(trunk.id);
+            PushCommit {
+                repo,
+                writes: vec![w],
+            }
+        })
+        .collect();
+    let before = s.statements();
+    let out = s.commit_pushes(&pushes).await.unwrap();
+    let wrote = s.statements() - before;
+    assert!(
+        out.iter()
+            .all(|o| matches!(o, Ok(CommitOutcome::Committed(_)))),
+        "{out:?}"
+    );
+    if s.dialect() == Dialect::Postgres {
+        assert_eq!((registered.queries, registered.transaction_control), (4, 2));
+        assert_eq!((wrote.queries, wrote.transaction_control), (4, 2));
+    }
+}
+
+/// On Postgres a registration whose insert waits for a sweep deleting the
+/// same checksum's old row must take the next generation, although the
+/// tombstone the sweep writes is not in the snapshot of the statement it
+/// started. The sweep is played by hand: lock the row `FOR UPDATE`, delete
+/// it and write its tombstone, and commit only after the registration has
+/// started and is waiting. (SQLite runs one writer at a time.)
+async fn a_registration_that_waits_for_a_sweep_takes_the_next_generation(c: Ctx) {
+    let s = &c.store;
+    if s.dialect() != Dialect::Postgres {
+        return;
+    }
+    let repo = new_repo(s, "acme/r").await.id;
+    let old = s.register_pack(&push_pack(repo, 1)).await.unwrap();
+    assert_eq!(old.generation, PackGeneration::FIRST);
+    let mut sweep = raw_write_tx(s).await;
+    sqlx::query("SELECT id FROM packs WHERE id = $1 FOR UPDATE")
+        .bind(old.id.get())
+        .fetch_all(&mut *sweep)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM pack_touches WHERE pack_id = $1")
+        .bind(old.id.get())
+        .execute(&mut *sweep)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM packs WHERE id = $1")
+        .bind(old.id.get())
+        .execute(&mut *sweep)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO pack_tombstones (repo_id, checksum, generation, swept_at_us) \
+         VALUES ($1, $2, 0, 1)",
+    )
+    .bind(repo.get())
+    .bind(vec![1u8; 20])
+    .execute(&mut *sweep)
+    .await
+    .unwrap();
+    let s2 = s.clone();
+    let register = tokio::spawn(async move { s2.register_pack(&push_pack(repo, 1)).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !register.is_finished(),
+        "the registration waits for the sweep"
+    );
+    sweep.commit().await.unwrap();
+    let again = register.await.unwrap().unwrap();
+    assert_ne!(again.id, old.id);
+    assert_eq!(again.generation, PackGeneration::new(1));
+    assert_eq!(s.packs(&[again.id]).await.unwrap(), vec![again]);
 }
 
 /// `covers_at` returns exactly the covers of the ref at the level whose
@@ -3492,13 +3964,32 @@ async fn pack_by_checksum_looks_up_one_repository(c: Ctx) {
 const GRACE: Duration = Duration::from_secs(10);
 const GRACE_US: i64 = 10_000_000;
 
-async fn sweep(s: &SqlStore) -> Vec<PackId> {
-    s.sweep_orphan_packs(GRACE, 100)
+/// Longer than any test's clock runs: the test's lease never expires
+/// unless a test lets it.
+const FOREVER: Duration = Duration::from_secs(1 << 40);
+
+/// The garbage-collection lease, held by this test.
+async fn gc_lease(s: &SqlStore) -> Lease {
+    s.acquire_lease(GC_LEASE, "test", FOREVER)
         .await
         .unwrap()
-        .iter()
-        .map(|p| p.id)
-        .collect()
+        .expect("nobody else holds the lease")
+}
+
+/// One sweep batch of at most `limit` registrations, under the test's
+/// lease.
+async fn sweep_batch(s: &SqlStore, limit: u32) -> SweepBatch {
+    let lease = gc_lease(s).await;
+    s.sweep_orphan_packs(&lease, GRACE, limit).await.unwrap()
+}
+
+/// The rows one batch of at most `limit` deletes.
+async fn sweep_rows(s: &SqlStore, limit: u32) -> Vec<aspen_core::pack::PackRecord> {
+    sweep_batch(s, limit).await.deleted
+}
+
+async fn sweep(s: &SqlStore) -> Vec<PackId> {
+    sweep_rows(s, 100).await.iter().map(|p| p.id).collect()
 }
 
 /// Registering records the store's time on the pack, and registering it
@@ -3544,16 +4035,10 @@ async fn an_orphan_is_swept_after_grace_and_tombstoned(c: Ctx) {
     assert_eq!(sweep(s).await, vec![]);
     c.set_time(t0 + GRACE_US);
     // A limit of one deletes the oldest first.
-    assert_eq!(
-        s.sweep_orphan_packs(GRACE, 1).await.unwrap(),
-        vec![rows[0].clone()]
-    );
-    assert_eq!(s.sweep_orphan_packs(GRACE, 0).await.unwrap(), vec![]);
+    assert_eq!(sweep_rows(s, 1).await, vec![rows[0].clone()]);
+    assert_eq!(sweep_rows(s, 0).await, vec![]);
     c.set_time(t0 + GRACE_US + 1);
-    assert_eq!(
-        s.sweep_orphan_packs(GRACE, 5).await.unwrap(),
-        vec![rows[1].clone()]
-    );
+    assert_eq!(sweep_rows(s, 5).await, vec![rows[1].clone()]);
     assert_eq!(sweep(s).await, vec![]);
     let sum = PackChecksum::from_bytes([1; 20]);
     assert_eq!(s.pack_by_checksum(repo, &sum).await.unwrap(), None);
@@ -3767,6 +4252,8 @@ async fn the_sweep_spares_a_pack_an_open_push_is_referencing(c: Ctx) {
     let t0 = c.now().0;
     let p = pack(s, repo, 1).await;
     c.set_time(t0 + 100 * GRACE_US);
+    // Before the open transaction: on SQLite it holds the write lock.
+    let lease = gc_lease(s).await;
     let mut push = raw_write_tx(s).await;
     sqlx::query(
         "INSERT INTO ref_versions (repo_id, ref_name, seq, tip_oid, closure_exact, pack_id) \
@@ -3780,13 +4267,226 @@ async fn the_sweep_spares_a_pack_an_open_push_is_referencing(c: Ctx) {
     .await
     .unwrap();
     let sweeper = s.clone();
-    let handle = tokio::spawn(async move { sweeper.sweep_orphan_packs(GRACE, 100).await });
+    let handle = tokio::spawn(async move { sweeper.sweep_orphan_packs(&lease, GRACE, 100).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     push.commit().await.unwrap();
-    assert_eq!(handle.await.unwrap().unwrap(), vec![]);
+    assert_eq!(handle.await.unwrap().unwrap().deleted, vec![]);
     assert_eq!(s.packs(&[p]).await.unwrap()[0].id, p);
     c.set_time(t0 + 1000 * GRACE_US);
     assert_eq!(sweep(s).await, vec![]);
+}
+
+/// The sweep is incremental (migration 0009): each batch reads at most
+/// `limit` registrations after where the last one stopped, plus `limit`
+/// packs of the audit, however many packs are stored, and a run of batches
+/// deletes every orphan that is due, oldest registration first.
+async fn the_sweep_resumes_where_it_stopped_in_bounded_batches(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+    // 40 packs, every fourth an orphan, each registered 1 µs after the last.
+    let mut orphans = Vec::new();
+    let mut named = Vec::new();
+    for n in 1..=40u8 {
+        c.set_time(t0 + i64::from(n));
+        let p = pack(s, repo, n).await;
+        if n % 4 == 0 {
+            orphans.push(p);
+        } else {
+            advance(s, repo, MAIN, oid(n), p).await;
+            named.push(p);
+        }
+    }
+    c.set_time(t0 + 100 * GRACE_US);
+    let mut deleted = Vec::new();
+    let mut batches = 0;
+    loop {
+        let b = sweep_batch(s, 6).await;
+        batches += 1;
+        assert!(
+            b.examined <= 12,
+            "a batch reads at most twice its limit: {b:?}"
+        );
+        // Oldest registration first: nothing is deleted out of order.
+        deleted.extend(b.deleted.iter().map(|r| r.id));
+        if b.caught_up {
+            break;
+        }
+        assert!(batches < 20, "the walk does not advance");
+    }
+    assert_eq!(deleted, orphans);
+    assert_eq!(batches, 7, "40 registrations in batches of 6");
+    assert_eq!(s.packs(&named).await.unwrap().len(), named.len());
+    // Caught up: a batch reads no registration again, only the audit's.
+    let b = sweep_batch(s, 6).await;
+    assert!(b.caught_up && b.deleted.is_empty(), "{b:?}");
+    assert!(b.examined <= 6, "{b:?}");
+}
+
+/// A pack the walk passed while something named it, and that stops being
+/// named during the pass, is not deleted by that pass, nor by any before
+/// its new grace period ends; then it is. Eviction touches the pack, which
+/// moves its registration ahead of the watermark.
+async fn a_pack_unnamed_behind_the_cursor_survives_its_grace_then_goes(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+    let base = pack(s, repo, 1).await;
+    let v1 = advance(s, repo, MAIN, oid(1), base).await;
+    let p = shallow_built(s, repo, 2).await.id;
+    record(s, repo, v1.id, depth(1), p).await.unwrap();
+    let orphan = pack(s, repo, 3).await;
+    advance(s, repo, MAIN, oid(2), base).await;
+    let t1 = t0 + 100 * GRACE_US;
+    c.set_time(t1);
+    // One registration per batch: base, then the recorded pack, both named.
+    assert_eq!(sweep_rows(s, 1).await, vec![]);
+    assert_eq!(sweep_rows(s, 1).await, vec![]);
+    // The walk is past `p`; its recording is evicted (p is touched now).
+    assert_eq!(
+        s.evict_shallow_packs(Duration::ZERO, NEVER, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    // The rest of the pass deletes the orphan after it and spares `p`.
+    let rest = sweep_rows(s, 1).await;
+    assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![orphan]);
+    assert_eq!(sweep(s).await, vec![]);
+    c.set_time(t1 + GRACE_US - 1);
+    assert_eq!(sweep(s).await, vec![]);
+    c.set_time(t1 + GRACE_US);
+    assert_eq!(sweep(s).await, vec![p]);
+}
+
+/// On Postgres a transaction naming an orphan holds its row, so the sweep
+/// skips it; the walk must not move past it, because that transaction may
+/// roll back and leave the pack an orphan. Here it rolls back, and the
+/// next batch deletes the pack, before the audit could come round to it.
+/// (On SQLite the sweep waits for the transaction instead.)
+async fn the_walk_never_passes_a_pack_an_open_transaction_holds(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+    // Named packs with lower IDs and later registrations: the audit (one
+    // pack per batch here) reads them first, the walk after the orphan.
+    c.set_time(t0 + 1);
+    let mut named = Vec::new();
+    for n in 1..=4u8 {
+        let p = pack(s, repo, n).await;
+        advance(s, repo, MAIN, oid(n), p).await;
+        named.push(p);
+    }
+    c.set_time(t0);
+    let orphan = pack(s, repo, 9).await;
+    c.set_time(t0 + 100 * GRACE_US);
+    // Before the open transaction: on SQLite it holds the write lock.
+    let lease = gc_lease(s).await;
+    let mut push = raw_write_tx(s).await;
+    sqlx::query(
+        "INSERT INTO ref_versions (repo_id, ref_name, seq, tip_oid, closure_exact, pack_id) \
+         VALUES ($1, $2, 1, $3, 1, $4)",
+    )
+    .bind(repo.get())
+    .bind("refs/heads/topic")
+    .bind(oid(9).as_bytes().to_vec())
+    .bind(orphan.get())
+    .execute(&mut *push)
+    .await
+    .unwrap();
+    let sweeper = s.clone();
+    let first = tokio::spawn(async move { sweeper.sweep_orphan_packs(&lease, GRACE, 1).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    push.rollback().await.unwrap();
+    let first = first.await.unwrap().unwrap();
+    let deleted: Vec<PackId> = match s.dialect() {
+        // SQLite waited for the rollback, so the orphan was free.
+        Dialect::Sqlite => first.deleted.iter().map(|r| r.id).collect(),
+        Dialect::Postgres => {
+            assert_eq!(first.deleted, vec![], "the row was held");
+            assert!(first.caught_up, "a held first row ends the pass: {first:?}");
+            sweep_rows(s, 1).await.iter().map(|r| r.id).collect()
+        }
+    };
+    assert_eq!(deleted, vec![orphan]);
+    assert_eq!(s.packs(&named).await.unwrap().len(), 4);
+}
+
+/// The audit reaches a pack with no registration time (one registered
+/// before migration 0005) wherever the walk is, records the time, and the
+/// walk deletes it a grace period later.
+async fn the_audit_stamps_a_legacy_pack_behind_the_walk(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+    let legacy = pack(s, repo, 1).await;
+    let later = pack(s, repo, 2).await;
+    advance(s, repo, MAIN, oid(2), later).await;
+    sqlx::query("DELETE FROM pack_touches WHERE pack_id = $1")
+        .bind(legacy.get())
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let t1 = t0 + 100 * GRACE_US;
+    c.set_time(t1);
+    let b = sweep_batch(s, 10).await;
+    assert_eq!(b.deleted, vec![]);
+    assert_eq!(count(s, "pack_touches").await, 2);
+    c.set_time(t1 + GRACE_US);
+    assert_eq!(sweep(s).await, vec![legacy]);
+}
+
+/// One holder at a time: a live lease is refused to another owner and
+/// extended for its own; it expires `ttl` after its last extension (its
+/// holder died), and the next owner takes it with a new epoch. Work under
+/// the old epoch is then refused and writes nothing, whatever its owner's
+/// clock says.
+async fn a_lease_has_one_holder_and_fences_a_stale_one(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+    let ttl = Duration::from_secs(60);
+    let a = s.acquire_lease(GC_LEASE, "a", ttl).await.unwrap().unwrap();
+    assert_eq!((a.owner.as_str(), a.epoch), ("a", 1));
+    assert_eq!(s.acquire_lease(GC_LEASE, "b", ttl).await.unwrap(), None);
+    // Another lease name is independent.
+    assert!(s.acquire_lease("other", "b", ttl).await.unwrap().is_some());
+    // The holder extends it; it keeps its epoch.
+    c.set_time(t0 + 50_000_000);
+    assert_eq!(
+        s.acquire_lease(GC_LEASE, "a", ttl).await.unwrap(),
+        Some(a.clone())
+    );
+    c.set_time(t0 + 109_999_999);
+    assert_eq!(s.acquire_lease(GC_LEASE, "b", ttl).await.unwrap(), None);
+
+    // `a` stops (it died, or stalled): its lease runs out and `b` takes it.
+    let orphan = pack(s, repo, 1).await;
+    c.set_time(t0 + 110_000_000);
+    let b = s.acquire_lease(GC_LEASE, "b", ttl).await.unwrap().unwrap();
+    assert_eq!((b.owner.as_str(), b.epoch), ("b", 2));
+    assert_eq!(s.acquire_lease(GC_LEASE, "a", ttl).await.unwrap(), None);
+
+    // `a` resumes: its sweep is refused and deletes nothing.
+    c.set_time(t0 + 110_000_000 + GRACE_US);
+    let r = s.sweep_orphan_packs(&a, GRACE, 100).await;
+    assert!(matches!(&r, Err(e) if e.is_lease_lost()), "{r:?}");
+    assert_eq!(s.packs(&[orphan]).await.unwrap().len(), 1);
+    // `b`'s sweep extends `b`'s lease and does the work.
+    let swept = s.sweep_orphan_packs(&b, GRACE, 100).await.unwrap();
+    assert_eq!(
+        swept.deleted.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![orphan]
+    );
+    c.set_time(t0 + 110_000_000 + GRACE_US + 59_000_000);
+    assert_eq!(s.acquire_lease(GC_LEASE, "a", ttl).await.unwrap(), None);
+    // A lease that expired is refused even to its own holder's work, and
+    // taking it again is a new epoch.
+    c.set_time(t0 + 110_000_000 + GRACE_US + 60_000_000);
+    let r = s.sweep_orphan_packs(&b, GRACE, 100).await;
+    assert!(matches!(&r, Err(e) if e.is_lease_lost()), "{r:?}");
+    let b2 = s.acquire_lease(GC_LEASE, "b", ttl).await.unwrap().unwrap();
+    assert_eq!(b2.epoch, 3);
 }
 
 // ---------------------------------------------------------------------------

@@ -23,7 +23,8 @@ use aspen_meta::SqlStore;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
 use aspen_place::{PlaceConfig, ServerSettings};
 use aspen_server::access::ClientAddr;
-use aspen_server::access::tokens::SqlTokens;
+use aspen_server::access::cache;
+use aspen_server::access::tokens::{CachedTokens, SqlTokens};
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -188,7 +189,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let drain = Duration::from_secs(parse("PLACE_SHUTDOWN_DRAIN_SECONDS", 20)?);
-    let built = aspen_place::build(meta.clone(), blobs, SqlTokens(meta), config, settings).await?;
+    // Token rows are kept for a few seconds, as `aspen serve` does by
+    // default (decisions log, "throughput 6a").
+    let tokens = CachedTokens::new(SqlTokens(meta.clone()), cache::DEFAULT_TOKEN_TTL);
+    let built = aspen_place::build(meta.clone(), blobs, tokens, config, settings).await?;
     // Compaction, commit indexing and garbage collection. Jobs are leased
     // and idempotent, so one cut short by exit is redone after its lease.
     let mut background = built.worker;

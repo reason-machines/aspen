@@ -76,7 +76,7 @@ where
             reason: other.to_string(),
         },
     };
-    let stitch_plan = deliver::stitch_plan(server.blobs(), &rows)
+    let stitch_plan = deliver::stitch_plan(server.blobs(), &rows, &[])
         .await
         .map_err(fetch_err)?;
     let io = |e: std::io::Error| StoreError::LocalIo {

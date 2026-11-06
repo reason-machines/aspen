@@ -7,8 +7,10 @@ on one machine).
 
 It works with stock `git` over HTTP and SSH. No client changes are needed.
 
-> **Status: pre-alpha.** Aspen is not released yet. There are no published
-> binaries or images, and the public demo is not running. Aspen is licensed
+> **Status: pre-alpha.** Aspen is not released yet: there are no published
+> binaries or images, and storage formats may still change. The public demo,
+> [place.reasonmachines.com](https://place.reasonmachines.com), is a shared
+> pixel canvas where every click is a `git push` to Aspen. Aspen is licensed
 > under the Apache License 2.0. Everything on this site describes the code on the `main` branch.
 > The [limitations](limitations.md) page lists what is missing.
 
@@ -22,7 +24,13 @@ server spends its time on locks and on compressing the same objects again
 and again.
 
 Aspen follows the design OpenAI described for its internal Git service,
-Pando ("[Scaling Git at OpenAI](https://openai.com/index/scaling-git-at-openai/)"):
+Pando ("[Scaling Git at OpenAI](https://openai.com/index/scaling-git-at-openai/)"),
+and takes further inspiration from Cursor's
+"[Git at any scale](https://cursor.com/blog/git-at-any-scale)": the bar of
+counting a push only once it is durable in object storage, and batching the
+write that publishes pushes rather than their data (group commit). Aspen is
+an independent implementation, not affiliated with OpenAI or Cursor. In
+short:
 
 - **Packs go to object storage as they arrive.** A push is checked,
   completed into a self-contained pack and uploaded. It is never unpacked

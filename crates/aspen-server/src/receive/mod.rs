@@ -66,7 +66,10 @@ pub use push::{PushOutcome, Timings};
 pub struct ReceiveConfig {
     /// Where pushes are spooled and completed: a real disk (never tmpfs),
     /// sized for about twice the largest accepted push plus its `.idx`
-    /// (S4). Each push works in its own temporary directory under it.
+    /// (S4). Each push works in its own temporary directory under it. The
+    /// delta-chain maps of sampled packs (`aspen_pack::chains`, 16 bytes
+    /// per object of each sampled pack in the `.idx` cache) are kept in
+    /// `chains/` under it.
     pub spool_dir: PathBuf,
     /// Object count and pack size limits, checked before and while the
     /// pack body is read.
@@ -292,7 +295,10 @@ where
     /// The service. `spool_dir` is created if missing.
     pub fn new(meta: M, blobs: B, config: ReceiveConfig) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&config.spool_dir)?;
-        let packs = StoredPacks::new(meta.clone(), blobs.clone(), config.locate);
+        // Sampled packs keep their delta-chain maps on the spool disk, so a
+        // deep chain in a large pack costs one round of reads (item 11).
+        let packs = StoredPacks::new(meta.clone(), blobs.clone(), config.locate)
+            .with_chain_dir(config.spool_dir.join("chains"));
         let group = config
             .group_commit
             .enabled
@@ -522,6 +528,31 @@ where
             "Delta bases and other objects read from stored packs that came from the blob store.",
             misses,
         );
+        let l = self.packs.stats();
+        for (name, help, v) in [
+            (
+                "aspen_push_idx_loads_total",
+                "Pack indexes (.idx) read from the blob store into the locator's cache, whole or as a sample.",
+                l.whole_idx_loads + l.sampled_idx_loads,
+            ),
+            (
+                "aspen_push_idx_sampled_loads_total",
+                "Of those, indexes kept as a sample: over ASPEN_IDX_WHOLE_MAX_BYTES, or not fitting ASPEN_IDX_CACHE_BYTES beside the other indexes of their search.",
+                l.sampled_idx_loads,
+            ),
+            (
+                "aspen_push_idx_load_waits_total",
+                "Index cache misses that waited for another request's read of the same .idx instead of reading it again.",
+                l.idx_load_waits,
+            ),
+            (
+                "aspen_push_idx_read_bytes_total",
+                "Bytes of .idx read from the blob store: whole loads, samples, and lookups in samples.",
+                l.idx_bytes_read,
+            ),
+        ] {
+            crate::metrics::expo::counter(out, name, help, v);
+        }
         if self.config.merge_queue {
             self.queue_metrics.render(out);
         }
@@ -562,6 +593,16 @@ where
     /// The metadata store.
     pub(crate) fn meta(&self) -> &M {
         &self.meta
+    }
+
+    /// The blob store (the merge queue reads queued packs whole).
+    pub(crate) fn blobs(&self) -> &B {
+        &self.blobs
+    }
+
+    /// The largest object any step inflates.
+    pub(crate) fn max_object_bytes(&self) -> u64 {
+        self.config.max_object_bytes.get()
     }
 
     /// Whether `a` is an ancestor of (or equal to) `b`, answered exactly
@@ -700,52 +741,33 @@ where
 
     /// The ref advertisement a push starts with, as a connection (SSH)
     /// sends it: a `version 1` line if the client asked for v1, then trunk
-    /// (and the branch-scoped ref, if any) with up to `have_tips` earlier
-    /// trunk tips as `.have` lines (S2).
+    /// (and the branch-scoped ref, if any) with earlier trunk tips as
+    /// `.have` lines (S2): every one of the newest `8 × have_tips`, then
+    /// tips spaced a quarter apart down to the oldest
+    /// ([`have_tip_seqs`]), so a client whose base is any trunk version
+    /// sends little more than its own commits, without `push.negotiate`.
     ///
     /// A `.have` tip tells the client it may leave out everything that tip
     /// reaches, so only tips inside the closure a push searches are shown:
-    /// the earlier versions reached from the current trunk version through
-    /// trunk dependencies that are each the version's own parent. The walk
-    /// stops at the first version whose trunk dependency is not its parent
-    /// (a forced trunk update, or a first push after a delete), so tips a
-    /// forced update skipped are never advertised.
+    /// trunk versions the current trunk version reaches through its
+    /// dependencies (`Closures::held_seqs`). Tips a forced trunk
+    /// update skipped are outside it and never advertised. The walk is the
+    /// one a push's search set needs anyway, and is cached: it reads the
+    /// versions pushed since the cached closure (one, between two pushes on
+    /// one instance), then one batch of the advertised versions' rows that
+    /// this instance does not remember (none, between two of its pushes).
     pub async fn advertise_refs(
         &self,
         r: &Repo,
         scope: Option<&RefName>,
         requested: ProtocolVersion,
     ) -> Result<Vec<u8>, ServiceError> {
-        let trunk = r.settings.trunk().clone();
-        let mut refs = Vec::new();
-        let mut haves = Vec::new();
-        if let Some(v) = self.meta.current_version(r.id, &trunk).await?
-            && let Some(tip) = v.value.tip()
-        {
-            refs.push(AdvertisedRef {
-                name: trunk.clone(),
-                tip,
-            });
-            let want = have_tip_seqs(v.seq, r.settings.have_tips());
-            let chain = self
-                .trunk_chain(r, &trunk, &v, want.last().copied())
-                .await?;
-            for old in chain.iter().filter(|o| want.contains(&o.seq)) {
-                if let RefValue::Live { tip: t, .. } = old.value
-                    && t != tip
-                    && !haves.contains(&t)
-                {
-                    haves.push(t);
-                }
-            }
-        }
-        if let Some(scope) = scope.filter(|s| *s != &trunk)
-            && let Some(v) = self.meta.current_version(r.id, scope).await?
-            && let Some(tip) = v.value.tip()
-        {
-            refs.push(AdvertisedRef {
-                name: scope.clone(),
-                tip,
+        let (refs, counted) = self.meta.count_statements(self.advertised(r, scope)).await;
+        let (refs, haves) = refs?;
+        if let Some(n) = counted {
+            self.record(&Timings {
+                advert_db_queries: n.queries,
+                ..Timings::default()
             });
         }
         let version = ReceiveVersion::answering(requested);
@@ -762,45 +784,63 @@ where
         Ok(out)
     }
 
-    /// The earlier trunk versions down to `oldest`, newest first, for as
-    /// long as each newer one's trunk dependency is its parent. Read in
-    /// batches that double, so a short chain costs few rows.
-    async fn trunk_chain(
+    /// The refs and `.have` tips of [`ReceivePack::advertise_refs`]: trunk
+    /// and the versions pushed since this instance last asked in one
+    /// statement, the `.have` versions from the closure cache (one batch
+    /// for any it lacks), and the scoped ref in another.
+    async fn advertised(
         &self,
         r: &Repo,
-        trunk: &RefName,
-        current: &aspen_core::refs::RefVersion,
-        oldest: Option<aspen_core::id::Seq>,
-    ) -> Result<Vec<aspen_core::refs::RefVersion>, ServiceError> {
-        let mut out = Vec::new();
-        let Some(oldest) = oldest else {
-            return Ok(out);
-        };
-        let mut newer = current.clone();
-        let mut batch = 1u64;
-        let mut back = 1u64;
-        loop {
-            let seqs: Vec<_> = (back..back + batch)
-                .filter_map(|b| current.seq.back(b))
-                .filter(|s| *s >= oldest)
-                .collect();
-            if seqs.is_empty() {
-                return Ok(out);
-            }
-            let mut got = self.meta.versions_by_seq(r.id, trunk, &seqs).await?;
-            got.sort_by_key(|v| std::cmp::Reverse(v.seq));
-            for old in got {
-                if newer.parent != Some(old.id) || newer.deps.trunk != Some(old.id) {
-                    return Ok(out);
+        scope: Option<&RefName>,
+    ) -> Result<(Vec<AdvertisedRef>, Vec<aspen_core::id::ObjectId>), ServiceError> {
+        let trunk = r.settings.trunk().clone();
+        let mut refs = Vec::new();
+        let mut haves = Vec::new();
+        let n = r.settings.have_tips();
+        // The dense window of `have_tip_seqs`, read with the current
+        // version, so that versions other instances pushed come in the same
+        // statement.
+        let window = 8 * u64::from(n);
+        if let Some(recent) = self
+            .closures
+            .recent(&self.meta, r.id, &trunk, window)
+            .await?
+            && let Some(tip) = recent[0].value.tip()
+        {
+            let v = &recent[0];
+            refs.push(AdvertisedRef {
+                name: trunk.clone(),
+                tip,
+            });
+            if n > 0 {
+                let held = self
+                    .closures
+                    .held_seqs(&self.meta, r.id, v.id, &trunk)
+                    .await?;
+                let want = have_tip_seqs(v.seq, n, &held);
+                for old in self
+                    .closures
+                    .versions_at(&self.meta, r.id, &trunk, &want)
+                    .await?
+                {
+                    if let RefValue::Live { tip: t, .. } = old.value
+                        && t != tip
+                        && !haves.contains(&t)
+                    {
+                        haves.push(t);
+                    }
                 }
-                out.push(old.clone());
-                newer = old;
             }
-            if newer.seq == oldest {
-                return Ok(out);
-            }
-            back += batch;
-            batch *= 2;
         }
+        if let Some(scope) = scope.filter(|s| *s != &trunk)
+            && let Some(v) = self.meta.current_version(r.id, scope).await?
+            && let Some(tip) = v.value.tip()
+        {
+            refs.push(AdvertisedRef {
+                name: scope.clone(),
+                tip,
+            });
+        }
+        Ok((refs, haves))
     }
 }

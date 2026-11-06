@@ -61,10 +61,10 @@ use std::time::Duration;
 use std::ops::{Deref, DerefMut};
 
 use aspen_core::error::StoreError;
-use sqlx::AnyConnection;
 use sqlx::pool::PoolConnection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::conn::{Conn, Counter};
 use crate::error::store_error;
 
 /// The store's queue for connections. Cheap to clone: clones share it.
@@ -213,29 +213,29 @@ pub(crate) struct Permit(#[allow(dead_code)] OwnedSemaphorePermit);
 #[derive(Debug)]
 pub(crate) struct Admitted {
     // Declared first, so the connection is released before the permit.
-    conn: PoolConnection<sqlx::Any>,
+    conn: Conn,
     _permit: Permit,
 }
 
 impl Admitted {
-    pub(crate) fn new(conn: PoolConnection<sqlx::Any>, permit: Permit) -> Self {
+    pub(crate) fn new(conn: PoolConnection<sqlx::Any>, permit: Permit, counter: Counter) -> Self {
         Self {
-            conn,
+            conn: Conn::pooled(conn, counter),
             _permit: permit,
         }
     }
 }
 
 impl Deref for Admitted {
-    type Target = AnyConnection;
+    type Target = Conn;
 
-    fn deref(&self) -> &AnyConnection {
+    fn deref(&self) -> &Conn {
         &self.conn
     }
 }
 
 impl DerefMut for Admitted {
-    fn deref_mut(&mut self) -> &mut AnyConnection {
+    fn deref_mut(&mut self) -> &mut Conn {
         &mut self.conn
     }
 }

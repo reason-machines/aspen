@@ -62,7 +62,7 @@ One row per repository.
 | `allow_force` | `none`, `branches` (default; every ref except trunk) or `all`. Gates whether a force is possible; the client must still ask with `-o force` or a lease |
 | `writable_refs` | Writable namespaces, space-separated patterns (`refs/heads/* refs/tags/*` by default) |
 | `no_thin` | 1 to advertise `no-thin` on push (default 0) |
-| `have_tips` | Earlier trunk tips advertised as `.have` lines, 0 to 32 (default 8) |
+| `have_tips` | Scales the `.have` lines of a push advertisement, 0 to 32 (default 8; 0 advertises none): every one of the newest `8 × have_tips` earlier trunk versions, then tips about a quarter apart back to the oldest (`aspen_core::meta::have_tip_seqs`) |
 | `shallow` | `serve` (default; full closure plus exact `shallow-info`) or `refuse` |
 
 ### `packs`
@@ -106,6 +106,7 @@ The history of every ref: one row per accepted update.
 | `pack_id` | The pack this write stored, `NULL` if it stored none (always `NULL` for a deletion). A multi-ref push stores one pack per write |
 | `trunk_dep_id` | The exact trunk version the push's base lookup and connectivity check searched (always `NULL` for a deletion) |
 | `scoped_dep_id` | For a branch-scoped URL push, the scoped ref's old version; for a client's push of one branch through the plain repository URL (not forced or leased), that branch's version the push searched (issue #203). Always `NULL` for a deletion |
+| `txid` | Migration 0010: the transaction that wrote the row, so a reader can ask which refs changed since it last read them (`MetaStore::ref_changes`, which `ls-refs` uses to keep listings in memory). On Postgres the writing top-level transaction's 64-bit ID (`pg_current_xact_id()`, the column default); a reader's cursor is its statement's snapshot, `xmax` plus the transactions it saw in progress, so a write that commits after a later-numbered one is still found. On SQLite, where writes run one at a time, the row's own `id`, set by the trigger `ref_versions_txid`. `0` for rows written before the migration, which every reader sees. Indexed with `repo_id` (`ref_versions_repo_txid`) |
 
 Invariant (**connected**): every object reachable from `tip_oid` is in
 `pack_id` or in the closure of the dependencies. The push path's
@@ -213,7 +214,7 @@ blobs, then commits the version or cover that names it, so for a while
 every new pack is unreferenced on purpose. A push that loses its
 compare-and-swap, is refused or dies, or a compactor that dies, leaves its
 pack unreferenced for good (issue #48).
-`MetaStore::sweep_orphan_packs(grace, limit)` deletes those rows; the
+`MetaStore::sweep_orphan_packs(lease, grace, limit)` deletes those rows; the
 caller (`aspen-compact`'s GC) then deletes their blobs and finishes the
 tombstones (`MetaStore::pending_pack_deletes`,
 `MetaStore::finish_pack_deletes`).
@@ -223,20 +224,67 @@ tombstones (`MetaStore::pending_pack_deletes`,
 | `packs` | `generation` | Which registration of its checksum the row is (`aspen_core::pack::PackGeneration`): 0 for the first, one more than the highest tombstoned generation after that. Generation 0 keeps the schema v1 keys; generation `n` uses `repos/<repo>/packs/<checksum>.g<n>.{pack,idx,entries}`, and the key columns always match the row's generation |
 | `pack_touches` | `pack_id` (primary key), `repo_id`, `touched_at_us` | When `register_pack` last registered the pack, by the store's clock; every registration, of a new or an existing row, sets it (never moving it back) |
 | `pack_tombstones` | `repo_id`, `checksum`, `generation` (primary key), `swept_at_us`, `deleted_at_us` | A row the sweep deleted. Pending (blobs still to delete) while `deleted_at_us` is null. Rows are kept after they are finished, so the checksum's next row still gets a later generation; they never expire |
+| `gc_cursors` (migration 0009) | `name` (primary key), `touched_at_us`, `pack_id`, `audit_pack_id` | Where the sweep (row `orphan_packs`) resumes: the `(touched_at_us, pack_id)` key of the last registration its ordered walk decided (the watermark), and the last pack ID its audit read (0 to start over) |
+| `leases` (migration 0009) | `name` (primary key), `owner`, `epoch`, `expires_at_us` | Time-limited leases on work one process does at a time (`MetaStore::acquire_lease`; the sweep's is `gc`). `epoch` grows by one each time the lease changes hands or is taken again after it expired. Expiry is by the store's clock |
 
-The sweep, in one write transaction:
+Index `pack_touches_due` (migration 0009) on `pack_touches
+(touched_at_us, pack_id)` orders registrations by when their grace periods
+end.
 
-1. Pick up to `limit` packs, oldest ID first, that no `ref_versions.pack_id`,
-   `covers.pack_id`, `jobs.pack_id` (a job of any state) or
-   `shallow_packs.pack_id` names and that
-   either have no touch row or were touched at least `grace` ago. On
-   Postgres the pick locks them `FOR UPDATE OF p SKIP LOCKED`.
-2. A pick without a touch row (registered before migration 0005) gets one
-   with the current time and is left for a later sweep.
-3. Delete the other picks' touch rows and then their `packs` rows, each
-   `DELETE` re-checking that nothing names the pack and that the touch is
-   still old, and leave a pending tombstone for each deleted row with its
-   generation. Return the deleted rows.
+The sweep, in one write transaction of bounded size (throughput item 7;
+before migration 0009 it picked candidates with one query over every pack,
+whose cost grew with the number of packs: 7.9 s per pass at 1.5 million
+packs in a load test):
+
+1. Extend the `gc` lease (`UPDATE leases ... WHERE` owner, epoch and not
+   expired). If that matches no row, refuse (`StoreError::lease_lost`) and
+   write nothing. On Postgres the update holds the lease row until the
+   transaction ends, so a takeover waits for it.
+2. The walk: up to `limit` `pack_touches` rows after the watermark whose
+   touch is at least `grace` old, in `(touched_at_us, pack_id)` order (a
+   range scan of `pack_touches_due`).
+3. The audit: the next `limit` `packs` rows by ID after the audit cursor
+   (wrapping to the start once it reads fewer), each with its touch. A row
+   with no touch (registered before migration 0005) gets one with the
+   current time, so the walk deletes it a grace period later. A row whose
+   touch is old and that the watermark already passed is a candidate
+   again.
+4. Lock the candidates that no `ref_versions.pack_id`, `covers.pack_id`,
+   `jobs.pack_id` (a job of any state) or `shallow_packs.pack_id` names,
+   `FOR UPDATE OF p SKIP LOCKED` on Postgres.
+5. Delete the locked candidates' touch rows and then their `packs` rows,
+   each `DELETE` re-checking that nothing names the pack and that the
+   touch is still old, and leave a pending tombstone for each deleted row
+   with its generation.
+6. Move the watermark to the last walked registration, but never past a
+   walked candidate that no row names and that the lock skipped: a
+   transaction holds it (it is naming the pack, or registering it again)
+   and may roll back, leaving an orphan the walk must see again. Return the
+   deleted rows, the rows read, and whether the walk caught up.
+
+Why every orphan is eventually found: a pack whose registration the walk
+passed was named then (or was skipped, which holds the watermark). Rows
+that name a pack are never deleted, except `shallow_packs` recordings, and
+every statement that deletes a recording touches the pack in the same
+transaction (eviction, and the byte cap's eviction in `set_shallow_pack`).
+A touch moves the registration ahead of the watermark, so the walk reads it
+again once its grace period ends. **Any new code that stops naming a pack
+must touch it in the same transaction**, as eviction does; the audit is
+the backstop (it finds an orphan the walk passed within one cycle through
+every pack, `limit` packs per transaction), and it is also what stamps
+rows with no touch. A touch whose time is already behind the watermark
+(a server clock more than `grace` behind the sweeper's) is also left to the
+audit.
+
+Why only one process sweeps at a time: the compactor's pass first takes
+the lease (`MetaStore::acquire_lease`: insert it, take it over once
+expired, or extend it as its holder) and does nothing while another owner
+holds it. Each sweep transaction extends it in step 1, so the holder keeps
+it while it works, and a holder that dies loses it `ttl` after its last
+transaction. A holder that stalls past its expiry and resumes is refused in
+step 1 once anyone took the lease (the epoch differs), and until then
+nobody else holds it. The lease limits cost, not safety: the argument below
+holds for any number of concurrent sweeps.
 
 Registration, in one write transaction: lock the existing row with the
 checksum (`FOR KEY SHARE` on Postgres) and return it, touched; or insert a
@@ -294,9 +342,11 @@ uploads after the deletion ran, and blobs whose deletion fails stay until
 a later pass succeeds. Nothing lists the bucket to find blobs no row or
 tombstone names (follow-up issue).
 
-A sweep reads every `packs` row's references (four index probes per pack)
-until it finds `limit` candidates, so its cost grows with the number of
-packs, not the number of orphans.
+A sweep transaction reads at most `2 × limit` rows (the walk and the
+audit), whatever the number of packs, and probes four indexes only for its
+candidates (`crates/aspen-meta/tests/sweep_cost.rs` checks the bound and
+both scans' plans; at a million packs a caught-up batch takes milliseconds
+where the earlier candidate query read every pack).
 
 ### `shallow_packs`
 

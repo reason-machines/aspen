@@ -35,8 +35,9 @@
 //!    503 with `Retry-After` when the instance does and its queue is full
 //!    or the wait runs out. The slot is held until the request is done,
 //!    before its body is read; the request's body holds it too.
-//! 5. **Route to the repository**: look it up in the metadata store. A
-//!    missing repository is 404, the same answer as step 3 gives a
+//! 5. **Route to the repository**: look it up in the metadata store, or in
+//!    the instance's short-lived copy of it ([`Access::repo`], [`cache`]).
+//!    A missing repository is 404, the same answer as step 3 gives a
 //!    signed-in caller with no grant.
 //! 6. **Push quota** (`POST git-receive-pack` only): a declared length over
 //!    the per-push cap is 413, a spent byte budget 429, both before the body
@@ -60,6 +61,7 @@
 //! [`Authorized`]). Mount routes that are not Git, such as health checks or
 //! the presigned blob route, on a router this middleware does not wrap.
 
+pub mod cache;
 mod client_addr;
 pub mod route;
 pub mod tokens;
@@ -77,10 +79,10 @@ use aspen_auth::{
     TokenStore,
 };
 use aspen_core::auth::{Credential, Principal};
-use aspen_core::error::{AuthError, ToWire};
+use aspen_core::error::{AuthError, StoreError, ToWire};
 use aspen_core::id::UnixMicros;
 use aspen_core::meta::MetaStore;
-use aspen_core::name::RefName;
+use aspen_core::name::{RefName, RepoName};
 use aspen_core::repo::Repo;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -90,9 +92,11 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body::Frame;
 
+pub use cache::AccessCaches;
 pub use client_addr::{ClientAddr, ClientAddrError, Fallback, Forwarded, TrustedProxies};
 
 use crate::admission::{Admission, Busy, InstanceLimits, RETRY_AFTER, Slot, Work};
+use cache::TtlCache;
 pub use route::{Endpoint, GitRoute, RouteError};
 
 /// Everything [`guard`] and the SSH transport need: the auth service (with
@@ -104,6 +108,8 @@ pub struct Access<M, T, K = NoSshKeys> {
     meta: M,
     client_addr: ClientAddr,
     admission: Arc<Admission>,
+    /// Repository rows by name, kept for [`AccessCaches::repo_ttl`].
+    repos: TtlCache<RepoName, Repo>,
 }
 
 impl<M, T, K> fmt::Debug for Access<M, T, K> {
@@ -118,8 +124,9 @@ impl<M, T, K> fmt::Debug for Access<M, T, K> {
 
 impl<M: MetaStore + 'static, T: TokenStore + 'static, K: SshKeyStore + 'static> Access<M, T, K> {
     /// Access control over these parts, with the default
-    /// [`InstanceLimits`] and the per-caller caps of `limits`
-    /// ([`Limits::concurrent`]).
+    /// [`InstanceLimits`], the per-caller caps of `limits`
+    /// ([`Limits::concurrent`]) and repository rows cached for
+    /// [`cache::DEFAULT_REPO_TTL`].
     pub fn new(auth: AuthService<T, K>, limits: Limits, meta: M, client_addr: ClientAddr) -> Self {
         let admission = Arc::new(Admission::new(
             limits.concurrent(),
@@ -131,7 +138,30 @@ impl<M: MetaStore + 'static, T: TokenStore + 'static, K: SshKeyStore + 'static> 
             meta,
             client_addr,
             admission,
+            repos: TtlCache::new(cache::DEFAULT_REPO_TTL, cache::CAPACITY),
         }
+    }
+
+    /// Keeps repository rows for `ttl` instead of the default; zero reads
+    /// the repository on every request ([`cache`]).
+    pub fn with_repo_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.repos = TtlCache::new(ttl, cache::CAPACITY);
+        self
+    }
+
+    /// The repository named `name`, from this instance's copy when it is
+    /// younger than the repository TTL, else from the metadata store (and
+    /// then kept). A missing repository is never remembered.
+    pub async fn repo(&self, name: &RepoName) -> Result<Option<Repo>, StoreError> {
+        if let Some(repo) = self.repos.get(name) {
+            return Ok(Some(repo));
+        }
+        let ticket = self.repos.ticket();
+        let repo = self.meta.repo(name).await?;
+        if let Some(repo) = &repo {
+            self.repos.insert(name.clone(), repo.clone(), ticket);
+        }
+        Ok(repo)
     }
 
     /// Bounds the work this instance runs at once with `instance` instead
@@ -160,6 +190,19 @@ impl<M: MetaStore + 'static, T: TokenStore + 'static, K: SshKeyStore + 'static> 
     /// The metadata store.
     pub fn meta(&self) -> &M {
         &self.meta
+    }
+
+    /// Drops this instance's copy of repository `name`: call it after
+    /// changing or deleting the repository through this process, so its
+    /// next request reads the change. Other instances see it within the
+    /// repository TTL.
+    pub fn forget_repo(&self, name: &RepoName) {
+        self.repos.remove(name);
+    }
+
+    /// Drops every cached repository row.
+    pub fn forget_repos(&self) {
+        self.repos.clear();
     }
 
     /// Steps 3 to 6 of the module docs for an identified caller: authorize
@@ -199,7 +242,7 @@ impl<M: MetaStore + 'static, T: TokenStore + 'static, K: SshKeyStore + 'static> 
             .enter(work, key)
             .await
             .map_err(Refusal::Busy)?;
-        let repo = match self.meta.repo(&route.repo).await {
+        let repo = match self.repo(&route.repo).await {
             Ok(Some(repo)) => repo,
             Ok(None) => return Err(Refusal::Auth(AuthError::NotFound)),
             // Core's wording for every storage failure a client sees; the
@@ -596,7 +639,7 @@ fn refused(refusal: Refusal) -> Response {
         Refusal::Busy(busy) => {
             let status = match busy {
                 Busy::Caller { .. } => StatusCode::TOO_MANY_REQUESTS,
-                Busy::Instance { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                Busy::Instance { .. } | Busy::Memory { .. } => StatusCode::SERVICE_UNAVAILABLE,
             };
             let mut r = text(status, &busy.to_string());
             r.headers_mut().insert(

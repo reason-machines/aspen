@@ -179,7 +179,9 @@ async fn an_atomic_replay_goes_with_its_batch() {
 }
 
 /// Sets the repository's force policy, as an operator changing it between
-/// two pushes would.
+/// two pushes would, and drops the server's cached copy of the repository
+/// so the next push reads it (elsewhere that takes up to the repository
+/// TTL; `access.rs` tests that).
 async fn set_force_policy(s: &Server, policy: &str) {
     sqlx::query("UPDATE repos SET allow_force = $1 WHERE id = $2")
         .bind(policy)
@@ -187,6 +189,7 @@ async fn set_force_policy(s: &Server, policy: &str) {
         .execute(s.meta.pool())
         .await
         .unwrap();
+    s.access.forget_repo(&s.repo.name);
 }
 
 /// A resent command is `ok` only if its own rules accept the move it

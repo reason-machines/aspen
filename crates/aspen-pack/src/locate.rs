@@ -7,13 +7,30 @@
 //!   search) in probe order and stops at the first hit (S3, "Base-object
 //!   lookup"). `.idx` files are immutable, so they are cached in memory up to
 //!   a byte budget; a warm lookup reads no object storage.
+//! - **Cold start** (monorepo benchmark, item 8): concurrent misses on one
+//!   pack share one load (single flight), so 128 pushes that start together
+//!   read each `.idx` once, not 128 times. Whether a pack's `.idx` is kept
+//!   whole or sampled depends on the search set, not only on its own size:
+//!   in probe order, an `.idx` is kept whole only while the set's whole
+//!   `.idx` files still fit [`LocateOptions::idx_cache_bytes`], and the rest
+//!   are sampled. A repository whose indexes outgrow the cache then keeps
+//!   all of them (part whole, part sampled) instead of evicting and
+//!   reloading them on every push.
 //! - **Prefetch** locates every candidate base, then reads its entry and its
-//!   delta chain from the blob store in rounds: all entries known in a round
-//!   are read in parallel (bounded), each read reveals the next base, and a
-//!   chain of depth d costs d + 1 rounds, never one round trip per base
-//!   (S4: p99 chains of 3 to 7 entries). Chains are then resolved locally
-//!   and the full objects handed to completion as
-//!   [`aspen_core::ingest::InMemoryBases`].
+//!   delta chain from the blob store. A pack whose `.idx` is kept whole is
+//!   kept with its **chain map**, each entry's base from the pack's entry
+//!   table, so every entry of every chain is known before anything is read
+//!   and they are all read in one round of parallel range reads: a chain of
+//!   depth 50 (what `git gc` and compaction write) costs one round trip,
+//!   not 51 (monorepo benchmark, item 11). In a sampled pack
+//!   (`crate::sampled`) chains are still found by reading: each round's
+//!   reads reveal the next bases, so a chain of depth d costs d + 1 rounds
+//!   there. Chains are then resolved locally and the full objects handed to
+//!   completion as [`aspen_core::ingest::InMemoryBases`].
+//! - **Lookups** in sampled packs read a window's IDs and offsets together
+//!   (one round trip), and probe every sampled search pack at once, so a
+//!   lookup costs one round trip however many large packs the repository
+//!   has; probe order still decides which pack answers.
 //! - **Memory** of a prefetch is bounded by
 //!   [`LocateOptions::max_prefetch_bytes`]: every inflated entry, every
 //!   intermediate chain result and every output object is charged before it
@@ -34,7 +51,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use aspen_core::blob::{BlobKey, BlobStore, ByteRange};
 use aspen_core::error::StoreError;
@@ -47,6 +64,7 @@ use aspen_core::meta::MetaStore;
 use aspen_core::pack::{PACK_HEADER_LEN, PACK_TRAILER_LEN, PackRecord};
 
 use crate::MaxObjectBytes;
+use crate::chains::{ChainsBuilder, ChainsError, DiskChains};
 use crate::header::{self, RawBase};
 use crate::idx::IdxV2;
 use crate::sampled::{SampleBuilder, SampledIdx};
@@ -83,7 +101,10 @@ impl<M: MetaStore> PackRows for M {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocateOptions {
     /// Bytes of `.idx` kept in memory (about 6% of the packs they index,
-    /// S4). Least recently loaded entries are evicted first.
+    /// S4), plus 8 bytes per object of a whole one's sorted offsets. Least
+    /// recently used entries are evicted first. A lookup whose search packs'
+    /// whole `.idx` files do not fit keeps the ones probed first whole and
+    /// samples the rest, so one repository never evicts its own indexes.
     pub idx_cache_bytes: u64,
     /// Largest `.idx` kept whole (default 64 MiB, a pack of about 2.4
     /// million objects). A larger one is kept as a sample, one ID of every
@@ -103,7 +124,12 @@ pub struct LocateOptions {
     /// from a stored pack costs a blob-store read per delta in its chain.
     /// 0 turns the cache off.
     pub object_cache_bytes: u64,
-    /// Most blob reads in flight at once during a prefetch round.
+    /// Most blob reads in flight at once: entries in a prefetch round, and
+    /// lookups in sampled `.idx` files (each a few kilobytes). A round with
+    /// more waits for a second wave, a whole round trip: a push reads every
+    /// chain of its bases in one round, up to about 10 bases at the depth
+    /// cap of 50 or 20 at compaction's tree cap of 10, and probes each
+    /// sampled pack for each ID it looks up (item 11).
     pub max_parallel_reads: usize,
     /// Largest inflated object or delta a prefetch accepts; use ingest's
     /// limit. Stored entries were validated at ingest; this bounds memory
@@ -117,22 +143,29 @@ pub struct LocateOptions {
 
 impl LocateOptions {
     /// Defaults for everything but the object limit, which must come from
-    /// the server's configuration: a 256 MiB `.idx` cache (an `.idx` over
-    /// 64 MiB is sampled), a 64 MiB base
-    /// object cache, 64 reads in
-    /// flight, and a prefetch budget of four times the object limit (at
-    /// least 1 GiB).
+    /// the server's configuration: a 1 GiB `.idx` cache (an `.idx` over
+    /// 64 MiB is sampled), a 64 MiB base object cache, 256 reads in flight,
+    /// and a prefetch budget of four times the object limit (at least
+    /// 1 GiB).
+    ///
+    /// 1 GiB holds every index of a repository of about 30 million objects
+    /// whole (the monorepo benchmark's 11.6 million take 400 MiB); a larger
+    /// one is part sampled, never reloaded. It is an upper bound, not a
+    /// reservation: a server with small repositories uses what they need.
     pub fn new(max_object_bytes: MaxObjectBytes) -> Self {
         Self {
-            idx_cache_bytes: 256 << 20,
+            idx_cache_bytes: DEFAULT_IDX_CACHE_BYTES,
             max_whole_idx_bytes: 64 << 20,
             object_cache_bytes: 64 << 20,
-            max_parallel_reads: 64,
+            max_parallel_reads: 256,
             max_object_bytes,
             max_prefetch_bytes: max_object_bytes.get().saturating_mul(4).max(1 << 30),
         }
     }
 }
+
+/// [`LocateOptions::idx_cache_bytes`] by default: 1 GiB.
+pub const DEFAULT_IDX_CACHE_BYTES: u64 = 1 << 30;
 
 /// The largest object the base-object cache keeps
 /// ([`LocateOptions::object_cache_bytes`]).
@@ -209,12 +242,41 @@ struct LoadedIdx {
     bytes: Vec<u8>,
     /// Entry offsets in pack order, to find where an entry ends.
     sorted_offsets: Vec<u64>,
+    /// The chain map: per entry in pack order, the position (in
+    /// `sorted_offsets`) of its delta base, or [`NO_BASE`] for a full
+    /// object. From the pack's entry table.
+    bases: Vec<u32>,
 }
 
+/// A full object in [`LoadedIdx::bases`].
+const NO_BASE: u32 = u32::MAX;
+
 impl LoadedIdx {
-    /// Bytes this entry holds in the cache: the `.idx` plus the offsets.
+    /// Bytes this entry holds in the cache: the `.idx`, the offsets and the
+    /// chain map.
     fn cost(&self) -> u64 {
-        (self.bytes.len() + self.sorted_offsets.len() * std::mem::size_of::<u64>()) as u64
+        (self.bytes.len()
+            + self.sorted_offsets.len() * std::mem::size_of::<u64>()
+            + self.bases.len() * std::mem::size_of::<u32>()) as u64
+    }
+
+    /// The entry at `offset` and every entry below it on its delta chain,
+    /// from the chain map, appended to `out`. Stops early (the prefetch's
+    /// rounds find the rest) at an offset that is not an entry or a base
+    /// that is not earlier, which a stored pack never has.
+    fn chain(&self, pack: usize, offset: u64, out: &mut Vec<At>) {
+        let Ok(mut i) = self.sorted_offsets.binary_search(&offset) else {
+            out.push((pack, offset));
+            return;
+        };
+        loop {
+            out.push((pack, self.sorted_offsets[i]));
+            match self.bases[i] {
+                NO_BASE => return,
+                b if (b as usize) < i => i = b as usize,
+                _ => return,
+            }
+        }
     }
 
     fn idx(&self) -> IdxV2<'_> {
@@ -236,28 +298,45 @@ impl LoadedIdx {
     }
 }
 
+/// What a pack's `.idx` costs in the cache kept whole: the file plus its
+/// sorted offsets and chain map ([`LoadedIdx::cost`]).
+fn whole_cost(row: &PackRecord) -> u64 {
+    // Offsets (8 bytes) and the chain map (4 bytes) per object.
+    row.pack
+        .idx_size
+        .saturating_add(u64::from(row.pack.object_count) * 12)
+}
+
+/// About what a pack's `.idx` costs in the cache kept as a sample
+/// ([`SampledIdx::cost`]).
+fn sampled_cost(row: &PackRecord) -> u64 {
+    let samples = u64::from(row.pack.object_count).div_ceil(crate::sampled::SAMPLE_EVERY);
+    samples * 20 + 256 * 4 + 64
+}
+
 /// A search pack's `.idx` as the locator holds it.
 #[derive(Debug, Clone)]
 enum Idx {
     /// The whole file.
     Whole(Arc<LoadedIdx>),
     /// A sample of a file over [`LocateOptions::max_whole_idx_bytes`]
-    /// (`crate::sampled`).
-    Sampled(Arc<SampledIdx>),
+    /// (`crate::sampled`), with its chain map on local disk
+    /// (`crate::chains`) when the locator has a directory for one.
+    Sampled(Arc<SampledIdx>, Option<Arc<DiskChains>>),
 }
 
 impl Idx {
     fn record(&self) -> &PackRecord {
         match self {
             Self::Whole(l) => &l.record,
-            Self::Sampled(s) => &s.record,
+            Self::Sampled(s, _) => &s.record,
         }
     }
 
     fn cost(&self) -> u64 {
         match self {
             Self::Whole(l) => l.cost(),
-            Self::Sampled(s) => s.cost(),
+            Self::Sampled(s, c) => s.cost() + c.as_ref().map_or(0, |c| c.cost()),
         }
     }
 }
@@ -273,11 +352,17 @@ pub struct LocateStats {
     /// Bytes of `.idx` read from the blob store: whole loads, samples, and
     /// the IDs and offsets lookups in samples read.
     pub idx_bytes_read: u64,
+    /// Bytes of entry tables read from the blob store for the chain maps of
+    /// whole `.idx` files.
+    pub table_bytes_read: u64,
     /// Object IDs looked up (each once per call, however many packs it was
     /// probed in).
     pub ids_looked_up: u64,
     /// Pack entries read from the blob store by prefetches.
     pub entries_read: u64,
+    /// Misses that waited for another call's load of the same `.idx`
+    /// instead of reading it again.
+    pub idx_load_waits: u64,
 }
 
 #[derive(Debug, Default)]
@@ -285,8 +370,10 @@ struct Counters {
     whole_idx_loads: AtomicU64,
     sampled_idx_loads: AtomicU64,
     idx_bytes_read: AtomicU64,
+    table_bytes_read: AtomicU64,
     ids_looked_up: AtomicU64,
     entries_read: AtomicU64,
+    idx_load_waits: AtomicU64,
 }
 
 /// A least-recently-used cache bounded in bytes: the `.idx` cache and the
@@ -346,12 +433,18 @@ pub struct StoredPacks<M, B> {
     blobs: B,
     options: LocateOptions,
     cache: Mutex<Cache<PackId, Idx>>,
+    /// `.idx` loads in progress, so concurrent misses on a pack share one.
+    /// Lock order: `flights`, then `cache`.
+    flights: Mutex<HashMap<PackId, Arc<Flight>>>,
     objects: Mutex<Cache<ObjectId, CachedObject>>,
     /// Prefetched objects answered by the base-object cache, and read from
     /// the blob store.
     object_hits: std::sync::atomic::AtomicU64,
     object_misses: std::sync::atomic::AtomicU64,
     counters: Counters,
+    /// Where sampled packs' chain maps are kept (`crate::chains`); `None`
+    /// keeps none.
+    chain_dir: Option<std::path::PathBuf>,
 }
 
 /// A resolved base object in the base-object cache.
@@ -365,11 +458,22 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             blobs,
             options,
             cache: Mutex::new(Cache::new(options.idx_cache_bytes)),
+            flights: Mutex::default(),
             objects: Mutex::new(Cache::new(options.object_cache_bytes)),
             object_hits: Default::default(),
             object_misses: Default::default(),
             counters: Counters::default(),
+            chain_dir: None,
         }
+    }
+
+    /// Keeps the chain maps of sampled packs in files in `dir`, a real
+    /// local disk (`crate::chains`): about 16 bytes per object of every
+    /// sampled pack in the `.idx` cache. Without it a chain in a sampled
+    /// pack costs a round trip per level.
+    pub fn with_chain_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.chain_dir = Some(dir.into());
+        self
     }
 
     /// What this locator has read and looked up so far.
@@ -379,12 +483,18 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             whole_idx_loads: c.whole_idx_loads.load(Relaxed),
             sampled_idx_loads: c.sampled_idx_loads.load(Relaxed),
             idx_bytes_read: c.idx_bytes_read.load(Relaxed),
+            table_bytes_read: c.table_bytes_read.load(Relaxed),
             ids_looked_up: c.ids_looked_up.load(Relaxed),
             entries_read: c.entries_read.load(Relaxed),
+            idx_load_waits: c.idx_load_waits.load(Relaxed),
         }
     }
 
     /// The `.idx` of each pack, from the cache or the blob store.
+    ///
+    /// Misses are loaded in parallel, each through [`Self::load_shared`],
+    /// so a pack another call is already loading is waited for, not read
+    /// again. Each miss is kept whole or sampled by [`Self::plan_misses`].
     async fn load(&self, packs: &[PackId]) -> Result<Vec<Idx>, StoreError> {
         let mut out: Vec<Option<Idx>> = {
             let mut cache = self.cache.lock().expect("not poisoned");
@@ -403,37 +513,162 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
                     what: "the metadata store returned pack rows out of order".into(),
                 });
             }
+            let cached: u64 = out.iter().flatten().map(Idx::cost).sum();
+            let whole = self.plan_misses(&rows, cached);
             let loads = join_bounded(
-                rows.into_iter().map(|r| self.load_one(r)),
+                rows.into_iter()
+                    .zip(whole)
+                    .map(|(r, whole)| self.load_shared(r, whole)),
                 self.options.max_parallel_reads,
             )
             .await;
-            let mut loaded = Vec::with_capacity(loads.len());
-            for l in loads {
-                loaded.push(l?);
-            }
-            let mut cache = self.cache.lock().expect("not poisoned");
-            let mut fresh = loaded.into_iter();
+            let mut fresh = loads.into_iter();
             for slot in out.iter_mut().filter(|o| o.is_none()) {
-                let l = fresh.next().expect("one load per miss");
-                cache.insert(l.record().id, l.clone(), l.cost());
-                *slot = Some(l);
+                *slot = Some(fresh.next().expect("one load per miss")?);
             }
         }
         Ok(out.into_iter().map(|o| o.expect("filled")).collect())
     }
 
-    /// Reads one pack's `.idx`: whole, or as a sample when it is over
-    /// [`LocateOptions::max_whole_idx_bytes`].
-    async fn load_one(&self, row: PackRecord) -> Result<Idx, StoreError> {
-        if row.pack.idx_size > self.options.max_whole_idx_bytes {
-            return Ok(Idx::Sampled(Arc::new(self.load_sampled(row).await?)));
+    /// Whether each missed pack (in probe order) is kept whole: while the
+    /// search set's whole `.idx` files, after the `cached` bytes it already
+    /// holds, fit [`LocateOptions::idx_cache_bytes`], and only an `.idx` of
+    /// at most [`LocateOptions::max_whole_idx_bytes`]. The rest are sampled.
+    ///
+    /// Without this, a set over the budget was loaded whole, evicted itself
+    /// as it was inserted, and was read whole again by the next push: the
+    /// monorepo benchmark's 400 MiB of indexes against a 256 MiB cache read
+    /// every `.idx` on every push.
+    fn plan_misses(&self, rows: &[PackRecord], cached: u64) -> Vec<bool> {
+        let mut left = self.options.idx_cache_bytes.saturating_sub(cached);
+        rows.iter()
+            .map(|r| {
+                let cost = whole_cost(r);
+                let whole = r.pack.idx_size <= self.options.max_whole_idx_bytes && cost <= left;
+                left = left.saturating_sub(if whole { cost } else { sampled_cost(r) });
+                whole
+            })
+            .collect()
+    }
+
+    /// One pack's `.idx`, loaded once however many calls miss it at the
+    /// same time: the first becomes the leader and loads it (and caches
+    /// it), the others wait for its result. A leader that is dropped
+    /// before it finishes (its request ended) hands the load to a waiter.
+    async fn load_shared(&self, row: PackRecord, whole: bool) -> Result<Idx, StoreError> {
+        loop {
+            let (flight, leader) = {
+                let mut flights = self.flights.lock().expect("not poisoned");
+                // Under the flights lock: a leader caches its result before
+                // it leaves the map, so a pack is always in one or the other.
+                if let Some(hit) = self.cache.lock().expect("not poisoned").get(&row.id) {
+                    return Ok(hit);
+                }
+                match flights.get(&row.id) {
+                    Some(f) => (Arc::clone(f), false),
+                    None => {
+                        let f = Arc::new(Flight::default());
+                        flights.insert(row.id, Arc::clone(&f));
+                        (f, true)
+                    }
+                }
+            };
+            if !leader {
+                self.counters.idx_load_waits.fetch_add(1, Relaxed);
+                match (WaitFlight { flight: &flight }).await {
+                    Some(result) => return result,
+                    // The leader was dropped: try again, maybe as leader.
+                    None => continue,
+                }
+            }
+            let mut lead = Lead {
+                flights: &self.flights,
+                id: row.id,
+                flight,
+                finished: false,
+            };
+            let result = self.load_one(row, whole).await;
+            if let Ok(idx) = &result {
+                let mut cache = self.cache.lock().expect("not poisoned");
+                cache.insert(idx.record().id, idx.clone(), idx.cost());
+            }
+            lead.finish(result.clone());
+            return result;
+        }
+    }
+
+    /// Reads one pack's `.idx`: whole with its chain map (the `.idx` and
+    /// the entry table read at once), or as a sample with its chain map on
+    /// disk when the locator has a directory for one.
+    async fn load_one(&self, row: PackRecord, whole: bool) -> Result<Idx, StoreError> {
+        if !whole {
+            let chains = async {
+                match &self.chain_dir {
+                    Some(dir) => self.load_chains(&row, dir).await,
+                    None => Ok(None),
+                }
+            };
+            let (chains, sampled) = futures_join(chains, self.load_sampled(row.clone())).await;
+            return Ok(Idx::Sampled(Arc::new(sampled?), chains?.map(Arc::new)));
         }
         let range = ByteRange::new(0, row.pack.idx_size)
             .ok_or_else(|| corrupt(&row, "empty .idx".into()))?;
-        let bytes = self.read_idx(&row.keys().idx, range).await?;
+        // The entry table streams in sections, so a large one is never
+        // held whole: its first section is read with the `.idx`, the rest
+        // two at a time once the `.idx` is checked.
+        let count = u64::from(row.pack.object_count);
+        let sections: Vec<(u64, u64)> = (0..count)
+            .step_by(SAMPLE_READ_ENTRIES as usize)
+            .map(|from| ChainsBuilder::records_range(from, (from + SAMPLE_READ_ENTRIES).min(count)))
+            .collect();
+        let keys = row.keys();
+        let read_table = |(from, to): (u64, u64)| {
+            let key = &keys.entries;
+            async move {
+                let range = ByteRange::new(from, to).expect("non-empty");
+                let bytes = self.blobs.read_exact_range(key, range).await?;
+                self.counters
+                    .table_bytes_read
+                    .fetch_add(bytes.len() as u64, Relaxed);
+                Ok::<_, StoreError>(bytes)
+            }
+        };
+        let header_and_first = (
+            0,
+            sections
+                .first()
+                .map_or(ChainsBuilder::header_range().1, |s| s.1),
+        );
+        let (bytes, first) = futures_join(
+            self.read_idx(&keys.idx, range),
+            read_table(header_and_first),
+        )
+        .await;
+        let (bytes, first) = (bytes?, first?);
         self.counters.whole_idx_loads.fetch_add(1, Relaxed);
-        Ok(Idx::Whole(Arc::new(validate_idx(row, bytes)?)))
+        let mut loaded = validate_idx(row, bytes)?;
+        let header_len = aspen_core::pack::ENTRY_TABLE_HEADER_LEN;
+        if first.len() < header_len {
+            return Err(corrupt(&loaded.record, "entry table: short".into()));
+        }
+        check_table_header(&loaded, &first[..header_len])?;
+        let mut bases = Vec::with_capacity(loaded.sorted_offsets.len());
+        feed_chain_map(&loaded, &first[header_len..], &mut bases)?;
+        drop(first);
+        for group in sections.get(1..).unwrap_or_default().chunks(2) {
+            let reads = join_bounded(group.iter().map(|&r| read_table(r)), 2).await;
+            for bytes in reads {
+                feed_chain_map(&loaded, &bytes?, &mut bases)?;
+            }
+        }
+        if bases.len() != loaded.sorted_offsets.len() {
+            return Err(corrupt(
+                &loaded.record,
+                "entry table: too few records".into(),
+            ));
+        }
+        loaded.bases = bases;
+        Ok(Idx::Whole(Arc::new(loaded)))
     }
 
     /// Streams a large `.idx` through [`SampleBuilder`], which checks all
@@ -456,6 +691,55 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
         Ok(sampled)
     }
 
+    /// A sampled pack's chain map, built in a file in `dir` from its entry
+    /// table, streamed in sections. `None` (the prefetch then finds chains
+    /// by reading) if the local file cannot be written; an entry table that
+    /// does not describe the pack is corruption.
+    async fn load_chains(
+        &self,
+        row: &PackRecord,
+        dir: &std::path::Path,
+    ) -> Result<Option<DiskChains>, StoreError> {
+        let key = row.keys().entries;
+        let key = &key;
+        let read = |(from, to): (u64, u64)| {
+            let range = ByteRange::new(from, to).expect("non-empty");
+            async move {
+                let bytes = self.blobs.read_exact_range(key, range).await?;
+                self.counters
+                    .table_bytes_read
+                    .fetch_add(bytes.len() as u64, Relaxed);
+                Ok::<_, StoreError>(bytes)
+            }
+        };
+        let fail = |e: ChainsError| match e {
+            ChainsError::Corrupt(what) => Err(corrupt(row, what)),
+            ChainsError::Io(_) => Ok(None),
+        };
+        let header = read(ChainsBuilder::header_range()).await?;
+        let mut builder = match ChainsBuilder::new(dir, row, &header) {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        };
+        let count = builder.count();
+        let sections: Vec<(u64, u64)> = (0..count)
+            .step_by(SAMPLE_READ_ENTRIES as usize)
+            .map(|from| ChainsBuilder::records_range(from, (from + SAMPLE_READ_ENTRIES).min(count)))
+            .collect();
+        for group in sections.chunks(8) {
+            let reads = join_bounded(group.iter().map(|&r| read(r)), 8).await;
+            for bytes in reads {
+                if let Err(e) = builder.feed(&bytes?) {
+                    return fail(e);
+                }
+            }
+        }
+        match builder.finish() {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => fail(e),
+        }
+    }
+
     /// One range of an `.idx`, counted.
     async fn read_idx(&self, key: &BlobKey, range: ByteRange) -> Result<Vec<u8>, StoreError> {
         let bytes = self.blobs.read_exact_range(key, range).await?;
@@ -467,6 +751,13 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
 
     /// Where each of `ids` is, in the first of `packs` (probe order) that
     /// holds it: the index into `packs` and the entry's offset.
+    ///
+    /// Whole `.idx` files answer from memory. Every sampled pack that comes
+    /// before an ID's first whole-pack hit is probed for it at once, so the
+    /// lookup costs one round trip however many sampled packs there are
+    /// (one probing them in turn cost a round trip per pack, on every
+    /// lookup of a push: monorepo benchmark, item 11); the earliest hit in
+    /// probe order wins, as before. A sampled pack after a hit is not read.
     async fn find_all(
         &self,
         packs: &[Idx],
@@ -477,54 +768,66 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             .fetch_add(ids.len() as u64, Relaxed);
         let mut out: Vec<Option<At>> = vec![None; ids.len()];
         for (p, pack) in packs.iter().enumerate() {
-            match pack {
-                Idx::Whole(l) => {
-                    let idx = l.idx();
-                    for (o, id) in out.iter_mut().zip(ids) {
-                        if o.is_none()
-                            && let Some(i) = idx.lookup(id)
-                        {
-                            *o = Some((p, idx.offset(i)));
-                        }
+            if let Idx::Whole(l) = pack {
+                let idx = l.idx();
+                for (o, id) in out.iter_mut().zip(ids) {
+                    if o.is_none()
+                        && let Some(i) = idx.lookup(id)
+                    {
+                        *o = Some((p, idx.offset(i)));
                     }
                 }
-                Idx::Sampled(s) => {
-                    let todo: Vec<usize> = (0..ids.len())
-                        .filter(|&i| out[i].is_none() && s.window(&ids[i]).is_some())
-                        .collect();
-                    let found = join_bounded(
-                        todo.iter().map(|&i| self.sampled_lookup(s, &ids[i])),
-                        self.options.max_parallel_reads,
-                    )
-                    .await;
-                    for (&i, f) in todo.iter().zip(found) {
-                        if let Some(offset) = f? {
-                            out[i] = Some((p, offset));
-                        }
+            }
+        }
+        let mut todo: Vec<(usize, usize, &SampledIdx)> = Vec::new();
+        for (p, pack) in packs.iter().enumerate() {
+            if let Idx::Sampled(s, _) = pack {
+                for (i, id) in ids.iter().enumerate() {
+                    if out[i].is_none_or(|(q, _)| q > p) && s.window(id).is_some() {
+                        todo.push((p, i, s));
                     }
                 }
+            }
+        }
+        let found = join_bounded(
+            todo.iter()
+                .map(|&(_, i, s)| self.sampled_lookup(s, &ids[i])),
+            self.options.max_parallel_reads,
+        )
+        .await;
+        for (&(p, i, _), f) in todo.iter().zip(found) {
+            if let Some(offset) = f?
+                && out[i].is_none_or(|(q, _)| q > p)
+            {
+                out[i] = Some((p, offset));
             }
         }
         Ok(out)
     }
 
-    /// The offset of `id` in a sampled pack: one read of the IDs that can
-    /// hold it, one of its offset (two for a large offset).
+    /// The offset of `id` in a sampled pack: one round trip, reading the
+    /// IDs that can hold it and their offsets together (a second for a
+    /// large offset).
     async fn sampled_lookup(
         &self,
         s: &SampledIdx,
         id: &ObjectId,
     ) -> Result<Option<u64>, StoreError> {
-        let Some((from, _, range)) = s.window(id) else {
+        let Some((from, to, range)) = s.window(id) else {
             return Ok(None);
         };
         let key = s.record.keys().idx;
-        let ids = self.read_idx(&key, range).await?;
+        let (ids, offsets) = futures_join(
+            self.read_idx(&key, range),
+            self.read_idx(&key, s.offsets_range(from, to)),
+        )
+        .await;
+        let (ids, offsets) = (ids?, offsets?);
         let Some(i) = SampledIdx::find(from, &ids, id) else {
             return Ok(None);
         };
-        let raw = self.read_idx(&key, s.offset_range(i)).await?;
-        Ok(Some(match s.small_offset(&raw) {
+        let at = 4 * (i - from) as usize;
+        Ok(Some(match s.small_offset(&offsets[at..at + 4]) {
             Ok(offset) => offset,
             Err(large) => SampledIdx::large_offset(&self.read_idx(&key, large).await?),
         }))
@@ -541,7 +844,9 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
         self.counters.entries_read.fetch_add(1, Relaxed);
         let pack = match pack {
             Idx::Whole(l) => l,
-            Idx::Sampled(s) => return self.read_entry_open_ended(&s.record, offset, budget).await,
+            Idx::Sampled(s, _) => {
+                return self.read_entry_open_ended(&s.record, offset, budget).await;
+            }
         };
         let range = pack.entry_range(offset)?;
         let key = pack.record.keys().pack;
@@ -607,6 +912,98 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
                     .into());
                 }
             }
+        }
+    }
+}
+
+/// One `.idx` load in progress ([`StoredPacks::load_shared`]).
+#[derive(Debug, Default)]
+struct Flight {
+    state: Mutex<FlightState>,
+}
+
+#[derive(Debug)]
+enum FlightState {
+    /// The leader is loading; these waiters are woken when it ends.
+    Running(Vec<Waker>),
+    /// The leader's result.
+    Done(Result<Idx, StoreError>),
+    /// The leader was dropped before it finished.
+    Abandoned,
+}
+
+impl Default for FlightState {
+    fn default() -> Self {
+        Self::Running(Vec::new())
+    }
+}
+
+impl Flight {
+    /// Ends the flight and wakes every waiter.
+    fn end(&self, to: FlightState) {
+        let state = std::mem::replace(&mut *self.state.lock().expect("not poisoned"), to);
+        if let FlightState::Running(wakers) = state {
+            wakers.into_iter().for_each(Waker::wake);
+        }
+    }
+}
+
+/// The leader's hold on a [`Flight`]: removes it from the map when the load
+/// ends, and marks it abandoned if the leader is dropped first, so waiters
+/// never wait for a load nobody is running.
+struct Lead<'a> {
+    flights: &'a Mutex<HashMap<PackId, Arc<Flight>>>,
+    id: PackId,
+    flight: Arc<Flight>,
+    finished: bool,
+}
+
+impl Lead<'_> {
+    fn finish(&mut self, result: Result<Idx, StoreError>) {
+        self.finished = true;
+        self.leave();
+        self.flight.end(FlightState::Done(result));
+    }
+
+    fn leave(&self) {
+        let mut flights = self.flights.lock().expect("not poisoned");
+        if flights
+            .get(&self.id)
+            .is_some_and(|f| Arc::ptr_eq(f, &self.flight))
+        {
+            flights.remove(&self.id);
+        }
+    }
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.leave();
+            self.flight.end(FlightState::Abandoned);
+        }
+    }
+}
+
+/// Waits for a [`Flight`]: its result, or `None` if it was abandoned.
+struct WaitFlight<'a> {
+    flight: &'a Flight,
+}
+
+impl Future for WaitFlight<'_> {
+    type Output = Option<Result<Idx, StoreError>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.flight.state.lock().expect("not poisoned");
+        match &mut *state {
+            FlightState::Running(wakers) => {
+                if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    wakers.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            FlightState::Done(result) => Poll::Ready(Some(result.clone())),
+            FlightState::Abandoned => Poll::Ready(None),
         }
     }
 }
@@ -711,7 +1108,112 @@ fn validate_idx(record: PackRecord, bytes: Vec<u8>) -> Result<LoadedIdx, StoreEr
         record,
         bytes,
         sorted_offsets,
+        bases: Vec::new(),
     })
+}
+
+/// The chain map of a validated `.idx` from its pack's whole entry table
+/// ([`check_table_header`], then [`feed_chain_map`]).
+fn chain_map(l: &LoadedIdx, table: &[u8]) -> Result<Vec<u32>, StoreError> {
+    use aspen_core::pack::{ENTRY_RECORD_LEN, ENTRY_TABLE_HEADER_LEN};
+    let n = l.sorted_offsets.len();
+    if table.len() != ENTRY_TABLE_HEADER_LEN + ENTRY_RECORD_LEN * n {
+        return Err(corrupt(&l.record, "entry table: wrong length".into()));
+    }
+    check_table_header(l, &table[..ENTRY_TABLE_HEADER_LEN])?;
+    let mut bases = Vec::with_capacity(n);
+    feed_chain_map(l, &table[ENTRY_TABLE_HEADER_LEN..], &mut bases)?;
+    Ok(bases)
+}
+
+/// Checks that an entry table's header (`aspen_core::pack::EntryTable`'s
+/// encoding) describes the pack of a validated `.idx`.
+fn check_table_header(l: &LoadedIdx, header: &[u8]) -> Result<(), StoreError> {
+    use aspen_core::pack::{ENTRY_TABLE_HEADER_LEN, ENTRY_TABLE_MAGIC, ENTRY_TABLE_VERSION};
+    let record = &l.record;
+    let n = l.sorted_offsets.len();
+    if n >= NO_BASE as usize
+        || header.len() != ENTRY_TABLE_HEADER_LEN
+        || header[..8] != ENTRY_TABLE_MAGIC
+        || header[8..12] != ENTRY_TABLE_VERSION.to_be_bytes()
+        || header[12..16] != (n as u32).to_be_bytes()
+        || header[16..24] != record.pack.size.to_be_bytes()
+        || header[24..44] != *record.pack.checksum.as_bytes()
+    {
+        return Err(corrupt(
+            record,
+            "entry table: does not describe this pack".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Appends to `bases` the chain map of the entry table's next records, read
+/// without building the table: each must be the `.idx`'s next entry in
+/// pack order, and every delta's base one of its entries. Any mismatch is
+/// [`StoreError::Corrupt`].
+fn feed_chain_map(l: &LoadedIdx, records: &[u8], bases: &mut Vec<u32>) -> Result<(), StoreError> {
+    use aspen_core::pack::ENTRY_RECORD_LEN;
+    let record = &l.record;
+    let bad = |what: &str| corrupt(record, format!("entry table: {what}"));
+    if !records.len().is_multiple_of(ENTRY_RECORD_LEN) {
+        return Err(bad("a read ends inside a record"));
+    }
+    let idx = l.idx();
+    let position = |offset: u64| {
+        l.sorted_offsets
+            .binary_search(&offset)
+            .map(|i| i as u32)
+            .map_err(|_| bad(&format!("a base at {offset} is not an entry")))
+    };
+    for rec in records.as_chunks::<ENTRY_RECORD_LEN>().0 {
+        let Some(&offset) = l.sorted_offsets.get(bases.len()) else {
+            return Err(bad("more records than entries"));
+        };
+        if rec[..8] != offset.to_be_bytes() {
+            return Err(bad("lists other entries than the .idx"));
+        }
+        bases.push(match rec[8] {
+            1..=4 => NO_BASE,
+            6 => position(u64::from_be_bytes(rec[32..40].try_into().expect("8 bytes")))?,
+            7 => {
+                let base = ObjectId::from_slice(&rec[32..52]).expect("20 bytes");
+                let i = idx
+                    .lookup(&base)
+                    .ok_or_else(|| bad(&format!("a REF_DELTA base {base} is not in the pack")))?;
+                position(idx.offset(i))?
+            }
+            t => return Err(bad(&format!("unknown entry type {t}"))),
+        });
+    }
+    Ok(())
+}
+
+/// Runs two futures concurrently (no runtime needed) and returns both
+/// outputs.
+async fn futures_join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    let (mut ra, mut rb) = (None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
+        }
+        if rb.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(cx)
+        {
+            rb = Some(v);
+        }
+        if ra.is_some() && rb.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (ra.expect("ready"), rb.expect("ready"))
 }
 
 /// Decodes one entry read from the blob store: header, then the inflated
@@ -834,6 +1336,40 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             .insert(id, Arc::new((kind, data)), len);
     }
 
+    /// Puts a pack this process has just stored into the `.idx` cache, from
+    /// the `.idx` and entry table it uploaded, as a later load would read
+    /// them: the next push to the same ref searches this pack, and loading
+    /// it cost every push a round trip (item 11). Returns whether it was
+    /// kept: a pack whose `.idx` is over
+    /// [`LocateOptions::max_whole_idx_bytes`] is not (it would be sampled),
+    /// nor one whose files do not validate against its row.
+    pub fn remember_pack(&self, record: PackRecord, idx: Vec<u8>, table: &[u8]) -> bool {
+        if record.pack.idx_size > self.options.max_whole_idx_bytes {
+            return false;
+        }
+        let Ok(mut loaded) = validate_idx(record, idx) else {
+            return false;
+        };
+        let Ok(bases) = chain_map(&loaded, table) else {
+            return false;
+        };
+        loaded.bases = bases;
+        let id = loaded.record.id;
+        let entry = Idx::Whole(Arc::new(loaded));
+        let cost = entry.cost();
+        self.cache
+            .lock()
+            .expect("not poisoned")
+            .insert(id, entry, cost);
+        true
+    }
+
+    /// Whether [`Self::remember_pack`] keeps a pack with an `.idx` of
+    /// `idx_size` bytes, so a caller can skip reading its files.
+    pub fn keeps_whole(&self, idx_size: u64) -> bool {
+        idx_size <= self.options.max_whole_idx_bytes
+    }
+
     /// [`BasePrefetcher::prefetch`] with its typed error and memory
     /// figures. The trait method reports [`PrefetchError::OverBudget`] as
     /// [`StoreError::Unavailable`]; a caller that can refuse the push with
@@ -892,8 +1428,17 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             }
         }
         // Read entries in rounds; each round's reads reveal the next bases.
+        // A whole pack's chain map gives every entry of a chain up front,
+        // so its chains are read in the first round, whatever their depth.
         let mut reads: HashMap<At, Read> = HashMap::new();
-        let mut frontier: Vec<At> = wanted.iter().map(|w| w.1).collect();
+        let mut frontier: Vec<At> = Vec::with_capacity(wanted.len());
+        for &(_, (p, off)) in &wanted {
+            match &loaded[p] {
+                Idx::Whole(l) => l.chain(p, off, &mut frontier),
+                Idx::Sampled(_, Some(c)) => c.chain(p, off, &mut frontier),
+                Idx::Sampled(_, None) => frontier.push((p, off)),
+            }
+        }
         frontier.sort_unstable();
         frontier.dedup();
         while !frontier.is_empty() {
@@ -950,7 +1495,7 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             }
             let bases = join_bounded(
                 by_id.iter().map(|((p, _), id, _)| match &loaded[*p] {
-                    Idx::Sampled(s) => self.sampled_lookup(s, id),
+                    Idx::Sampled(s, _) => self.sampled_lookup(s, id),
                     Idx::Whole(_) => unreachable!("whole packs answer at once"),
                 }),
                 self.options.max_parallel_reads,

@@ -28,7 +28,7 @@ use aspen_core::repo::RepoSettings;
 use aspen_meta::SqlStore;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
 use aspen_server::access::Access;
-use aspen_server::access::tokens::SqlTokens;
+use aspen_server::access::tokens::{CachedTokens, SqlTokens};
 use aspen_server::mirror::SqlMirrors;
 use aspen_server::ssh::keys::SqlSshKeys;
 use aspen_server::ssh::{PrivateKey, SshConfig, SshServer};
@@ -78,6 +78,7 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let label = startup.label;
     let role = config.role;
+    let caches = config.access_caches();
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -132,6 +133,7 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     let mut server_config = ServerConfig::new(max_object);
     server_config.packfile_uris = packfile_uris;
     server_config.metrics_on_git_listener = config.metrics_on_git_listener;
+    config.tune_server(&mut server_config);
     if config.shallow_packs {
         // Exact cached shallow packs (C8): builds download a closure and
         // write the new pack here, on the spool's real disk.
@@ -150,26 +152,49 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     let mut compact = CompactConfig::new(compact_dir, max_object, max_inflated);
     compact.layout = receive.cover_layout;
     compact.shallow_unused = config.shallow_unused;
+    config.apply_gc(&mut compact);
+    // The garbage-collection lease's holder name: one per process.
+    compact.gc_owner = worker_id(label)?;
     compact
         .validate()
         .map_err(|e| format!("compaction settings: {e}"))?;
+    // Garbage collection runs on a pool of its own on PostgreSQL, with its
+    // own statement timeout, so its statements never wait in or take from
+    // the queue pushes use (throughput item 7). SQLite has one writer at a
+    // time whatever the pool, so it shares the store. Only a process whose
+    // role runs the background worker (`compact_task` below) collects.
+    let collects = config.background_worker && role.runs_jobs();
+    let gc_meta = match (collects, meta.dialect()) {
+        (true, aspen_meta::Dialect::Postgres) => {
+            SqlStore::connect_with(&config.database_url, &config.gc_store)
+                .await
+                .map_err(|e| format!("connecting garbage collection's pool: {e}"))?
+        }
+        _ => meta.clone(),
+    };
+    let gc_metrics = Arc::new(aspen_compact::GcMetrics::default());
     // Several workers, each with its own lease name, run jobs at once; one
-    // of them also runs the garbage-collection sweeps.
+    // of them also runs the garbage-collection passes, which take the
+    // garbage-collection lease, so one process at a time collects.
     let mut compactors = Vec::with_capacity(config.compact_workers);
     for i in 0..config.compact_workers {
         let mut options = config.worker_options(worker_id(label)?);
         options.collect_garbage = i == 0;
-        compactors.push(Worker::new(
-            Compactor::new(meta.clone(), blobs.clone(), compact.clone()),
-            options,
-        ));
+        let mut compactor = Compactor::new(meta.clone(), blobs.clone(), compact.clone());
+        if options.collect_garbage {
+            compactor = compactor
+                .with_gc_store(gc_meta.clone())
+                .with_gc_metrics(Arc::clone(&gc_metrics));
+        }
+        compactors.push(Worker::new(compactor, options));
     }
 
     let mut server = Server::new(meta.clone(), blobs.clone(), server_config)
         .with_receive_pack(receive)
         .map_err(|e| format!("spool directory {}: {e}", config.spool_dir.display()))?
         // Job, queue-lag and wider-trunk gauges, read at most every 30 s (C5).
-        .with_store_gauges(STORE_GAUGES_REFRESH);
+        .with_store_gauges(STORE_GAUGES_REFRESH)
+        .with_gc_metrics(gc_metrics);
     if let AnyBlobStore::Local(local) = &blobs
         && local.url_signer().is_some()
     {
@@ -205,8 +230,11 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
 
     // One access decision for HTTP and SSH, so a subject's requests over
     // both draw on the same rate-limit buckets (C3 obligation).
-    let auth = AuthService::new(config.policy, SqlTokens(meta.clone()))?
-        .with_ssh_keys(SqlSshKeys(meta.clone()));
+    // Repository and token rows are kept for a few seconds, so a caller's
+    // requests do not each read them (`ASPEN_REPO_CACHE_TTL_MS`,
+    // `ASPEN_TOKEN_CACHE_TTL_MS`; decisions log, "throughput 6a").
+    let tokens = CachedTokens::new(SqlTokens(meta.clone()), caches.token_ttl);
+    let auth = AuthService::new(config.policy, tokens)?.with_ssh_keys(SqlSshKeys(meta.clone()));
     let access = Arc::new(
         Access::new(
             auth,
@@ -214,7 +242,8 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
             meta.clone(),
             config.client_addr,
         )
-        .with_instance_limits(config.instance),
+        .with_instance_limits(config.instance)
+        .with_repo_cache_ttl(caches.repo_ttl),
     );
 
     // Bind every listener before announcing any, so a port in use fails
@@ -372,6 +401,8 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
                 aspen_server::queue::QueueConfig {
                     batch: config.merge_queue_batch,
                     outcome_ttl: config.merge_queue_outcome_ttl,
+                    interval: config.merge_queue_interval,
+                    owner: worker_id(label)?,
                     ..Default::default()
                 },
             );

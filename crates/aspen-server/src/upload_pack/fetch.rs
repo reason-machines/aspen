@@ -115,6 +115,11 @@ where
 {
     let request = &args.request;
     let mode = request.plan_mode(repo.settings.shallow())?;
+    if args.wait_for_done && request.wants.is_empty() && !request.done {
+        return Ok(Round::Acks(
+            negotiation_acks(server.meta(), repo, &request.haves).await?,
+        ));
+    }
     if request.wants.is_empty() {
         return Err(Failure::refused(
             "protocol error: a fetch must have at least one want",
@@ -127,7 +132,7 @@ where
     if !request.done {
         let mut common: Vec<_> = haves.iter().map(|(id, _)| *id).collect();
         common.sort_unstable();
-        let ready = mode == PlanMode::FullClosure || !common.is_empty();
+        let ready = !args.wait_for_done && (mode == PlanMode::FullClosure || !common.is_empty());
         let acks = Acknowledgments { common, ready };
         if !ready {
             return Ok(Round::Acks(acks));
@@ -136,18 +141,28 @@ where
             .acknowledgments(&mut head, &acks)
             .expect("first section of a round without done");
     }
-    let rows = if request.is_shallow() {
+    let (rows, leave_out) = if request.is_shallow() {
         let (rows, info) = shallow_plan(server, repo, request, &wants).await?;
         response
             .shallow_info(&mut head, &info)
             .expect("shallow-info follows acknowledgments");
-        rows
+        (rows.rows, rows.leave_out)
     } else {
-        plan_rows(server, repo, mode, &wants, haves, graph, dropped).await?
+        let rows = plan_rows(server, repo, mode, &wants, haves, graph, dropped).await?;
+        (rows, Vec::new())
     };
-    let Split { uris, stitched } = deliver::split(server, request, rows).await;
+    // A pack sent as a URI goes whole, so a plan that leaves objects out
+    // is stitched.
+    let Split { uris, stitched } = if leave_out.is_empty() {
+        deliver::split(server, request, rows).await
+    } else {
+        Split {
+            uris: Vec::new(),
+            stitched: rows,
+        }
+    };
     let slot = deliver::stitch_slot(caller, &stitched).await?;
-    let plan = deliver::stitch_plan(server.blobs(), &stitched).await?;
+    let plan = deliver::stitch_plan(server.blobs(), &stitched, &leave_out).await?;
     response
         .packfile_uris(&mut head, &uris)
         .expect("URIs are only made in schemes the client listed");
@@ -164,6 +179,50 @@ where
         },
         stitched,
         slot,
+    })
+}
+
+/// The answer to a negotiation-only round (`wait-for-done`, haves and no
+/// wants): `ACK` for every have with a `commit_index` row, whatever version
+/// the row names, and never `ready`.
+///
+/// This is what `git push` runs first when `push.negotiate` is set: it
+/// leaves every acknowledged commit, and everything that commit reaches,
+/// out of the pack it sends. Without it a push through the plain repository
+/// URL, which advertises only trunk (S2), resends the pushed branch's whole
+/// history since trunk every time.
+///
+/// An acknowledged commit need not be in the dependencies the push will
+/// search: the client does not say which ref it will push, so a commit of
+/// another branch (a branch created from it, a merge of it into trunk) can
+/// be acknowledged. Receive-pack finds such a pack's boundary commits
+/// through the same `commit_index` rows and copies what the write needs
+/// from their versions (`crate::receive`, "boundary outside the
+/// dependencies"). A row is never removed, and every version a row names
+/// stays connected and stored, so an acknowledged commit can always be
+/// found again at push time. A commit with no row yet (a non-tip commit of
+/// a push the indexing job has not reached) is not acknowledged; Git then
+/// sends its parents as haves in the next round, at worst resending it.
+pub(crate) async fn negotiation_acks<M: MetaStore>(
+    meta: &M,
+    repo: &Repo,
+    haves: &[ObjectId],
+) -> Result<Acknowledgments, Failure> {
+    let sorted = aspen_core::ingest::SortedIds::from_unsorted(haves.to_vec());
+    let rows = meta
+        .lookup_commits(repo.id, &sorted)
+        .await
+        .map_err(aspen_core::error::FetchError::Store)?;
+    let common = sorted
+        .as_slice()
+        .iter()
+        .zip(rows)
+        .filter(|(_, row)| matches!(row, aspen_core::meta::CommitLookup::Indexed(_)))
+        .map(|(id, _)| *id)
+        .collect();
+    Ok(Acknowledgments {
+        common,
+        ready: false,
     })
 }
 
@@ -289,39 +348,51 @@ where
     Ok((rows, stats, graph.version_count(), heat))
 }
 
+/// The packs of a shallow answer, and objects every copy of which is left
+/// out of the stitched pack (a layered answer's earlier commits; empty
+/// otherwise).
+#[derive(Debug, Default)]
+pub(crate) struct ShallowRows {
+    pub(crate) rows: Vec<PackRecord>,
+    pub(crate) leave_out: Vec<ObjectId>,
+}
+
 /// The packs and the `shallow-info` of a shallow request (fetch path step
-/// 5): the exact cached shallow packs when the request can use them
-/// (`super::exact`, node C8), otherwise the full closure of the wants
-/// (the over-fetch fallback, S5). `shallow-info` is computed the same way
-/// in both cases.
+/// 5): the exact cached shallow packs (or a layered answer) when the
+/// request can use them (`super::exact`, node C8), otherwise the full
+/// closure of the wants (the over-fetch fallback, S5). `shallow-info` is
+/// computed the same way in every case.
 pub(crate) async fn shallow_plan<M, B>(
     server: &Server<M, B>,
     repo: &Repo,
     request: &FetchRequest,
     wants: &[resolve::Want],
-) -> Result<(Vec<PackRecord>, ShallowInfo), Failure>
+) -> Result<(ShallowRows, ShallowInfo), Failure>
 where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
 {
     let rows = match exact::packs(server, repo, request, wants).await? {
         Some(rows) => rows,
-        None => {
-            let (haves, graph, dropped) =
-                resolve_haves(server.meta(), repo, PlanMode::FullClosure, &[]).await?;
-            plan_rows(
-                server,
-                repo,
-                PlanMode::FullClosure,
-                wants,
-                haves,
-                graph,
-                dropped,
-            )
-            .await?
-        }
+        None => ShallowRows {
+            leave_out: Vec::new(),
+            rows: {
+                let (haves, graph, dropped) =
+                    resolve_haves(server.meta(), repo, PlanMode::FullClosure, &[]).await?;
+                plan_rows(
+                    server,
+                    repo,
+                    PlanMode::FullClosure,
+                    wants,
+                    haves,
+                    graph,
+                    dropped,
+                )
+                .await?
+            },
+        },
     };
-    let info = shallow_info(server, repo, request, wants, &rows).await?;
+    let info = shallow_info(server, repo, request, wants, &rows.rows).await?;
     Ok((rows, info))
 }
 

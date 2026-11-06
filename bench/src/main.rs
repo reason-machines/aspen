@@ -87,6 +87,9 @@ enum Command {
         /// --strict`); any mismatch fails the run (exit status 3).
         #[arg(long)]
         verify_landed: bool,
+        /// Enqueue with `git push -o land` of a branch.
+        #[arg(long)]
+        land_option: bool,
     },
     /// M jobs fetch the same new commit at once, for several rounds.
     FetchStorm {
@@ -333,6 +336,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             poll_ms,
             overlap,
             verify_landed,
+            land_option,
         } => {
             let opts = queue::QueueOpts {
                 clients,
@@ -342,6 +346,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 poll: Duration::from_millis(poll_ms),
                 overlap,
                 verify_landed,
+                land_option,
             };
             workload(&common, |setup, params| queue::run(setup, &opts, params))
         }

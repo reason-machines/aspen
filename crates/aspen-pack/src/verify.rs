@@ -51,6 +51,9 @@ pub struct VerifiedPack {
     pub idx: Vec<u8>,
     /// Longest delta chain (0 when no entry is a delta).
     pub max_delta_depth: u32,
+    /// Longest delta chain of an object that is not a blob (a tree, commit
+    /// or tag): compaction bounds these lower (item 11).
+    pub max_tree_delta_depth: u32,
 }
 
 /// Verifies the pack at `pack`, using `scratch` (an existing directory) for
@@ -121,11 +124,12 @@ pub fn verify_pack(
         })?;
         let table = entries::build(File::open(pack).map_err(LayoutError::Io)?, size, &idx)?;
         table.check_layout().map_err(LayoutError::Table)?;
-        let max_delta_depth = max_delta_depth(&table);
+        let depths = delta_depths(&table);
         Ok(VerifiedPack {
             table,
             idx: idx_bytes,
-            max_delta_depth,
+            max_delta_depth: depths.all,
+            max_tree_delta_depth: depths.tree,
         })
     })();
     let _ = fs::remove_dir_all(&dir);
@@ -135,23 +139,48 @@ pub fn verify_pack(
 /// The longest delta chain of a base-first pack: 0 for a full object, one
 /// more than its base for a delta. Linear, because every base comes first.
 pub fn max_delta_depth(table: &EntryTable) -> u32 {
+    delta_depths(table).all
+}
+
+/// The longest delta chains of a base-first pack, of every object and of
+/// the objects that are not blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeltaDepths {
+    /// Of every object.
+    pub all: u32,
+    /// Of trees, commits and tags: a delta is the kind of its chain's full
+    /// object.
+    pub tree: u32,
+}
+
+/// [`DeltaDepths`] of a base-first pack. Linear, because every base comes
+/// first; a base the table lacks counts as a full object of unknown kind
+/// (a blob).
+pub fn delta_depths(table: &EntryTable) -> DeltaDepths {
     let entries = table.entries();
-    let mut depth_by_offset: HashMap<u64, u32> = HashMap::with_capacity(entries.len());
-    let mut depth_by_id: HashMap<ObjectId, u32> = HashMap::with_capacity(entries.len());
-    let mut max = 0;
+    // (depth, is a blob) by offset and by ID.
+    let mut by_offset: HashMap<u64, (u32, bool)> = HashMap::with_capacity(entries.len());
+    let mut by_id: HashMap<ObjectId, (u32, bool)> = HashMap::with_capacity(entries.len());
+    let mut out = DeltaDepths::default();
     for e in entries {
-        let d = match e.kind {
-            EntryKind::OfsDelta { base_offset } => {
-                depth_by_offset.get(&base_offset).map_or(0, |d| d + 1)
+        let (d, blob) = match e.kind {
+            EntryKind::OfsDelta { base_offset } => by_offset
+                .get(&base_offset)
+                .map_or((0, true), |&(d, b)| (d + 1, b)),
+            EntryKind::RefDelta { base } => {
+                by_id.get(&base).map_or((0, true), |&(d, b)| (d + 1, b))
             }
-            EntryKind::RefDelta { base } => depth_by_id.get(&base).map_or(0, |d| d + 1),
-            _ => 0,
+            EntryKind::Blob => (0, true),
+            EntryKind::Tree | EntryKind::Commit | EntryKind::Tag => (0, false),
         };
-        depth_by_offset.insert(e.offset, d);
-        depth_by_id.insert(e.id, d);
-        max = max.max(d);
+        by_offset.insert(e.offset, (d, blob));
+        by_id.insert(e.id, (d, blob));
+        out.all = out.all.max(d);
+        if !blob {
+            out.tree = out.tree.max(d);
+        }
     }
-    max
+    out
 }
 
 fn tempdir_in(parent: &Path) -> Result<std::path::PathBuf, VerifyError> {

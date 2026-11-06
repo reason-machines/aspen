@@ -22,6 +22,8 @@ crc32fast = "1"
 # O(1) least-recently-used order for the `.idx` cache.
 hashlink = "0.11"
 thiserror.workspace = true
+# Sampled packs' chain maps live in unnamed files on the spool disk.
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

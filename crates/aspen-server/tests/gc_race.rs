@@ -27,7 +27,7 @@ use aspen_compact::{CompactConfig, Compactor, JobOutcome, Worker, WorkerOptions}
 use aspen_core::blob::{BlobKey, BlobStore, ByteRange, PresignedUrl, UploadReceipt};
 use aspen_core::error::StoreError;
 use aspen_core::id::{ObjectId, UnixMicros};
-use aspen_core::meta::{CoverLayout, JobKind, MetaStore, NewJob};
+use aspen_core::meta::{CoverLayout, GC_LEASE, JobKind, MetaStore, NewJob};
 use aspen_core::name::{RefName, RepoName};
 use aspen_core::pack::{PackGeneration, PackKeys, PackRecord};
 use aspen_core::repo::{ForcePolicy, Repo, RepoSettings};
@@ -657,23 +657,52 @@ async fn compaction_and_indexing_read_a_source_pack_by_its_generation() {
 
 /// Invariant (issue #48): a worker that dies between its sweep and its
 /// blob deletions leaves pending tombstones, and the next pass of any
-/// worker deletes those blobs and finishes them.
+/// worker deletes those blobs and finishes them. Throughput item 7: the
+/// dead worker held the garbage-collection lease, so no other process
+/// collects until that lease expires, and then the next one takes it over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crashed_workers_deletions_are_finished_by_the_next_pass() {
     let env = Env::start().await;
     let (_, pack) = commit_pack(1, None);
     let orphan = env.store_unreferenced(&pack).await;
     env.advance(GRACE_US + 1_000_000);
-    // The sweep commits, then the worker dies before deleting anything.
-    let swept = env.meta.sweep_orphan_packs(GRACE, 100).await.unwrap();
+    // Another process takes the lease and sweeps; the sweep commits, then
+    // that process dies before deleting anything.
+    let ttl = Duration::from_secs(60);
+    let lease = env
+        .meta
+        .acquire_lease(GC_LEASE, "crashed-process", ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let swept = env
+        .meta
+        .sweep_orphan_packs(&lease, GRACE, 100)
+        .await
+        .unwrap()
+        .deleted;
     assert_eq!(swept, vec![orphan.clone()]);
     assert_eq!(env.exists(&orphan.keys()), [true; 3]);
 
+    // Its lease is still live: this process's pass does nothing.
+    env.advance(59_000_000);
     let report = env
         .compactor(env.local.clone())
         .collect_garbage()
         .await
         .unwrap();
+    assert!(report.lease_held_elsewhere, "{report:?}");
+    assert_eq!(report.deletes_finished, 0, "{report:?}");
+    assert_eq!(env.exists(&orphan.keys()), [true; 3]);
+
+    // The lease expires a minute after the dead process last extended it.
+    env.advance(1_000_000);
+    let report = env
+        .compactor(env.local.clone())
+        .collect_garbage()
+        .await
+        .unwrap();
+    assert!(!report.lease_held_elsewhere, "{report:?}");
     assert!(report.packs_deleted.is_empty(), "{report:?}");
     assert_eq!(report.deletes_finished, 1, "{report:?}");
     assert_eq!(env.exists(&orphan.keys()), [false; 3]);

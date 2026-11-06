@@ -74,6 +74,7 @@ Configuration (environment variables; see site/src/configuration.md):
   ASPEN_COMPACT_WORKERS        background jobs (compaction, commit indexing) run at once [default: 8]
   ASPEN_MERGE_QUEUE            on|off: land pushes to refs/queue/<trunk>/... on trunk in batches [default: off]
   ASPEN_MERGE_QUEUE_BATCH      most queue entries one trunk update lands [default: 64]
+  ASPEN_MERGE_QUEUE_INTERVAL_MS  wait to gather a batch after its oldest entry, 0-10000 [default: 50]
   ASPEN_GROUP_COMMIT           on|off: concurrent pushes share metadata transactions [default: off]
   ASPEN_GROUP_COMMIT_WINDOW_MS how long a group commit batch waits for more pushes [default: 2]
   ASPEN_GROUP_COMMIT_MAX_BATCH most pushes one group commit transaction takes [default: 64]
@@ -83,11 +84,12 @@ Configuration (environment variables; see site/src/configuration.md):
   ASPEN_MAX_CONCURRENT_STITCHES inline packs stitched at once [default: 32]
   ASPEN_ADMISSION_QUEUE        requests of each kind waiting for a slot [default: 64]
   ASPEN_ADMISSION_QUEUE_WAIT_SECS longest wait in that queue [default: 10]
+  ASPEN_MEMORY_HIGH_WATER_BYTES resident memory over which new requests get 503, 0 = off [default: 80% of the cgroup or machine memory]
   ASPEN_PREFETCH_FLOOR_BYTES   prefetch memory each push reserves first [default: 67108864]
   ASPEN_PREFETCH_PER_PUSH_BYTES most prefetch memory one push may use [default: 4 x ASPEN_MAX_OBJECT_BYTES, >= 1 GiB]
   ASPEN_PREFETCH_WAIT_SECS     longest wait for prefetch memory [default: 60]
   ASPEN_PREFETCH_PARALLEL_READS object store reads in flight per push prefetch [default: 64]
-  ASPEN_IDX_CACHE_BYTES        pack index cache shared by pushes [default: 268435456]
+  ASPEN_IDX_CACHE_BYTES        pack index cache shared by pushes [default: 1073741824]
   ASPEN_OBJECT_CACHE_BYTES     delta-base cache shared by pushes, 0 = off [default: 67108864]
   ASPEN_IDX_WHOLE_MAX_BYTES    largest pack index kept whole; larger ones are sampled [default: 67108864]
   ASPEN_TRUNK_TREE_CACHE_BYTES trunk's newest trees kept for pushes' diffs, 0 = none [default: 67108864]
@@ -100,6 +102,11 @@ Configuration (environment variables; see site/src/configuration.md):
   ASPEN_DB_LOCK_TIMEOUT_SECS   longest wait for a row lock, 0 = none [default: 10]
   ASPEN_DB_STATEMENT_TIMEOUT_SECS longest statement on PostgreSQL, 0 = none [default: 60]
   ASPEN_COMPACT_IDLE_POLL_MS   how often an idle background worker looks for jobs [default: 5000]
+  ASPEN_GC_EVERY_SECS          seconds between garbage-collection passes [default: 300]
+  ASPEN_GC_SWEEP_BATCH         registrations one sweep transaction reads [default: 1000]
+  ASPEN_GC_LEASE_SECS          garbage-collection lease length; one process collects at a time [default: 300]
+  ASPEN_GC_DB_MAX_CONNECTIONS  garbage collection's own PostgreSQL pool [default: 1]
+  ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS  its statement timeout [default: 10]
   ASPEN_PACKFILE_URIS          auto|true|false [default: auto: on when URLs can be presigned]
   ASPEN_EXPRESS_SERVE          auto|true|false: serve /-/express [default: auto: when ASPEN_EXPRESS_URLS names this server]
   ASPEN_MIGRATE                apply schema migrations at startup [default: true]
@@ -515,6 +522,7 @@ fn dev(
         public_url: None,
         database_url: format!("sqlite://{}?mode=rwc", data_dir.join("meta.db").display()),
         store: aspen_meta::StoreOptions::default(),
+        gc_store: aspen_meta::StoreOptions::default(),
         blob_url: format!("file://{}", blobs.display()),
         blob_url_secret: None,
         policy: PolicyConfig {
@@ -543,6 +551,9 @@ fn dev(
         merge_queue_outcome_ttl: Some(std::time::Duration::from_secs(
             config::DEFAULT_MERGE_QUEUE_OUTCOME_TTL_SECS,
         )),
+        merge_queue_interval: std::time::Duration::from_millis(
+            config::DEFAULT_MERGE_QUEUE_INTERVAL_MS,
+        ),
         packfile_uris: Switch::Auto,
         express_serve: false,
         migrate: true,

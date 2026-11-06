@@ -11,7 +11,7 @@
 //! |---|---|
 //! | [`access`] | Authentication, authorization, repository routing, rate limits and push quotas, as one middleware ([`access::guard`]) in front of every Git endpoint (node B3) |
 //! | [`admission`] | How many fetches, pushes and stitches run at once, per caller and per instance (issue #118) |
-//! | [`receive`] | `git-receive-pack` (node B1): the push advertisement (trunk, the scoped ref, log-spaced `.have` tips) and the push path (ingest, one pack per ref write, the commit check, compare-and-swap) |
+//! | [`receive`] | `git-receive-pack` (node B1): the push advertisement (trunk, the scoped ref, `.have` tips) and the push path (ingest, one pack per ref write, the commit check, compare-and-swap) |
 //! | [`upload_pack`] | `git-upload-pack`: protocol v2 (`ls-refs`, `fetch` with planning, `shallow-info`, packfile URIs, the stitched pack) and v0/v1 for clients without v2 fetch |
 //! | [`blobs`] | `/-/blobs/<key>`: downloads of presigned local-store URLs, with `Range` and the empty-`206` rule |
 //! | [`express`] | Packfile URIs on express and CDN endpoints, and the in-process express service at `/-/express` (node C2) |
@@ -158,6 +158,12 @@ pub struct ServerConfig {
     /// How long the server waits for a body before
     /// [`ServerConfig::body_min_bytes_per_sec`] applies.
     pub body_rate_grace: Duration,
+    /// Most refs `ls-refs` keeps in memory across repositories
+    /// (`upload_pack::ref_snapshot`), so a listing asks the store only what
+    /// changed since the last one instead of scanning every ref; `0` lists
+    /// every ref from the store on every request. Never stale: each
+    /// request is answered from a store read that began after it arrived.
+    pub ls_refs_cache_refs: usize,
 }
 
 impl ServerConfig {
@@ -188,9 +194,14 @@ impl ServerConfig {
             body_idle_timeout: Duration::from_secs(60),
             body_min_bytes_per_sec: 1024,
             body_rate_grace: Duration::from_secs(10),
+            ls_refs_cache_refs: DEFAULT_LS_REFS_CACHE_REFS,
         }
     }
 }
+
+/// Default of [`ServerConfig::ls_refs_cache_refs`]: about 40 MB of ref
+/// names and tips at most.
+pub const DEFAULT_LS_REFS_CACHE_REFS: usize = 250_000;
 
 /// The server: shared state behind every request. Cheap to clone.
 ///
@@ -230,12 +241,19 @@ struct Inner<M, B> {
     store_gauges: Option<metrics::StoreGauges>,
     /// Mirror mode's counters, once set up ([`Server::with_mirror`]).
     mirror_metrics: Option<Arc<aspen_mirror::Metrics>>,
+    /// Garbage collection's counters ([`Server::with_gc_metrics`]).
+    gc_metrics: Option<Arc<aspen_compact::GcMetrics>>,
     /// The client-address source of the first [`Server::router`]'s
     /// access layer, whose fallback counters join `/-/metrics`.
     client_addr: std::sync::OnceLock<access::ClientAddr>,
+    /// The router's admission, for its memory-pressure metrics.
+    admission: std::sync::OnceLock<Arc<admission::Admission>>,
     shallow_cache: Option<upload_pack::exact::ShallowCache<M, B>>,
     /// Fetches' compaction heat, written to the job queue in batches.
     heat: upload_pack::heat::HeatNotes,
+    /// `ls-refs` listings held in memory; `None` when
+    /// [`ServerConfig::ls_refs_cache_refs`] is 0.
+    ref_snapshots: Option<upload_pack::ref_snapshot::RefSnapshots>,
 }
 
 impl<M, B> Server<M, B>
@@ -277,6 +295,8 @@ where
                 config.max_object_bytes,
             )
         });
+        let ref_snapshots = (config.ls_refs_cache_refs > 0)
+            .then(|| upload_pack::ref_snapshot::RefSnapshots::new(config.ls_refs_cache_refs));
         Self {
             inner: Arc::new(Inner {
                 meta,
@@ -290,11 +310,24 @@ where
                 express: None,
                 store_gauges: None,
                 mirror_metrics: None,
+                gc_metrics: None,
                 client_addr: std::sync::OnceLock::new(),
+                admission: std::sync::OnceLock::new(),
                 shallow_cache,
                 heat: upload_pack::heat::HeatNotes::default(),
+                ref_snapshots,
             }),
         }
+    }
+
+    /// Also exports the counters of this process's garbage collection
+    /// (`aspen_gc_*`; the background worker records them). Call before
+    /// [`Server::router`] and before cloning.
+    pub fn with_gc_metrics(mut self, metrics: Arc<aspen_compact::GcMetrics>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_gc_metrics is called before the server is shared")
+            .gc_metrics = Some(metrics);
+        self
     }
 
     /// Also serves downloads of `store`'s presigned URLs at `/-/blobs/`
@@ -360,6 +393,7 @@ where
         K: SshKeyStore + 'static,
     {
         let _ = self.inner.client_addr.set(access.client_addr().clone());
+        let _ = self.inner.admission.set(Arc::clone(access.admission()));
         let git = Router::new()
             .fallback(serve_git::<M, B>)
             .with_state(self.clone())
@@ -418,11 +452,17 @@ where
         if let Some(mirror) = &self.inner.mirror_metrics {
             mirror.render(&mut text);
         }
+        if let Some(gc) = &self.inner.gc_metrics {
+            gc.render(&mut text);
+        }
         self.inner
             .client_addr
             .get()
             .unwrap_or(&access::ClientAddr::Peer)
             .render_metrics(&mut text);
+        if let Some(admission) = self.inner.admission.get() {
+            admission.render_metrics(&mut text);
+        }
         text
     }
 }
@@ -473,6 +513,10 @@ impl<M, B> Server<M, B> {
 
     pub(crate) fn config(&self) -> &ServerConfig {
         &self.inner.config
+    }
+
+    pub(crate) fn ref_snapshots(&self) -> Option<&upload_pack::ref_snapshot::RefSnapshots> {
+        self.inner.ref_snapshots.as_ref()
     }
 
     pub(crate) fn objects(&self) -> &StoredPacks<M, B> {

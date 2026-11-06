@@ -279,6 +279,7 @@ fn write_and_check(
 
     let options = RepackOptions {
         max_delta_depth: config.max_delta_depth,
+        max_tree_delta_depth: config.max_tree_delta_depth,
         max_object_bytes: config.max_object_bytes,
     };
     let written = write_repack_subset(&refs, &keep, out_dir, &options)?;
@@ -306,6 +307,12 @@ fn write_and_check(
         return Err(CompactError::Verify(format!(
             "shallow pack delta depth {} is over the bound {}",
             verified.max_delta_depth, config.max_delta_depth
+        )));
+    }
+    if verified.max_tree_delta_depth > config.max_tree_delta_depth {
+        return Err(CompactError::Verify(format!(
+            "shallow pack tree delta depth {} is over the bound {}",
+            verified.max_tree_delta_depth, config.max_tree_delta_depth
         )));
     }
     let out = IdxV2::parse(&idx, Some(written.size)).map_err(|e| StoreError::Corrupt {

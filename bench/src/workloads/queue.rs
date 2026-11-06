@@ -148,6 +148,9 @@ pub struct QueueOpts {
     pub overlap: Overlap,
     /// Check every landed commit with stock git after the run.
     pub verify_landed: bool,
+    /// Enqueue with `git push -o land` of a branch instead of a push to
+    /// `refs/queue/...` (the server writes the same queue ref).
+    pub land_option: bool,
 }
 
 impl QueueOpts {
@@ -173,6 +176,7 @@ impl QueueOpts {
             .into(),
         );
         m.insert("verify_landed".to_owned(), self.verify_landed.into());
+        m.insert("land_option".to_owned(), self.land_option.into());
         m
     }
 }
@@ -430,13 +434,19 @@ fn client(
         let (tx, rx): (Sender<Outcome>, Receiver<Outcome>) = mpsc::channel();
         lock(waiting).insert(suffix.clone(), tx);
         let pushed = Instant::now();
-        let (took, res) = git::run_timed(setup.git.cmd(repo).args([
-            "push",
-            "--quiet",
-            "--no-verify",
-            &setup.remote.url,
-            &format!("{tip}:refs/queue/{suffix}"),
-        ]));
+        let mut cmd = setup.git.cmd(repo);
+        cmd.args(["push", "--quiet", "--no-verify"]);
+        match suffix.split_once('/').filter(|_| opts.land_option) {
+            // `-o land` of branch `<rest>` is queued as `refs/queue/main/<rest>`.
+            Some((_, rest)) => cmd.args([
+                "-o",
+                "land",
+                &setup.remote.url,
+                &format!("{tip}:refs/heads/{rest}"),
+            ]),
+            None => cmd.args([&setup.remote.url, &format!("{tip}:refs/queue/{suffix}")]),
+        };
+        let (took, res) = git::run_timed(&mut cmd);
         if let Err(e) = res {
             lock(waiting).remove(&suffix);
             out.failed += 1;

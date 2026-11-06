@@ -73,8 +73,10 @@ aspen key revoke SHA256:...
 ```
 
 `--allow-force` is the repository's force policy: `none`, `branches` (the
-default; never trunk) or `all`. A revoked token or key is refused on the next
-request, including on an SSH connection that is already open. Each platform
+default; never trunk) or `all`. A revoked key is refused on the next
+request, including on an SSH connection that is already open. A revoked
+token is refused on every instance within `ASPEN_TOKEN_CACHE_TTL_MS` (5
+seconds by default), the time an instance keeps a token's row in memory. Each platform
 has its own way to run these commands next to the server (`docker compose
 exec`, `kubectl exec`, ECS Exec, a Cloud Run job); the
 [deployment reference](reference/deploy.md) lists them.

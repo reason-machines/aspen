@@ -338,6 +338,14 @@ impl SampledIdx {
         ByteRange::new(at, at + 4).expect("non-empty")
     }
 
+    /// The byte range of the 4-byte offsets of positions `[from, to)`: the
+    /// offsets of a whole [`SampledIdx::window`], read beside its IDs so a
+    /// lookup takes one round trip, not two.
+    pub fn offsets_range(&self, from: u64, to: u64) -> ByteRange {
+        let at = IDS_AT + 24 * self.count;
+        ByteRange::new(at + 4 * from, at + 4 * to).expect("non-empty")
+    }
+
     /// The offset a 4-byte offset entry gives, or the byte range of the
     /// large offset it points at.
     pub fn small_offset(&self, raw: &[u8]) -> Result<u64, ByteRange> {

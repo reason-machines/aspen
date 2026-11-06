@@ -298,6 +298,7 @@ name = "aspen-meta"
 version = "0.0.0"
 dependencies = [
  "aspen-core",
+ "futures-core",
  "sqlx",
  "tempfile",
  "tokio",

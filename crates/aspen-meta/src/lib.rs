@@ -48,6 +48,13 @@
 //! - **Row locks.** Claiming a job locks its row with
 //!   `FOR UPDATE SKIP LOCKED` on Postgres, so concurrent workers pass over
 //!   each other's candidates; SQLite has one writer at a time anyway.
+//! - **Single-statement writes.** On Postgres a push's commit of one ref
+//!   (compare-and-swap, version, commit rows, jobs) and most pack
+//!   registrations are each one statement with data-modifying `WITH`
+//!   clauses, which run without `BEGIN` and `COMMIT`, and need no
+//!   savepoint inside a group-commit batch (`src/push.rs`, `src/gc.rs`).
+//!   SQLite cannot write in a `WITH` clause and runs the same writes as
+//!   several statements in a transaction.
 //! - **Constraint names in errors.** Postgres names the violated
 //!   constraint; SQLite reports a unique violation by table and columns
 //!   (`UNIQUE constraint failed: ref_versions.repo_id, ...`). The store
@@ -96,7 +103,8 @@
 //!   [`aspen_core::meta::MetaStore::register_pack`] stamps each pack's
 //!   registration with it and
 //!   [`aspen_core::meta::MetaStore::sweep_orphan_packs`] measures the grace
-//!   period against it.
+//!   period against it, and [`aspen_core::meta::MetaStore::acquire_lease`]
+//!   a lease's expiry.
 //!   [`aspen_core::meta::MetaStore::set_shallow_pack`] stamps each
 //!   recording with it and
 //!   [`aspen_core::meta::MetaStore::evict_shallow_packs`] measures a
@@ -115,12 +123,15 @@
 use sqlx::migrate::Migrator;
 
 mod admission;
+mod conn;
 mod covers;
 mod error;
 mod gc;
 mod jobs;
+mod lease;
 mod mirrors;
 mod push;
+mod ref_changes;
 mod rows;
 mod shallow;
 mod sql;
@@ -130,6 +141,7 @@ mod store;
 mod tokens;
 mod tx;
 
+pub use gc::{SWEEP_AUDIT_SQL, SWEEP_WALK_SQL};
 pub use mirrors::{ConflictRow, MirrorRefRow, MirrorRefState, MirrorRow};
 pub use ssh_keys::SshKeyRow;
 pub use stats::{JobCount, OpenJobState, TrunkClosures};

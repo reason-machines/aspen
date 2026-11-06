@@ -27,7 +27,7 @@ where
     row.try_get(col).map_err(store_error)
 }
 
-fn bad(table: &str, col: &str, detail: impl std::fmt::Display) -> StoreError {
+pub(crate) fn bad(table: &str, col: &str, detail: impl std::fmt::Display) -> StoreError {
     corrupt(format!("{table}.{col}: {detail}"))
 }
 
@@ -51,12 +51,12 @@ fn opt_row_id<T>(
     raw.map(wrap).transpose().map_err(|e| bad(table, col, e))
 }
 
-fn object_id(row: &AnyRow, table: &str, col: &str) -> Result<ObjectId, StoreError> {
+pub(crate) fn object_id(row: &AnyRow, table: &str, col: &str) -> Result<ObjectId, StoreError> {
     let raw: Vec<u8> = get(row, col)?;
     ObjectId::from_slice(&raw).map_err(|e| bad(table, col, e))
 }
 
-fn ref_name(row: &AnyRow, table: &str, col: &str) -> Result<RefName, StoreError> {
+pub(crate) fn ref_name(row: &AnyRow, table: &str, col: &str) -> Result<RefName, StoreError> {
     let raw: String = get(row, col)?;
     RefName::new(raw).map_err(|e| bad(table, col, e))
 }

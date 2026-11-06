@@ -6,7 +6,7 @@
 //! ([`crate::receive::ReceivePack::push`]), so it is checked, completed,
 //! stored and committed exactly like a `git push`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 
 use aspen_core::id::ObjectId;
@@ -209,6 +209,89 @@ pub(crate) fn write_note_commit(
     out.into_bytes()
 }
 
+/// Every object of a whole pack file (`bytes`, trailer included), each
+/// resolved to its full content. Deltas must be based on objects of the
+/// same pack, as every stored pack's are (stored packs are
+/// self-contained). The merge queue reads a queued change's whole pack in
+/// one read this way, instead of one read per object it needs.
+pub(crate) fn parse_pack(
+    bytes: &[u8],
+    max_object: u64,
+) -> Result<HashMap<ObjectId, (ObjectKind, Vec<u8>)>, String> {
+    use aspen_pack::header::{RawBase, decode};
+    if bytes.len() < 12 + 20 || &bytes[..4] != b"PACK" {
+        return Err("not a pack".into());
+    }
+    let count = u32::from_be_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
+    let end = bytes.len() - 20;
+    let mut at = 12usize;
+    // Resolved objects by offset, for OFS_DELTA bases; ids for REF_DELTA.
+    let mut by_offset: HashMap<u64, (ObjectKind, ObjectId)> = HashMap::with_capacity(count);
+    let mut out: HashMap<ObjectId, (ObjectKind, Vec<u8>)> = HashMap::with_capacity(count);
+    for _ in 0..count {
+        if at >= end {
+            return Err("the pack ends before its last entry".into());
+        }
+        let h = decode(&bytes[at..end]).map_err(|e| e.to_string())?;
+        if h.size > max_object {
+            return Err(format!("an entry of {} bytes is over the limit", h.size));
+        }
+        let data_at = at + usize::from(h.len);
+        let mut z = flate2::Decompress::new(true);
+        let mut data = Vec::with_capacity(h.size as usize);
+        z.decompress_vec(
+            &bytes[data_at..end],
+            &mut data,
+            flate2::FlushDecompress::Finish,
+        )
+        .map_err(|e| format!("inflating the entry at {at}: {e}"))?;
+        if data.len() as u64 != h.size {
+            return Err(format!("the entry at {at} inflates to the wrong size"));
+        }
+        let (kind, data) = match h.base {
+            RawBase::None => (kind_of(h.type_code)?, data),
+            RawBase::Distance(d) => {
+                let base_at = (at as u64)
+                    .checked_sub(d)
+                    .ok_or_else(|| format!("OFS_DELTA at {at} points before the pack"))?;
+                let (kind, id) = by_offset
+                    .get(&base_at)
+                    .copied()
+                    .ok_or_else(|| format!("OFS_DELTA at {at}: no entry at {base_at}"))?;
+                let base = &out[&id].1;
+                (
+                    kind,
+                    aspen_pack::locate::apply_delta(base, &data, max_object)?,
+                )
+            }
+            RawBase::Id(base) => {
+                let (kind, b) = out.get(&base).ok_or_else(|| {
+                    format!("REF_DELTA at {at}: {base} is not earlier in the pack")
+                })?;
+                (
+                    *kind,
+                    aspen_pack::locate::apply_delta(b, &data, max_object)?,
+                )
+            }
+        };
+        let id = object_id(kind, &data);
+        by_offset.insert(at as u64, (kind, id));
+        out.insert(id, (kind, data));
+        at = data_at + z.total_in() as usize;
+    }
+    Ok(out)
+}
+
+fn kind_of(type_code: u8) -> Result<ObjectKind, String> {
+    Ok(match type_code {
+        1 => ObjectKind::Commit,
+        2 => ObjectKind::Tree,
+        3 => ObjectKind::Blob,
+        4 => ObjectKind::Tag,
+        t => return Err(format!("entry type {t} is not an object")),
+    })
+}
+
 /// A pack of whole (undeltified) objects, each written once, in the order
 /// added.
 #[derive(Debug, Default)]
@@ -383,6 +466,26 @@ pub(crate) fn parse_report(body: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_built_pack_parses_back_to_its_objects() {
+        let mut pb = PackBuilder::default();
+        let blob = pb.add(ObjectKind::Blob, b"hello\n".to_vec());
+        let tree = pb.add(
+            ObjectKind::Tree,
+            write_tree(&Tree::from([(
+                b"a.txt".to_vec(),
+                Entry {
+                    mode: 0o100644,
+                    id: blob,
+                },
+            )])),
+        );
+        let objs = parse_pack(&pb.finish(), 1 << 20).unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[&blob], (ObjectKind::Blob, b"hello\n".to_vec()));
+        assert_eq!(objs[&tree].0, ObjectKind::Tree);
+    }
 
     #[test]
     fn object_ids_match_git() {
