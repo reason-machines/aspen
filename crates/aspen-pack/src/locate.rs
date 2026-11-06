@@ -384,6 +384,27 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
         }
     }
 
+    /// Caches the `.idx` of a pack this process just stored (`bytes`, the
+    /// file it uploaded), so the next read of the pack does not fetch it
+    /// back from the blob store. Every push's pack is searched by later
+    /// pushes and fetches of its ref: reading its `.idx` costs one
+    /// blob-store round trip (about 25 ms on S3), which the merge queue
+    /// paid on every batch. An `.idx` that does not validate against the
+    /// row, or one too large to cache whole, is left to be read as before.
+    pub fn remember_idx(&self, record: PackRecord, bytes: Vec<u8>) {
+        if record.pack.idx_size > self.options.max_whole_idx_bytes {
+            return;
+        }
+        if let Ok(l) = validate_idx(record, bytes) {
+            let l = Arc::new(l);
+            let cost = l.cost();
+            self.cache
+                .lock()
+                .expect("not poisoned")
+                .insert(l.record.id, Idx::Whole(l), cost);
+        }
+    }
+
     /// The `.idx` of each pack, from the cache or the blob store.
     async fn load(&self, packs: &[PackId]) -> Result<Vec<Idx>, StoreError> {
         let mut out: Vec<Option<Idx>> = {

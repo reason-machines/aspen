@@ -2341,6 +2341,11 @@ where
         a.map_err(store)?;
         b.map_err(store)?;
         c.map_err(store)?;
+        // Later pushes and fetches of this ref search the pack: keep its
+        // `.idx`, which is on local disk, instead of reading it back.
+        if let Ok(bytes) = tokio::fs::read(&paths.1).await {
+            self.svc.packs.remember_idx(record.clone(), bytes);
+        }
         let id = record.id;
         self.timings.upload += started.elapsed();
         self.planned[pid.0].stored = Some(id);

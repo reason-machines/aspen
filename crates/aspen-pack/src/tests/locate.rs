@@ -271,6 +271,40 @@ fn locate_probes_in_order_and_caches_idx_files() {
 }
 
 #[test]
+fn a_remembered_idx_is_not_read_back() {
+    // Invariant: the `.idx` a writer remembers right after storing a pack
+    // serves the next lookup without a blob read; one that does not match
+    // its row is ignored, and the lookup reads the stored file.
+    let dir = scratch();
+    let src = history(dir.path(), 3);
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let setup = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let (p, _) = push(
+        &pack_objects(&src, "HEAD\n", false),
+        &[],
+        &setup,
+        dir.path(),
+        1,
+    );
+    let id = store(&p, 1, &rows, &blobs);
+    let record = rows.0.lock().unwrap()[&id].clone();
+    let idx = std::fs::read(&p.idx_path).unwrap();
+    let none = SortedIds::from_unsorted(vec![ObjectId::from_bytes([0xee; 20])]);
+    let fresh = || StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let reads = |s: &StoredPacks<&Rows, &Blobs>| {
+        let before = blobs.reads.load(Ordering::Relaxed);
+        ready(s.locate(&SearchPacks::new([id]), &none)).unwrap();
+        blobs.reads.load(Ordering::Relaxed) - before
+    };
+    let seeded = fresh();
+    seeded.remember_idx(record.clone(), idx.clone());
+    assert_eq!(reads(&seeded), 0, "the remembered .idx answers");
+    let wrong = fresh();
+    wrong.remember_idx(record, idx[..idx.len() - 1].to_vec());
+    assert_eq!(reads(&wrong), 1, "a short .idx is not cached");
+}
+
+#[test]
 fn short_reads_and_wrong_rows_are_corruption() {
     let dir = scratch();
     let src = history(dir.path(), 4);
