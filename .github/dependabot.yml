@@ -1,0 +1,11 @@
+# The public repository is rebuilt from the development repository, which
+# keeps the GitHub Actions pins current. Dependabot opens no pull requests here
+# (open-pull-requests-limit: 0); `cargo xtask check-workflows` still requires
+# this file to name the `github-actions` ecosystem.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
