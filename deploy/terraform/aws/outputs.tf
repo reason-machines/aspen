@@ -141,6 +141,18 @@ output "database_address" {
   value       = aws_db_instance.this.address
 }
 
+output "database_size" {
+  description = "The database's size as applied: instance class, storage and its autoscaling bound in GiB, gp3 IOPS and throughput (MiB/s) as configured (null below 400 GiB, where RDS fixes them at 3,000 and 125), and whether changes apply at once."
+  value = {
+    instance_class        = aws_db_instance.this.instance_class
+    allocated_storage     = aws_db_instance.this.allocated_storage
+    max_allocated_storage = aws_db_instance.this.max_allocated_storage
+    iops                  = try(local.db_gp3_baseline.iops, null)
+    storage_throughput    = try(local.db_gp3_baseline.throughput, null)
+    apply_immediately     = aws_db_instance.this.apply_immediately
+  }
+}
+
 output "database_port" {
   description = "RDS port."
   value       = aws_db_instance.this.port

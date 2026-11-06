@@ -114,6 +114,14 @@ run "defaults_are_cheap_and_private" {
     condition     = aws_db_instance.this.instance_class == "db.t4g.micro" && aws_db_instance.this.multi_az == false
     error_message = "The default database should be the small single-AZ class."
   }
+  assert {
+    condition     = aws_db_instance.this.apply_immediately == false
+    error_message = "By default database changes wait for the maintenance window."
+  }
+  assert {
+    condition     = output.database_size.iops == null && output.database_size.storage_throughput == null
+    error_message = "Below 400 GiB RDS fixes gp3 at 3,000 IOPS and refuses a value, so the module must not send one."
+  }
 
   # The bucket is locked down and cleans up interrupted multipart uploads.
   assert {
@@ -205,6 +213,28 @@ run "defaults_are_cheap_and_private" {
   assert {
     condition     = length(aws_ecs_task_definition.aspen.ephemeral_storage) == 0
     error_message = "The default ephemeral storage (20 GiB) needs no override."
+  }
+}
+
+# Growing an existing 20 GiB database to 400 GiB failed in the live demo with
+# "Invalid iops value for engine name postgres and storage type gp3: 3000":
+# the provider re-sent the old IOPS. From 400 GiB the module names gp3's
+# baseline itself.
+run "gp3_from_400_gib_names_its_baseline_iops_and_throughput" {
+  command = plan
+
+  variables {
+    db_allocated_storage     = 400
+    db_max_allocated_storage = 1000
+  }
+
+  assert {
+    condition     = aws_db_instance.this.iops == 12000 && aws_db_instance.this.storage_throughput == 500
+    error_message = "From 400 GiB, gp3 must be sent with its 12,000 IOPS and 500 MiB/s baseline."
+  }
+  assert {
+    condition     = output.database_size.iops == 12000 && output.database_size.storage_throughput == 500
+    error_message = "database_size must report the IOPS and throughput sent."
   }
 }
 

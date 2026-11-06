@@ -29,12 +29,14 @@ variables {
   github_repository            = null
 }
 
-run "one_300_dollar_budget_watches_the_whole_account" {
+run "one_budget_watches_the_whole_account" {
   command = plan
 
+  # The owner's approval for the public share (about $650/day,
+  # docs/PLAN.md decisions log, 2026-11-06).
   assert {
-    condition     = aws_budgets_budget.account.limit_amount == "300.00" && aws_budgets_budget.account.time_unit == "MONTHLY"
-    error_message = "The account budget must be $300/month."
+    condition     = aws_budgets_budget.account.limit_amount == "20000.00" && aws_budgets_budget.account.time_unit == "MONTHLY"
+    error_message = "The account budget must be $20,000/month."
   }
   assert {
     condition     = length(aws_budgets_budget.account.cost_filter) == 0
@@ -80,14 +82,53 @@ run "the_zone_is_a_subdomain_and_images_are_immutable" {
   }
 }
 
-run "more_than_300_dollars_needs_a_code_change" {
+run "more_than_the_approved_20000_dollars_needs_a_code_change" {
   command = plan
 
   variables {
-    budget_limit_usd = 301
+    budget_limit_usd = 20001
   }
 
   expect_failures = [var.budget_limit_usd]
+}
+
+run "a_daily_budget_catches_a_runaway_day_and_only_notifies" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_budgets_budget.daily.limit_amount == "650.00" &&
+      aws_budgets_budget.daily.time_unit == "DAILY" &&
+      aws_budgets_budget.daily.budget_type == "COST" &&
+      length(aws_budgets_budget.daily.cost_filter) == 0
+    )
+    error_message = "The daily budget must be $650/day of cost over the whole account."
+  }
+  assert {
+    condition = (
+      toset([for n in aws_budgets_budget.daily.notification : "${n.threshold}% ${n.notification_type}"]) ==
+      toset(["50% ACTUAL", "80% ACTUAL", "100% ACTUAL"])
+    )
+    error_message = "Daily alerts at 50/80/100% of a day's actual spend (daily budgets have no forecast)."
+  }
+  assert {
+    condition = alltrue([
+      for n in aws_budgets_budget.daily.notification :
+      n.subscriber_email_addresses == toset(["ops@example.test"]) && length(n.subscriber_sns_topic_arns) == 1
+    ])
+    error_message = "Every daily alert must reach the emails and the SNS topic."
+  }
+}
+
+run "the_daily_budget_fits_inside_the_monthly_one" {
+  command = plan
+
+  variables {
+    budget_limit_usd       = 300
+    daily_budget_limit_usd = 650
+  }
+
+  expect_failures = [var.daily_budget_limit_usd]
 }
 
 run "a_budget_needs_a_recipient" {
@@ -127,8 +168,8 @@ run "switching_to_the_created_budget_as_existing_keeps_it" {
   }
 
   assert {
-    condition     = aws_budgets_budget.account.name == "aspen-account-monthly" && aws_budgets_budget.account.limit_amount == "300.00"
-    error_message = "The budget the stack created must still be planned, at $300, once it is named as existing."
+    condition     = aws_budgets_budget.account.name == "aspen-account-monthly" && aws_budgets_budget.account.limit_amount == "20000.00"
+    error_message = "The budget the stack created must still be planned, at its limit, once it is named as existing."
   }
 }
 

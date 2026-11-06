@@ -1,8 +1,10 @@
 # Aspen's public demo: what the dedicated AWS account holds once, shared by
 # every environment in it (staging and the public demo, ../environment):
 #
-# - the account-wide AWS Budgets alarm ($300/month) and a CloudFront budget,
-#   which go to an SNS topic and email;
+# - the account-wide AWS Budgets alarms (monthly, and a daily one that
+#   catches a runaway day within it) and a CloudFront budget, which go to an
+#   SNS topic and email. They only notify: nothing here stops or scales down
+#   anything;
 # - the Route53 hosted zone for the demo's subdomain, which the parent
 #   domain's owner delegates to with the NS records this stack outputs;
 # - ECR repositories for the aspen and aspen-place images.
@@ -143,6 +145,34 @@ resource "aws_budgets_budget" "account" {
   # budget) fails the plan instead; retiring it is a deliberate state edit.
   lifecycle {
     prevent_destroy = true
+  }
+
+  depends_on = [aws_sns_topic_policy.budget]
+}
+
+# A day's spend, so a runaway day is seen within about a day, not when the
+# month's total finally crosses a threshold. AWS Budgets evaluates a few
+# times a day on billing data that lags by up to a day, and a daily budget
+# has no forecast alerts. It notifies only: there is no budget action, so
+# nothing is ever stopped by it.
+resource "aws_budgets_budget" "daily" {
+  name         = "aspen-account-daily"
+  budget_type  = "COST"
+  limit_amount = format("%.2f", var.daily_budget_limit_usd)
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
+
+  dynamic "notification" {
+    for_each = [50, 80, 100]
+
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "ACTUAL"
+      subscriber_email_addresses = var.budget_alert_emails
+      subscriber_sns_topic_arns  = [aws_sns_topic.budget.arn]
+    }
   }
 
   depends_on = [aws_sns_topic_policy.budget]

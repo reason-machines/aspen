@@ -119,7 +119,14 @@ where
     T: TokenStore + std::fmt::Debug + 'static,
 {
     let repo = place::ensure_repo(&meta, &config.repo).await?;
-    let shared = place::shared(&repo, &config);
+    let shared = place::shared(
+        &repo,
+        &config,
+        Arc::new(hook::IndexedMain {
+            meta: meta.clone(),
+            repo: repo.id,
+        }),
+    );
     let mut receive = ReceiveConfig::new(
         &settings.spool_dir,
         settings.max_object_bytes,

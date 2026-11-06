@@ -259,6 +259,35 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
     condition     = one(one(aws_lb_listener_rule.place[0].condition).host_header).values == toset(["place.example.test"])
     error_message = "Only place_hostname may reach the place task."
   }
+
+  # Sized for the public share, about 500 pushes/s (main.tf, sizing): one
+  # place task at Fargate's largest size, still exactly one of it.
+  assert {
+    condition     = aws_ecs_task_definition.place[0].cpu == "16384" && aws_ecs_task_definition.place[0].memory == "65536"
+    error_message = "The demo's place task must have 16 vCPU and 64 GiB."
+  }
+  assert {
+    condition     = aws_ecs_service.place[0].desired_count == 1 && aws_ecs_service.place[0].deployment_maximum_percent == 100
+    error_message = "A bigger place task is still exactly one task."
+  }
+  assert {
+    condition = contains(
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment,
+      { name = "PLACE_DB_MAX_CONNECTIONS", value = "64" }
+    )
+    error_message = "The demo's place pool must have 64 connections."
+  }
+  assert {
+    condition = (
+      module.aspen.database_size.instance_class == "db.m7g.2xlarge" &&
+      module.aspen.database_size.allocated_storage == 400 &&
+      module.aspen.database_size.max_allocated_storage == 1000 &&
+      module.aspen.database_size.iops == 12000 &&
+      module.aspen.database_size.storage_throughput == 500 &&
+      module.aspen.database_size.apply_immediately
+    )
+    error_message = "The demo's database must be db.m7g.2xlarge with 400 GiB of gp3 (12,000 IOPS, 500 MiB/s, named so the resize from 20 GiB is accepted), resized at once."
+  }
 }
 
 run "the_live_canvas_cdn_serves_only_the_image_cached_per_2_seconds" {
@@ -341,6 +370,61 @@ run "place_runs_as_exactly_one_instance" {
     condition     = jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].stopTimeout == 120
     error_message = "SIGTERM must leave time for the drain and the last merge."
   }
+
+  # Staging keeps the small sizes.
+  assert {
+    condition     = aws_ecs_task_definition.place[0].cpu == "512" && aws_ecs_task_definition.place[0].memory == "1024"
+    error_message = "Staging's place task stays at 0.5 vCPU and 1 GiB."
+  }
+  assert {
+    condition = contains(
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment,
+      { name = "PLACE_DB_MAX_CONNECTIONS", value = "10" }
+    )
+    error_message = "Staging's place pool stays at 10 connections."
+  }
+  assert {
+    condition = (
+      module.aspen.database_size.instance_class == "db.t4g.micro" &&
+      module.aspen.database_size.allocated_storage == 20 &&
+      module.aspen.database_size.iops == null &&
+      module.aspen.database_size.storage_throughput == null
+    )
+    error_message = "Staging's database stays db.t4g.micro with 20 GiB, leaving IOPS and throughput to RDS (it refuses them below 400 GiB)."
+  }
+}
+
+run "a_size_variable_overrides_its_environment_row" {
+  command = plan
+
+  variables {
+    environment              = "demo"
+    place_cpu                = 8192
+    place_memory             = 32768
+    place_db_max_connections = 32
+    db_instance_class        = "db.m7g.4xlarge"
+  }
+
+  assert {
+    condition = (
+      aws_ecs_task_definition.place[0].cpu == "8192" &&
+      aws_ecs_task_definition.place[0].memory == "32768" &&
+      local.place_environment.PLACE_DB_MAX_CONNECTIONS == "32" &&
+      module.aspen.database_size.instance_class == "db.m7g.4xlarge" &&
+      module.aspen.database_size.allocated_storage == 400
+    )
+    error_message = "A size variable set to anything but null must win over the environment's row, and only its own."
+  }
+}
+
+run "a_pool_of_zero_connections_is_refused" {
+  command = plan
+
+  variables {
+    place_db_max_connections = 0
+  }
+
+  expect_failures = [var.place_db_max_connections]
 }
 
 run "place_task_gets_its_own_database_and_bucket_and_no_password_in_plain_text" {

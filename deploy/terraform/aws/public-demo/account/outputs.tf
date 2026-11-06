@@ -33,6 +33,11 @@ output "account_budget_name" {
   value       = aws_budgets_budget.account.name
 }
 
+output "daily_budget_name" {
+  description = "The account's daily budget (notify only)."
+  value       = aws_budgets_budget.daily.name
+}
+
 output "image_publisher_role_arn" {
   description = "Role the image workflow assumes through GitHub OIDC, or null without github_repository."
   value       = var.github_repository == null ? null : aws_iam_role.image_publisher[0].arn

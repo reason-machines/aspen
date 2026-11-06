@@ -8,7 +8,11 @@
 //! 2. takes the commits `git rev-list <new> ^<trunk tip> ^<stored tip>`
 //!    lists, where both excluded tips are the ones the server read
 //!    ([`HookUpdate::trunk`], [`HookUpdate::stored`]), never the client's
-//!    old value (A9 review obligation 4);
+//!    old value (A9 review obligation 4). When that range runs into a
+//!    root commit or past the commit limit, the push may be built on a
+//!    `main` from before a history reset ([`crate::place::Place::reset_history`]):
+//!    the commits of any earlier `main` it reaches are excluded too
+//!    ([`MainHistory`]), so a clone made before a reset still pushes;
 //! 3. diffs each commit against its first parent and runs
 //!    [`rules::validate_push`] over them;
 //! 4. charges the push to the caller's per-branch quota.
@@ -23,8 +27,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aspen_core::error::StoreError;
-use aspen_core::id::{ObjectId, RepoId};
-use aspen_core::ingest::ObjectKind;
+use aspen_core::id::{ObjectId, RefVersionId, RepoId};
+use aspen_core::ingest::{ObjectKind, SortedIds};
+use aspen_core::meta::{CommitLookup, MetaStore};
 use aspen_core::repo::Repo;
 use aspen_server::receive::hook::{
     Caller, CommitRange, CommittedUpdate, HookFuture, HookObjects, HookUpdate, HookVerdict,
@@ -198,6 +203,88 @@ pub struct Shared {
     pub committed: Mutex<HashMap<(String, ObjectId), u64>>,
     /// Git pushes per caller and branch.
     pub git_quota: Mutex<Windows>,
+    /// Which commits are on `main`'s history, past or present.
+    pub main_history: Arc<dyn MainHistory>,
+}
+
+/// What the commit index says about one commit, for [`MainHistory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Indexed {
+    /// The commit is reachable from a version of `main`: one of the server's
+    /// own commits, from this history or one before a reset.
+    Main,
+    /// Indexed under another ref (a branch), with these parents.
+    Other(Vec<ObjectId>),
+    /// Not indexed (a commit of the push being checked, or one not known).
+    NotIndexed,
+}
+
+/// Tells the hook which commits are on `main`'s history. Only the server
+/// writes `main` (the merger bot, the README refresh and history resets),
+/// so a commit any version of `main` reaches holds tiles the server
+/// checked: a push built on it is checked from there, like one built on
+/// the current `main`.
+pub trait MainHistory: Send + Sync + std::fmt::Debug {
+    /// One answer per ID, in order.
+    fn classify<'a>(
+        &'a self,
+        ids: &'a [ObjectId],
+    ) -> HookFuture<'a, Result<Vec<Indexed>, StoreError>>;
+}
+
+/// [`MainHistory`] from Aspen's commit index: a commit's row names a
+/// version whose tip reaches it, and a commit is on `main`'s history
+/// exactly when that version is one of `main`'s (`main` takes no client
+/// pushes, so a version of it reaches only server commits; ref versions are
+/// never deleted, so this holds for every history before a reset too).
+#[derive(Debug)]
+pub struct IndexedMain<M> {
+    /// The metadata store.
+    pub meta: M,
+    /// The canvas repository.
+    pub repo: RepoId,
+}
+
+impl<M: MetaStore + std::fmt::Debug + 'static> MainHistory for IndexedMain<M> {
+    fn classify<'a>(
+        &'a self,
+        ids: &'a [ObjectId],
+    ) -> HookFuture<'a, Result<Vec<Indexed>, StoreError>> {
+        Box::pin(async move {
+            let sorted = SortedIds::from_unsorted(ids.to_vec());
+            let rows = self.meta.lookup_commits(self.repo, &sorted).await?;
+            let by_id: HashMap<ObjectId, CommitLookup> =
+                sorted.as_slice().iter().copied().zip(rows).collect();
+            let mut on_main: HashMap<RefVersionId, bool> = HashMap::new();
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(CommitLookup::Indexed(row)) = by_id.get(id) else {
+                    out.push(Indexed::NotIndexed);
+                    continue;
+                };
+                let main = match on_main.get(&row.ref_version) {
+                    Some(m) => *m,
+                    None => {
+                        let m = self
+                            .meta
+                            .ref_version(row.ref_version)
+                            .await?
+                            .is_some_and(|v| {
+                                v.repo == self.repo && v.name.as_str() == rules::TRUNK_REF
+                            });
+                        on_main.insert(row.ref_version, m);
+                        m
+                    }
+                };
+                out.push(if main {
+                    Indexed::Main
+                } else {
+                    Indexed::Other(row.parents.clone())
+                });
+            }
+            Ok(out)
+        })
+    }
 }
 
 impl Shared {
@@ -329,9 +416,25 @@ async fn check_git_update(
         // rules apply.
         return Ok(HookVerdict::Accept);
     };
-    let exclude: Vec<ObjectId> = update.trunk.into_iter().chain(update.stored).collect();
+    let mut exclude: Vec<ObjectId> = update.trunk.into_iter().chain(update.stored).collect();
     let limits = shared.limits;
-    let range = match objects.range(new, &exclude, limits.max_commits).await? {
+    let mut range = objects.range(new, &exclude, limits.max_commits).await?;
+    let reaches_a_root = match &range {
+        CommitRange::Commits(c) => c.iter().any(|c| c.parents.is_empty()),
+        CommitRange::TooLong => true,
+        CommitRange::Undecided => false,
+    };
+    if reaches_a_root {
+        // Built on a `main` from before a history reset (or on no `main` at
+        // all): stop at the earlier `main`'s commits too. Ordinary pushes
+        // never get here, so they pay nothing for it.
+        let boundary = main_boundary(shared, objects, new, limits.max_commits).await?;
+        if !boundary.is_empty() {
+            exclude.extend(boundary);
+            range = objects.range(new, &exclude, limits.max_commits).await?;
+        }
+    }
+    let range = match range {
         CommitRange::Commits(c) => c,
         CommitRange::TooLong => {
             return Ok(refuse_one(format!(
@@ -401,6 +504,51 @@ async fn check_git_update(
         },
     );
     Ok(HookVerdict::Accept)
+}
+
+/// The commits of `main`'s history (any epoch, [`MainHistory`]) that the
+/// history of `new` reaches first: walking down from `new`, a commit on
+/// `main` is kept and not walked past. Gives up (returns what it found so
+/// far) after `max_commits` commits that are not on `main`, which the
+/// range then reports as too long. Commits the index knows are read from
+/// it, in one batch per generation; the push's own commits are read from
+/// its pack.
+async fn main_boundary(
+    shared: &Shared,
+    objects: &mut dyn HookObjects,
+    new: ObjectId,
+    max_commits: usize,
+) -> Result<Vec<ObjectId>, StoreError> {
+    let mut boundary = Vec::new();
+    let mut seen: std::collections::HashSet<ObjectId> = [new].into();
+    let mut frontier = vec![new];
+    let mut walked = 0usize;
+    while !frontier.is_empty() && walked <= max_commits {
+        let answers = shared.main_history.classify(&frontier).await?;
+        let mut next = Vec::new();
+        for (id, answer) in frontier.iter().zip(answers) {
+            let parents = match answer {
+                Indexed::Main => {
+                    boundary.push(*id);
+                    continue;
+                }
+                Indexed::Other(parents) => parents,
+                Indexed::NotIndexed => match objects.read(*id).await? {
+                    Some((ObjectKind::Commit, data)) => {
+                        parse_commit(&data)
+                            .map_err(|what| StoreError::Corrupt { what })?
+                            .1
+                    }
+                    // Not readable or not a commit: the range decides.
+                    _ => continue,
+                },
+            };
+            walked += 1;
+            next.extend(parents.into_iter().filter(|p| seen.insert(*p)));
+        }
+        frontier = next;
+    }
+    Ok(boundary)
 }
 
 async fn read(
