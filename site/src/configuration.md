@@ -185,12 +185,14 @@ is the one to tune.
 | Where push time goes | What it means | Settings to look at |
 |---|---|---|
 | Pushes answered `503` with `Retry-After` | Every push slot was taken and the queue was full or its wait ran out | [Admission](#admission) |
+| Requests answered `503` saying `memory pressure` | The process's resident memory is over `ASPEN_MEMORY_HIGH_WATER_BYTES` | Lower the caches (`ASPEN_IDX_CACHE_BYTES`, `ASPEN_OBJECT_CACHE_BYTES`, `ASPEN_TRUNK_TREE_CACHE_BYTES`) or the concurrency limits, or give the instance more memory |
 | `stage="gate_wait"`, or `aspen_push_prefetch_wait_timeouts_total` rising | Pushes wait for delta-base memory | `ASPEN_PREFETCH_MEMORY_BYTES`, `ASPEN_PREFETCH_FLOOR_BYTES` |
 | `stage="prefetch"` | Reading delta bases from stored packs | `ASPEN_PREFETCH_PARALLEL_READS`, `ASPEN_OBJECT_CACHE_BYTES`, `ASPEN_IDX_CACHE_BYTES`, `ASPEN_IDX_WHOLE_MAX_BYTES` |
 | `stage="complete"` | Completing and indexing the pack on local CPU | `ASPEN_PUSH_THREADS`, the instance's vCPUs |
 | `stage="graph"` | Scanning the pushed pack, diffing its trees against their parents', and looking up what changed (connectivity, objects already stored) | `ASPEN_TRUNK_TREE_CACHE_BYTES`, `ASPEN_IDX_CACHE_BYTES`, `ASPEN_IDX_WHOLE_MAX_BYTES` |
 | `stage="upload"` | Writing the pack to the object store | [Uploads](#uploads-to-the-object-store) |
 | `stage="commit"` | The database transaction that moves the ref | [Metadata database](#metadata-database) (`ASPEN_GROUP_COMMIT`), `ASPEN_SYNC_COMMIT_ROWS` |
+| The database's CPU is high while the servers' is not | Each push sends its statements to the database; `aspen_push_db_statements_total` counts them (on PostgreSQL about 4 per branch push) | [Metadata database](#metadata-database) (`ASPEN_GROUP_COMMIT` shares the `BEGIN` and `COMMIT` of concurrent pushes) |
 | `aspen_jobs_queued_lag_seconds{kind="compact"}` growing | Compaction falls behind pushes | [Background work](#background-work) |
 
 Aspen checks every value at startup. A value that is not a number, is out
@@ -217,6 +219,7 @@ in a queue; with the queue full, or after the wait, it is refused with
 | `ASPEN_MAX_CONCURRENT_STITCHES` | `32` | Inline packs being built and streamed at once. Each holds its plan's object IDs while it streams | Size it by memory, like fetches |
 | `ASPEN_ADMISSION_QUEUE` | `64` | Requests of each kind that may wait for a slot; `0` refuses as soon as every slot is taken | Raise it to absorb bursts instead of answering `503` |
 | `ASPEN_ADMISSION_QUEUE_WAIT_SECS` | `10` | Longest a request waits in that queue for a slot before it is refused; `0` refuses at once when no slot is free. At most `3600` | Keep it under your load balancer's idle timeout. Lower it so an overloaded instance sheds load sooner |
+| `ASPEN_MEMORY_HIGH_WATER_BYTES` | 80% of the memory limit | Resident memory over which new fetch, push and stitch requests are refused at once with `503` and `Retry-After` (a retryable `ERR` over SSH), until it falls back under it. Work already running finishes. The default is 80% of the process's cgroup memory limit, or of the machine's memory without one; `0` turns it off | Keeps an overloaded instance answering instead of being killed by the kernel, which loses every request in flight. Set it a little under what the instance may use when other processes share its memory. Refusals count in `aspen_admission_memory_refusals_total` |
 
 Request bodies are bounded too, for every caller: a fetch request is at
 most 9 MiB (the protocol parser's 8 MiB plus framing), and any Git request
@@ -238,10 +241,10 @@ only when its bases need more; while there is no room, it waits.
 | `ASPEN_PREFETCH_FLOOR_BYTES` | `67108864` | What each push reserves (64 MiB) before its first read of stored packs. At most `ASPEN_PREFETCH_MEMORY_BYTES` and the per-push budget | Lower it to admit more small pushes at once with the same memory. Raise it when `aspen_push_prefetch_escalations_total` is a large share of pushes, since each escalation waits for the full budget |
 | `ASPEN_PREFETCH_PER_PUSH_BYTES` | `2147483648` | The most delta-base memory one push may use: by default four times `ASPEN_MAX_OBJECT_BYTES` and at least 1 GiB (2 GiB with the default object limit). A push whose bases need more is refused with an `unpack` error that is not retried. At least `ASPEN_MAX_OBJECT_BYTES`, at most `ASPEN_PREFETCH_MEMORY_BYTES` | Lower it, with `ASPEN_MAX_OBJECT_BYTES`, when no push you accept is that large, so more large pushes fit at once |
 | `ASPEN_PREFETCH_WAIT_SECS` | `60` | How long a push waits for prefetch memory before it is refused with a retryable error. At most `3600` | Lower it so a saturated instance fails pushes fast for clients to retry. Each give-up counts in `aspen_push_prefetch_wait_timeouts_total` |
-| `ASPEN_PREFETCH_PARALLEL_READS` | `64` | Object store reads one push keeps in flight while it reads delta bases. From 1 to 1024 | Raise it when `stage="prefetch"` dominates on a high-latency store. Lower it if the store throttles (S3 answers `503 Slow Down`) |
-| `ASPEN_IDX_CACHE_BYTES` | `268435456` | Memory for pack indexes (`.idx`, 256 MiB), shared by every push, used to find objects in stored packs. An index is about 6% of its pack | Make it hold the indexes of the packs that pushes to your busiest repositories search (trunk's packs); a miss is an object store read |
+| `ASPEN_PREFETCH_PARALLEL_READS` | `256` | Object store reads one push keeps in flight: the entries of its delta bases' chains, which it reads in one round, and its lookups in sampled pack indexes. A round with more reads waits for a second wave, one more round trip. From 1 to 1024 | Raise it when `stage="prefetch"` dominates on a high-latency store. Lower it if the store throttles (S3 answers `503 Slow Down`) |
+| `ASPEN_IDX_CACHE_BYTES` | `1073741824` | Memory for pack indexes (`.idx`, 1 GiB), shared by every push, used to find objects in stored packs. An index is about 6% of its pack, and a whole one also keeps 12 bytes per object: offsets and a map of the pack's delta chains, so a chain is read in one round trip. When the indexes one push searches do not all fit, the ones it probes first are kept whole and the rest as samples (see `ASPEN_IDX_WHOLE_MAX_BYTES`), so a repository larger than the cache never reloads its own indexes; concurrent pushes that miss the same index share one read. It is a bound, not a reservation | The default holds a repository of about 30 million objects whole. Lower it on a small instance; raise it when one very large repository dominates and its lookups show `.idx` reads (a whole index answers without object store reads) |
 | `ASPEN_OBJECT_CACHE_BYTES` | `67108864` | Memory for resolved delta bases (64 MiB), shared by every push. Consecutive pushes to one repository mostly need the same few bases (trunk's root tree and the directories above the files they change), and resolving one from a stored pack costs an object store read per delta in its chain. Objects over 1 MiB are never kept; `0` turns the cache off | Raise it for a repository with large trees and many pushes |
-| `ASPEN_IDX_WHOLE_MAX_BYTES` | `67108864` | The largest pack index (64 MiB, a pack of about 2.4 million objects) kept whole in `ASPEN_IDX_CACHE_BYTES`. A larger one is kept as a sample, one object ID of every 256, and each lookup in it reads about 5 KiB of the index from the object store; a whole index is read once, when the sample is built. Without sampling, a repository whose indexes do not fit the cache read them whole on every push | Keep it at most a quarter of `ASPEN_IDX_CACHE_BYTES`. Raise both when one large repository dominates and memory allows: a whole index answers without object store reads |
+| `ASPEN_IDX_WHOLE_MAX_BYTES` | `67108864` | The largest pack index (64 MiB, a pack of about 2.4 million objects) kept whole in `ASPEN_IDX_CACHE_BYTES`. A larger one is kept as a sample, one object ID of every 256, and each lookup in it reads about 6 KiB of the index from the object store in one round trip; a whole index is read once, when the sample is built, with the pack's entry table, from which a map of its delta chains is written to `chains/` under the spool directory (16 bytes per object), so a chain in it is read in one round trip, not one per level. Without sampling, a repository whose indexes do not fit the cache read them whole on every push | Keep it at most a quarter of `ASPEN_IDX_CACHE_BYTES`. Raise both when one large repository dominates and memory allows: a whole index answers without object store reads |
 | `ASPEN_TRUNK_TREE_CACHE_BYTES` | `67108864` | Memory for trunk's newest trees (64 MiB), shared by every push. A push diffs each pushed commit's tree against its parent's and descends only into the directories it changed, so connectivity and the "already stored" test look up only what changed; the parent's trees come from here (a push to trunk adds its own). `0` keeps none: each push reads the old trees on its changed paths from stored packs | Raise it when pushes to a repository with very large directories (thousands of entries) show `stage="graph"` time |
 | `ASPEN_PUSH_THREADS` | every core | Threads one push uses to complete and index its pack. From 1 to 1024 | Many small pushes at once each need only one thread, and every core per push makes them compete: try `1` or `2` when `stage="complete"` grows under concurrency. Leave it unset for few, large pushes |
 | `ASPEN_SYNC_COMMIT_ROWS` | `10000` | Commit index rows a push writes in its own database transaction. A push with more new commits writes its tip's row and leaves the rest to a background `index_commits` job. From 1 to 1000000 | Lower it so pushes that carry long histories are acknowledged sooner. Until the job runs, ancestry checks against those commits read packs, which is slower |
@@ -262,7 +265,10 @@ them.
 
 Requests take database connections in arrival order, so a busy pool slows
 requests down but does not fail them (issue #150). A push holds a
-connection for each short lookup and for its commit transaction.
+connection for each short lookup and for its commit transaction. Every Git
+request needs its repository's row and, when it carries one, its token's
+row; each instance keeps both in memory for a few seconds, so a busy
+caller's requests cost the database no lookup for them.
 
 | Variable | Default | Meaning | Tuning |
 |---|---|---|---|
@@ -273,6 +279,27 @@ connection for each short lookup and for its commit transaction.
 | `ASPEN_GROUP_COMMIT` | `off` | `on` lets concurrent pushes share their metadata transactions: pushes that reach the database within `ASPEN_GROUP_COMMIT_WINDOW_MS` of each other register their packs in one transaction and commit their ref updates in another, instead of two transactions each. Each push is still answered only after its pack is in the object store and its own ref update has committed, and its compare-and-swap is its own (one that loses is retried alone). Each push still stores its own pack objects | Turn it on when `stage="commit"` grows under load, or the database's transaction rate or connection pool (`ASPEN_DB_MAX_CONNECTIONS`) is the limit. Watch `aspen_push_group_commit_pushes_total` / `aspen_push_group_commit_batches_total`: near 1 push per transaction, the window only adds latency |
 | `ASPEN_GROUP_COMMIT_WINDOW_MS` | `2` | How long a group commit batch waits for more pushes after its first, from 0 to 1000 milliseconds; each push waits at most twice. `0` batches only pushes already waiting. Acts only with `ASPEN_GROUP_COMMIT=on` | Raise it (5 to 20) when batches stay small under load; each millisecond is added to every push's latency, up to twice |
 | `ASPEN_GROUP_COMMIT_MAX_BATCH` | `64` | Most pushes one group commit transaction takes, from 1 to 1024; a full batch starts at once. Acts only with `ASPEN_GROUP_COMMIT=on` | Lower it if one transaction of many pushes holds row locks long enough to slow other writers; raise it only when batches reach it under load |
+| `ASPEN_REPO_CACHE_TTL_MS` | `5000` | How long an instance keeps a repository's row in memory after reading it, in milliseconds, so a caller's requests do not each read it. A repository that does not exist is never remembered, so one created with `aspen repo create` is served at once. A setting changed in the database directly is seen within this long. From `0` (read on every request) to `60000` | Leave it. Lower it only if you edit `repos` rows by hand and need the change to apply sooner |
+| `ASPEN_TOKEN_CACHE_TTL_MS` | `5000` | How long an instance keeps a token's row in memory after reading it, in milliseconds, so a caller's requests do not each read it. This is the longest a token revoked with `aspen token revoke` (or on another instance) keeps working; expiry still applies to the second. From `0` (read on every request) to `60000` | Lower it for faster revocation, at one token lookup per caller per instance per TTL. With it at `0` every Git request reads its token |
+
+### Ref listings
+
+Stock `git ls-remote <url> <ref>` asks for every ref (its patterns match the
+end of a ref name, so it sends no `ref-prefix`), and agents that poll for a
+ref run it often. Each instance keeps every repository's refs it has listed
+in memory, and an `ls-refs` request asks the database only which refs
+changed since the last listing: one statement, which reads no ref rows when
+nothing moved, instead of a scan of the repository's refs plus a lookup of
+`HEAD`. Concurrent requests for one repository share one such read.
+
+A listing is never stale. Every request is answered from a database read
+that began after the request arrived, so a push acknowledged by any
+instance is in every listing requested after the acknowledgement, on every
+instance.
+
+| Variable | Default | Meaning | Tuning |
+|---|---|---|---|
+| `ASPEN_LS_REFS_CACHE_REFS` | `250000` | Most refs this instance keeps in memory for `ls-refs` across repositories, about 160 bytes each; each repository counts one more. Least recently listed repositories are dropped first, and a repository with more live refs than this is listed from the database on every request, as with `0`. `0` turns the cache off; at most `100000000` | Raise it when repositories with many refs are polled and memory has room. A repository dropped from memory costs one full listing the next time it is requested |
 
 ### Background work
 
@@ -283,10 +310,33 @@ pushes search more small packs.
 
 | Variable | Default | Meaning | Tuning |
 |---|---|---|---|
-| `ASPEN_COMPACT_WORKERS` | `8` | Background jobs (compaction and commit indexing) this instance runs at once, from 1 to 64. One of them also runs the garbage-collection sweeps | A job mostly waits on the object store, so raise it while `aspen_jobs_queued_lag_seconds{kind="compact"}` grows and CPU has room |
+| `ASPEN_COMPACT_WORKERS` | `8` | Background jobs (compaction and commit indexing) this instance runs at once, from 1 to 64. One of them also runs the garbage-collection passes ([below](#garbage-collection)) | A job mostly waits on the object store, so raise it while `aspen_jobs_queued_lag_seconds{kind="compact"}` grows and CPU has room |
 | `ASPEN_COMPACT_IDLE_POLL_MS` | `5000` | How often an idle worker asks the database for a due job, in milliseconds. From 10 to 3600000 | Lower it so a new job starts sooner after a quiet spell. Every idle worker on every instance polls, so the database sees workers × instances / interval queries per second |
 | `ASPEN_ROLE` | `all` | What this process runs: `all` (Git and the background worker), `serve` (Git, the merge queue and mirror mode, no background worker) or `compact` (the background worker only: compaction, commit indexing and garbage collection; `ASPEN_LISTEN` answers only `/healthz` and `/readyz`, and `ASPEN_SSH_LISTEN` or `ASPEN_MERGE_QUEUE=on` refuse the start). A deployment with `serve` processes needs at least one `compact` or `all` process | Run `compact` processes beside `serve` ones to scale compaction apart from Git, so it does not compete with pushes for CPU, disk and the database pool. Add `compact` processes (or `ASPEN_COMPACT_WORKERS`) while `aspen_compaction_backlog` grows under a steady push rate; flat means compaction keeps up |
 | `ASPEN_MERGE_QUEUE_BATCH` | `64` | Most queued changes one trunk update of the merge queue (`ASPEN_MERGE_QUEUE`, under [push limits](#push-limits)) lands, from 1 to 1024 | Larger batches land more changes per trunk update, but a batch is rebuilt when trunk moves meanwhile |
+
+### Garbage collection
+
+Garbage collection deletes packs nothing names any more (a push that lost
+its race, an evicted shallow pack) two hours after they were last
+registered. It runs in processes whose `ASPEN_ROLE` runs the background
+worker, one process at a time: a pass first takes a lease in the
+database, and while another process holds it the pass does nothing. If
+the holder stops, its lease expires and the next process to try takes it
+over. The sweep reads registrations in the order their grace periods end,
+resuming where it stopped, in transactions of a bounded size, so a pass
+costs about the same with a thousand packs or a million. On PostgreSQL it
+uses a connection pool of its own, so it never waits for, or holds, the
+connections pushes use. `aspen_gc_*` on `/-/metrics` shows which process
+collects and how long each batch takes ([Observability](reference/observability.md)).
+
+| Variable | Default | Meaning | Tuning |
+|---|---|---|---|
+| `ASPEN_GC_EVERY_SECS` | `300` | Seconds between one process's garbage-collection passes, from 10 to 86400. Every process that runs the background worker tries this often; only the lease holder collects | Raise it to collect less often. Garbage waits at most about two hours plus twice this |
+| `ASPEN_GC_SWEEP_BATCH` | `1000` | Registrations one sweep transaction reads, from 1 to 100000. It also reads as many packs of a slow audit, which walks every pack by ID to find packs with no registration time and any orphan the ordered walk passed. A pass runs transactions until the sweep has caught up, for at most 30 seconds | Lower it if `aspen_gc_sweep_batch_duration_seconds` is long enough to matter to the database. Raise it if a pass often stops at 30 seconds before catching up (`aspen_gc_sweep_rows_examined_total` grows by much more than new pushes) |
+| `ASPEN_GC_LEASE_SECS` | `300` | How long the garbage-collection lease lasts after its holder last used it, from 10 to 86400. Every sweep transaction extends it; work under a lease that expired or changed hands is refused, so two processes never sweep at once | Keep it at least `ASPEN_GC_EVERY_SECS`, so the holder keeps the lease from one pass to the next. Lower both to hand over sooner when the holder stops |
+| `ASPEN_GC_DB_MAX_CONNECTIONS` | `1` | Connections in garbage collection's own pool on PostgreSQL, apart from `ASPEN_DB_MAX_CONNECTIONS`, from 1 to 16. SQLite has one writer at a time, so there garbage collection shares the main pool | One is enough: a pass runs one statement at a time |
+| `ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS` | `10` | How long one garbage-collection statement may run on PostgreSQL before the database cancels it (`statement_timeout`), apart from `ASPEN_DB_STATEMENT_TIMEOUT_SECS`. A cancelled pass is retried at the next interval. `0` is no limit; at most `86400` | Each statement is a bounded range scan that takes milliseconds; this firing means the database is overloaded or a plan went wrong |
 
 ## Push limits
 
@@ -299,8 +349,9 @@ defaults suit a large monorepo.
 | `ASPEN_MAX_INFLATED_BYTES` | `8589934592` (8 GiB) | Most one push may inflate to in total; at least `ASPEN_MAX_OBJECT_BYTES` |
 | `ASPEN_MAX_PUSH_BYTES` | `8589934592` (8 GiB) | Largest pack per push |
 | `ASPEN_MAX_PUSH_OBJECTS` | `10000000` | Most objects per push (checked against the pack header before the body is read) |
-| `ASPEN_MERGE_QUEUE` | `off` | `on` runs the merge queue: push a change with `git push origin HEAD:refs/queue/main/<your-name>` and the server lands it on `main` in a batch with other pending changes, one compare-and-swap per batch. Read the outcome with `git ls-remote origin refs/queue-done/main/<your-name> refs/queue-rejected/main/<your-name>`: the first names the trunk commit that landed it; the second a report commit (`git fetch origin refs/queue-rejected/main/<your-name> && git log -1 FETCH_HEAD`) listing the paths that conflicted. A change of several commits lands as one commit with the last one's message |
+| `ASPEN_MERGE_QUEUE` | `off` | `on` runs the merge queue: push a change with `git push origin HEAD:refs/queue/main/<your-name>` and the server lands it on `main` in a batch with other pending changes, one compare-and-swap per batch. Or push a branch with `git push -o land origin HEAD:refs/heads/<branch>`: the branch is pushed and also queued as `refs/queue/main/<branch>`, in the same transaction. Read the outcome with `git ls-remote origin refs/queue-done/main/<your-name> refs/queue-rejected/main/<your-name>`: the first names the trunk commit that landed it; the second a report commit (`git fetch origin refs/queue-rejected/main/<your-name> && git log -1 FETCH_HEAD`) listing the paths that conflicted. A change of several commits lands as one commit with the last one's message |
 | `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS` | `3600` | Seconds an outcome ref (`refs/queue-done/...`, `refs/queue-rejected/...`) is kept after it was written; then the queue deletes it (a compare-and-swap delete, so a reused name keeps its newer outcome). `0` keeps outcomes for ever. Every outcome is a ref, so without expiry a busy repository gains thousands an hour and every full ref listing grows |
+| `ASPEN_MERGE_QUEUE_INTERVAL_MS` | `50` | How long a merge-queue batch that is not full waits, after its oldest change was queued, for more changes to land with it (0 to 10000; `0` lands as soon as anything is queued). Longer means fewer trunk updates and uploads per change, at the cost of latency. One worker per repository builds batches at a time, under a lease other instances take over within 10 s if it stops |
 
 Memory: plan for about 140 bytes of heap per object of the largest push you
 accept, plus the prefetch memory ([push path memory](#push-path-memory-and-cpu)).

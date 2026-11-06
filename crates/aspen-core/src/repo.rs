@@ -3,10 +3,11 @@
 use crate::id::RepoId;
 use crate::name::{NameError, RefName, RefPattern, RepoName};
 
-/// Default number of earlier trunk tips advertised as `.have` lines (S2).
+/// Default `have_tips`: the newest 64 earlier trunk tips are advertised as
+/// `.have` lines, then a sparser tail ([`crate::meta::have_tip_seqs`]).
 pub const DEFAULT_HAVE_TIPS: u8 = 8;
 
-/// Most earlier trunk tips a repository may advertise as `.have` lines.
+/// Largest `have_tips` (a window of 256 tips).
 pub const MAX_HAVE_TIPS: u8 = 32;
 
 /// Which refs a push may rewrite (non-fast-forward update, replace a tag, or
@@ -153,7 +154,7 @@ pub struct RepoSettings {
 
 impl RepoSettings {
     /// Defaults from `docs/PLAN.md`: force policy `branches`, writable
-    /// `refs/heads/*` and `refs/tags/*`, thin packs accepted, 8 `.have` tips,
+    /// `refs/heads/*` and `refs/tags/*`, thin packs accepted, `have_tips` 8,
     /// shallow served.
     pub fn new(trunk: RefName) -> Result<Self, SettingsError> {
         let writable = vec![
@@ -222,7 +223,7 @@ impl RepoSettings {
         self.no_thin
     }
 
-    /// How many earlier trunk tips go out as `.have` lines.
+    /// Scales the `.have` lines of a push advertisement ([`crate::meta::have_tip_seqs`]).
     pub fn have_tips(&self) -> u8 {
         self.have_tips
     }

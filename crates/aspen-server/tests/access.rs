@@ -1065,3 +1065,212 @@ async fn database_tokens_authenticate_and_revoke() {
     assert_eq!(send(&app, fetch()).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(log.lock().unwrap().calls.len(), 1);
 }
+
+/// The access layer as `aspen serve` wires it (cached tokens and
+/// repositories, `ttl` each) over a file-backed SQLite store holding
+/// `acme/a`, and a token that may push to it.
+struct Cached {
+    meta: aspen_meta::SqlStore,
+    tokens: aspen_server::access::tokens::CachedTokens<aspen_server::access::tokens::SqlTokens>,
+    access: Arc<
+        aspen_server::access::Access<
+            aspen_meta::SqlStore,
+            aspen_server::access::tokens::CachedTokens<aspen_server::access::tokens::SqlTokens>,
+        >,
+    >,
+    app: Router,
+    log: Log,
+    _dir: tempfile::TempDir,
+}
+
+impl Cached {
+    async fn start(ttl: std::time::Duration) -> Self {
+        use aspen_auth::{AuthService, Limits, PolicyConfig};
+        use aspen_server::access::tokens::{CachedTokens, SqlTokens};
+        use aspen_server::access::{Access, guard};
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("aspen.db").display()
+        );
+        let meta = aspen_meta::SqlStore::connect(&url).await.unwrap();
+        meta.migrate().await.unwrap();
+        create_repo(&meta, "acme/a").await;
+        let tokens = CachedTokens::new(SqlTokens(meta.clone()), ttl);
+        let auth = AuthService::new(PolicyConfig::default(), tokens.clone()).unwrap();
+        let access = Arc::new(
+            Access::new(auth, Limits::unlimited(), meta.clone(), ClientAddr::Peer)
+                .with_repo_cache_ttl(ttl),
+        );
+        let log: Log = Arc::default();
+        let app = recorder(log.clone()).layer(axum::middleware::from_fn_with_state(
+            access.clone(),
+            guard::<aspen_meta::SqlStore, CachedTokens<SqlTokens>, _>,
+        ));
+        Self {
+            meta,
+            tokens,
+            access,
+            app,
+            log,
+            _dir: dir,
+        }
+    }
+
+    /// A token that may push to `acme/*`, expiring at `expires_at`.
+    async fn token(
+        &self,
+        expires_at: Option<aspen_core::id::UnixMicros>,
+    ) -> (String, aspen_auth::TokenId) {
+        let issued = self
+            .tokens
+            .inner()
+            .create(
+                aspen_auth::NewToken {
+                    subject: "agent:cached".into(),
+                    grants: aspen_auth::Grants::new(["write:acme/*".parse().unwrap()]),
+                    description: String::new(),
+                    expires_at,
+                },
+                aspen_core::id::UnixMicros::now(),
+            )
+            .await
+            .unwrap();
+        (issued.token.expose().to_owned(), issued.record.id)
+    }
+
+    async fn fetch(&self, repo: &str, token: &str) -> StatusCode {
+        let url = format!("/{repo}/info/refs?service=git-upload-pack");
+        send(
+            &self.app,
+            req("GET", &url, Some(&basic("x", token)), vec![]),
+        )
+        .await
+        .0
+    }
+
+    /// The repository's force policy, as the access layer sees it.
+    async fn force_policy(&self, repo: &str) -> aspen_core::repo::ForcePolicy {
+        let name = aspen_core::name::RepoName::new(repo).unwrap();
+        let repo = self.access.repo(&name).await.unwrap().unwrap();
+        repo.settings.allow_force()
+    }
+
+    /// Changes the force policy in the database, as an operator or another
+    /// process would, without telling this instance.
+    async fn set_force_policy(&self, repo: &str, policy: &str) {
+        sqlx::query("UPDATE repos SET allow_force = $1 WHERE name = $2")
+            .bind(policy)
+            .bind(repo)
+            .execute(self.meta.pool())
+            .await
+            .unwrap();
+    }
+}
+
+async fn create_repo(meta: &aspen_meta::SqlStore, name: &str) {
+    let settings = aspen_core::repo::RepoSettings::new(
+        aspen_core::name::RefName::new("refs/heads/main").unwrap(),
+    )
+    .unwrap();
+    aspen_core::meta::MetaStore::create_repo(
+        meta,
+        &aspen_core::name::RepoName::new(name).unwrap(),
+        &settings,
+    )
+    .await
+    .unwrap();
+}
+
+/// Invariant (throughput 6a): a token revoked through this instance is
+/// refused on its very next request, however long its row would otherwise
+/// stay cached.
+#[tokio::test]
+async fn a_token_revoked_here_is_refused_on_the_next_request() {
+    let c = Cached::start(std::time::Duration::from_secs(3600)).await;
+    let (token, id) = c.token(None).await;
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::OK);
+    assert!(
+        c.tokens
+            .revoke(&id, aspen_core::id::UnixMicros::now())
+            .await
+            .unwrap()
+    );
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(c.log.lock().unwrap().calls.len(), 1);
+}
+
+/// Invariant (throughput 6a): a token revoked elsewhere (another instance,
+/// `aspen token revoke`) is refused here once the token TTL has passed
+/// since the revocation, although this instance cached its row before.
+#[tokio::test]
+async fn a_token_revoked_elsewhere_is_refused_within_the_ttl() {
+    let ttl = std::time::Duration::from_millis(300);
+    let c = Cached::start(ttl).await;
+    let (token, id) = c.token(None).await;
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::OK);
+    // Another process's store: this instance's cache is not told.
+    let elsewhere = aspen_server::access::tokens::SqlTokens(c.meta.clone());
+    assert!(
+        elsewhere
+            .revoke(&id, aspen_core::id::UnixMicros::now())
+            .await
+            .unwrap()
+    );
+    let revoked = std::time::Instant::now();
+    tokio::time::sleep(ttl.saturating_sub(revoked.elapsed())).await;
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(c.fetch("acme/b", &token).await, StatusCode::UNAUTHORIZED);
+}
+
+/// A cached token still expires on time: expiry is checked against the
+/// clock on every request, not when the row was read.
+#[tokio::test]
+async fn a_cached_token_expires_on_time() {
+    let c = Cached::start(std::time::Duration::from_secs(3600)).await;
+    let life = std::time::Duration::from_millis(300);
+    let (token, _) = c
+        .token(Some(aspen_core::id::UnixMicros::now().saturating_add(life)))
+        .await;
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::OK);
+    tokio::time::sleep(life + std::time::Duration::from_millis(50)).await;
+    assert_eq!(c.fetch("acme/a", &token).await, StatusCode::UNAUTHORIZED);
+}
+
+/// A repository changed through this instance ([`Access::forget_repo`]) is
+/// read again at once; one changed elsewhere is seen within the TTL.
+#[tokio::test]
+async fn repository_changes_are_seen_at_once_here_and_within_the_ttl_elsewhere() {
+    use aspen_core::repo::ForcePolicy;
+    let c = Cached::start(std::time::Duration::from_secs(3600)).await;
+    let name = aspen_core::name::RepoName::new("acme/a").unwrap();
+    assert_eq!(c.force_policy("acme/a").await, ForcePolicy::Branches);
+    c.set_force_policy("acme/a", "all").await;
+    assert_eq!(
+        c.force_policy("acme/a").await,
+        ForcePolicy::Branches,
+        "cached for the TTL"
+    );
+    c.access.forget_repo(&name);
+    assert_eq!(c.force_policy("acme/a").await, ForcePolicy::All);
+
+    let ttl = std::time::Duration::from_millis(300);
+    let c = Cached::start(ttl).await;
+    assert_eq!(c.force_policy("acme/a").await, ForcePolicy::Branches);
+    c.set_force_policy("acme/a", "none").await;
+    let changed = std::time::Instant::now();
+    tokio::time::sleep(ttl.saturating_sub(changed.elapsed())).await;
+    assert_eq!(c.force_policy("acme/a").await, ForcePolicy::None);
+}
+
+/// A missing repository is never remembered: one created by another
+/// process (`aspen repo create`) is served on its first request after.
+#[tokio::test]
+async fn a_missing_repository_is_not_remembered() {
+    let c = Cached::start(std::time::Duration::from_secs(3600)).await;
+    let (token, _) = c.token(None).await;
+    assert_eq!(c.fetch("acme/new", &token).await, StatusCode::NOT_FOUND);
+    create_repo(&c.meta, "acme/new").await;
+    assert_eq!(c.fetch("acme/new", &token).await, StatusCode::OK);
+}

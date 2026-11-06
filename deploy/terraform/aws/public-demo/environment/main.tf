@@ -64,6 +64,45 @@ locals {
   git_host   = "git.${var.base_domain}"
   place_host = coalesce(var.place_hostname, "place.${var.base_domain}")
 
+  # How large the place task and the database are, per environment. A
+  # variable set to anything but null overrides its row.
+  #
+  # The demo is sized for a public share where people push it to its limit
+  # from their own agents: about 500 pushes/s in total (docs/PLAN.md decisions
+  # log, 2026-11-06, "public-share sizing"). The throughput bench reached 567
+  # pushes/s with 8 cores for aspen-place and a 4-core PostgreSQL at about
+  # 85%, so the demo gets about twice both: aspen-place runs as one task
+  # (it keeps the canvas, merge queue and event feed in memory and never
+  # runs twice, place.tf), at Fargate's largest size, 16 vCPU, with 64 GiB;
+  # the database is an 8-vCPU Graviton instance with 400 GiB of gp3, the
+  # smallest gp3 size RDS gives 12,000 IOPS and 500 MiB/s (below 400 GiB it
+  # is 3,000 IOPS whatever the size). Staging keeps the small sizes.
+  sizing = {
+    staging = {
+      place_cpu                = 512
+      place_memory             = 1024
+      place_db_max_connections = 10
+      db_instance_class        = "db.t4g.micro"
+      db_allocated_storage     = 20
+      db_max_allocated_storage = 100
+    }
+    demo = {
+      place_cpu                = 16384
+      place_memory             = 65536
+      place_db_max_connections = 64
+      db_instance_class        = "db.m7g.2xlarge"
+      db_allocated_storage     = 400
+      db_max_allocated_storage = 1000
+    }
+  }
+
+  place_cpu                = coalesce(var.place_cpu, local.sizing[var.environment].place_cpu)
+  place_memory             = coalesce(var.place_memory, local.sizing[var.environment].place_memory)
+  place_db_max_connections = coalesce(var.place_db_max_connections, local.sizing[var.environment].place_db_max_connections)
+  db_instance_class        = coalesce(var.db_instance_class, local.sizing[var.environment].db_instance_class)
+  db_allocated_storage     = coalesce(var.db_allocated_storage, local.sizing[var.environment].db_allocated_storage)
+  db_max_allocated_storage = coalesce(var.db_max_allocated_storage, local.sizing[var.environment].db_max_allocated_storage)
+
   tags = {
     Project     = "aspen"
     Stack       = "public-demo"
@@ -89,9 +128,9 @@ locals {
   }, var.aspen_environment)
 }
 
-# The account stack's budget is the only thing watching spend (the module's
+# The account stack's budgets are the only thing watching spend (the module's
 # own budgets are off below). Refuse to plan an environment in an account
-# without it, or with a budget above the $300/month the account stack allows
+# without the monthly one, or with one above what the account stack allows
 # (../account-budget).
 module "account_budget" {
   source = "../account-budget"
@@ -124,6 +163,14 @@ module "aspen" {
   express_keys_version = var.express_keys_version
   ssh_host_key_version = var.ssh_host_key_version
 
+  db_instance_class        = local.db_instance_class
+  db_allocated_storage     = local.db_allocated_storage
+  db_max_allocated_storage = local.db_max_allocated_storage
+  # Changes here are made on purpose, by an operator who is applying now: a
+  # resize waiting days for the maintenance window would leave the demo
+  # undersized while the plan reads as applied. A class change restarts the
+  # single-AZ database (a few minutes without it for both services).
+  db_apply_immediately   = true
   db_deletion_protection = var.db_deletion_protection
   db_password_version    = var.db_password_version
   bucket_force_destroy   = var.bucket_force_destroy

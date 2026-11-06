@@ -15,7 +15,7 @@ use aspen_core::pack::{PackRecord, PushLimits};
 
 use crate::ingest::{CompleteOptions, IngestedPack, complete, object_id_of, receive};
 use crate::locate::{LocateOptions, PackRows, PrefetchError, StoredPacks, apply_delta};
-use crate::testutil::{MAX_OBJECT, Obj, Spec, build_pack, git_raw, scratch};
+use crate::testutil::{MAX_OBJECT, Obj, Spec, build_pack, git, git_raw, scratch};
 
 use super::ingest::history;
 use super::scan::ready;
@@ -42,6 +42,8 @@ struct Blobs {
     reads: AtomicUsize,
     /// Drop this many bytes from the end of every read (a short read).
     short_by: AtomicUsize,
+    /// While set, every read stays pending (a slow object store).
+    hold: std::sync::atomic::AtomicBool,
 }
 
 impl BlobStore for &Blobs {
@@ -53,6 +55,14 @@ impl BlobStore for &Blobs {
     }
 
     async fn read_range(&self, key: &BlobKey, range: ByteRange) -> Result<Vec<u8>, StoreError> {
+        std::future::poll_fn(|_| {
+            if self.hold.load(Ordering::Relaxed) {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
         self.reads.fetch_add(1, Ordering::Relaxed);
         let data = self.data.lock().unwrap();
         let blob = data.get(key).ok_or(StoreError::NotFound {
@@ -268,6 +278,42 @@ fn locate_probes_in_order_and_caches_idx_files() {
         reads,
         "warm lookups read nothing"
     );
+}
+
+#[test]
+fn a_remembered_idx_is_not_read_back() {
+    // Invariant: the `.idx` a writer remembers right after storing a pack
+    // serves the next lookup without a blob read; one that does not match
+    // its row is ignored, and the lookup reads the stored files.
+    let dir = scratch();
+    let src = history(dir.path(), 3);
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let setup = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let (p, _) = push(
+        &pack_objects(&src, "HEAD\n", false),
+        &[],
+        &setup,
+        dir.path(),
+        1,
+    );
+    let id = store(&p, 1, &rows, &blobs);
+    let record = rows.0.lock().unwrap()[&id].clone();
+    let idx = std::fs::read(&p.idx_path).unwrap();
+    let table = std::fs::read(&p.entries_path).unwrap();
+    let none = SortedIds::from_unsorted(vec![ObjectId::from_bytes([0xee; 20])]);
+    let fresh = || StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let reads = |s: &StoredPacks<&Rows, &Blobs>| {
+        let before = blobs.reads.load(Ordering::Relaxed);
+        ready(s.locate(&SearchPacks::new([id]), &none)).unwrap();
+        blobs.reads.load(Ordering::Relaxed) - before
+    };
+    let seeded = fresh();
+    assert!(seeded.remember_pack(record.clone(), idx.clone(), &table));
+    assert_eq!(reads(&seeded), 0, "the remembered .idx answers");
+    let wrong = fresh();
+    assert!(!wrong.remember_pack(record, idx[..idx.len() - 1].to_vec(), &table));
+    // A cold load reads the `.idx` and the entry table (its chain map).
+    assert_eq!(reads(&wrong), 2, "a short .idx is not cached");
 }
 
 #[test]
@@ -539,8 +585,9 @@ fn a_prefetch_over_its_budget_is_refused_before_allocating() {
 #[test]
 fn the_idx_cache_evicts_the_least_recently_used_pack() {
     // Invariant: the cache stays within idx_cache_bytes (counting the
-    // offsets it keeps per object) and evicts the pack used longest ago,
-    // so a pack probed on every push stays warm.
+    // offsets and chain map it keeps per object) and evicts the pack used
+    // longest ago, so a pack probed on every push stays warm. A load reads
+    // the `.idx` and the entry table.
     let dir = scratch();
     let src = history(dir.path(), 9);
     let (rows, blobs) = (Rows::default(), Blobs::default());
@@ -558,7 +605,7 @@ fn the_idx_cache_evicts_the_least_recently_used_pack() {
             dir.path(),
             n + 1,
         );
-        costs.push(p.idx_size + 8 * u64::from(p.object_count));
+        costs.push(p.idx_size + 12 * u64::from(p.object_count));
         ids.push(store(&p, n as i64 + 1, &rows, &blobs));
     }
     let [a, b, c] = [ids[0], ids[1], ids[2]];
@@ -577,12 +624,141 @@ fn the_idx_cache_evicts_the_least_recently_used_pack() {
         ready(cache.locate(&SearchPacks::new([p]), &none)).unwrap();
         blobs.reads.load(Ordering::Relaxed) - before
     };
-    assert_eq!(locate(a), 1);
-    assert_eq!(locate(b), 1);
+    assert_eq!(locate(a), 2);
+    assert_eq!(locate(b), 2);
     assert_eq!(locate(a), 0, "a is cached and now the most recently used");
-    assert_eq!(locate(c), 1, "loading c evicts b, the least recently used");
+    assert_eq!(locate(c), 2, "loading c evicts b, the least recently used");
     assert_eq!(locate(a), 0, "a survived the eviction");
-    assert_eq!(locate(b), 1, "b was evicted");
+    assert_eq!(locate(b), 2, "b was evicted");
+}
+
+/// Polls `f` once with a waker that does nothing.
+fn poll_once<F: std::future::Future + ?Sized>(
+    f: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    f.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+#[test]
+fn concurrent_misses_on_a_pack_share_one_load() {
+    // Invariant (monorepo benchmark, item 8): calls that miss the same
+    // `.idx` while it is being read wait for that read instead of reading
+    // it again; and a leader dropped mid-read (its request ended) hands
+    // the load to a waiter instead of leaving it waiting for ever.
+    let dir = scratch();
+    let src = history(dir.path(), 3);
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let setup = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let (p, _) = push(
+        &pack_objects(&src, "HEAD\n", false),
+        &[],
+        &setup,
+        dir.path(),
+        1,
+    );
+    let pack = store(&p, 1, &rows, &blobs);
+    let search = SearchPacks::new([pack]);
+    let none = SortedIds::from_unsorted(vec![ObjectId::from_bytes([0xee; 20])]);
+
+    // Two callers miss together; one read serves both.
+    let stored = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    blobs.hold.store(true, Ordering::Relaxed);
+    let mut a = Box::pin(stored.locate(&search, &none));
+    let mut b = Box::pin(stored.locate(&search, &none));
+    assert!(poll_once(a.as_mut()).is_pending(), "a leads the load");
+    assert!(poll_once(b.as_mut()).is_pending(), "b waits for it");
+    blobs.hold.store(false, Ordering::Relaxed);
+    assert!(poll_once(a.as_mut()).is_ready());
+    assert!(poll_once(b.as_mut()).is_ready());
+    let stats = stored.stats();
+    assert_eq!(stats.whole_idx_loads, 1, "one read for two misses");
+    assert_eq!(stats.idx_load_waits, 1);
+
+    // The leader is dropped mid-read: the waiter loads it itself.
+    let stored = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    blobs.hold.store(true, Ordering::Relaxed);
+    let mut a = Box::pin(stored.locate(&search, &none));
+    let mut b = Box::pin(stored.locate(&search, &none));
+    assert!(poll_once(a.as_mut()).is_pending());
+    assert!(poll_once(b.as_mut()).is_pending());
+    drop(a);
+    blobs.hold.store(false, Ordering::Relaxed);
+    match poll_once(b.as_mut()) {
+        std::task::Poll::Ready(found) => assert_eq!(found.unwrap(), vec![None]),
+        std::task::Poll::Pending => panic!("the waiter took over the abandoned load"),
+    }
+    assert_eq!(stored.stats().whole_idx_loads, 1);
+    // And it is cached: the next call reads nothing.
+    let before = blobs.reads.load(Ordering::Relaxed);
+    ready(stored.locate(&search, &none)).unwrap();
+    assert_eq!(blobs.reads.load(Ordering::Relaxed), before);
+}
+
+#[test]
+fn a_search_set_over_the_budget_is_part_sampled_and_never_reloaded() {
+    // Invariant (monorepo benchmark, item 8): when a search set's whole
+    // `.idx` files do not fit the cache, the packs probed first are kept
+    // whole while they fit and the rest are sampled, so the set stays
+    // cached: repeated lookups read no `.idx` again. Before, every pack was
+    // loaded whole, the set evicted itself, and every lookup reloaded it.
+    let dir = scratch();
+    let src = history(dir.path(), 60);
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let setup = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let mut ids = Vec::new();
+    let mut costs = Vec::new();
+    for (n, revs) in ["HEAD~40\n", "HEAD~20\n^HEAD~40\n", "HEAD\n^HEAD~20\n"]
+        .iter()
+        .enumerate()
+    {
+        let (p, _) = push(
+            &pack_objects(&src, revs, false),
+            &[],
+            &setup,
+            dir.path(),
+            n + 1,
+        );
+        costs.push(p.idx_size + 8 * u64::from(p.object_count));
+        ids.push(store(&p, n as i64 + 1, &rows, &blobs));
+    }
+    // Room for the first two whole, and for the third only sampled (a
+    // sample is about 1 KiB plus 20 bytes per 256 objects).
+    assert!(
+        costs[2] > 2048,
+        "the third pack's whole .idx outweighs a sample"
+    );
+    let stored = StoredPacks::new(
+        &rows,
+        &blobs,
+        LocateOptions {
+            idx_cache_bytes: costs[0] + costs[1] + costs[2] - 1,
+            ..LocateOptions::new(MAX_OBJECT)
+        },
+    );
+    let search = SearchPacks::new(ids.iter().copied());
+    let wanted = SortedIds::from_unsorted(
+        (0..60)
+            .map(|n| {
+                git(&src, &["rev-parse", &format!("HEAD~{n}")])
+                    .trim()
+                    .parse::<ObjectId>()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let first = ready(stored.locate(&search, &wanted)).unwrap();
+    assert!(first.iter().all(Option::is_some), "every commit is found");
+    let stats = stored.stats();
+    assert_eq!((stats.whole_idx_loads, stats.sampled_idx_loads), (2, 1));
+    for _ in 0..3 {
+        assert_eq!(ready(stored.locate(&search, &wanted)).unwrap(), first);
+    }
+    let again = stored.stats();
+    assert_eq!(
+        (again.whole_idx_loads, again.sampled_idx_loads),
+        (2, 1),
+        "nothing is loaded again"
+    );
 }
 
 #[test]
@@ -679,4 +855,250 @@ fn a_sampled_idx_answers_exactly_as_a_whole_one() {
         read <= 2 * (256 * 20 + 8),
         "a sampled lookup read {read} bytes of .idx"
     );
+}
+
+/// A blob store that counts round trips: a read started in one round
+/// completes only in the next, so [`Lockstep::run`] counts how many rounds
+/// of reads a call waits for in sequence, the latency it would pay on an
+/// object store, whatever the machine's speed.
+struct Lockstep<'a> {
+    inner: &'a Blobs,
+    round: AtomicUsize,
+}
+
+/// Pending until the round after the one it was first polled in.
+struct NextRound<'a> {
+    round: &'a AtomicUsize,
+    started: Option<usize>,
+}
+
+impl std::future::Future for NextRound<'_> {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let now = self.round.load(Ordering::Relaxed);
+        match self.started {
+            None => {
+                self.started = Some(now);
+                std::task::Poll::Pending
+            }
+            Some(s) if now > s => std::task::Poll::Ready(()),
+            Some(_) => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl BlobStore for &Lockstep<'_> {
+    async fn upload_file(&self, key: &BlobKey, path: &Path) -> Result<UploadReceipt, StoreError> {
+        self.inner.upload_file(key, path).await
+    }
+
+    async fn read_range(&self, key: &BlobKey, range: ByteRange) -> Result<Vec<u8>, StoreError> {
+        NextRound {
+            round: &self.round,
+            started: None,
+        }
+        .await;
+        self.inner.read_range(key, range).await
+    }
+
+    async fn size(&self, key: &BlobKey) -> Result<Option<u64>, StoreError> {
+        self.inner.size(key).await
+    }
+
+    async fn delete(&self, key: &BlobKey) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    async fn presign_get(&self, key: &BlobKey, ttl: Duration) -> Result<PresignedUrl, StoreError> {
+        self.inner.presign_get(key, ttl).await
+    }
+}
+
+impl Lockstep<'_> {
+    /// Runs `f` to completion; returns its output and the rounds of reads
+    /// it waited for.
+    fn run<F: std::future::Future>(&self, f: F) -> (F::Output, usize) {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut rounds = 0;
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return (v, rounds);
+            }
+            rounds += 1;
+            assert!(rounds < 10_000, "no progress");
+            self.round.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Stores a pack holding one chain of depth `depth` (each object a delta
+/// of the one before) and returns its row ID and the chain's objects.
+fn store_chain(
+    depth: usize,
+    id: i64,
+    rows: &Rows,
+    blobs: &Blobs,
+    dir: &Path,
+) -> (PackId, Vec<Obj>) {
+    let objs = big_chain(depth, 1 << 10);
+    let setup = StoredPacks::new(rows, blobs, LocateOptions::new(MAX_OBJECT));
+    let (p, _) = push(&build_pack(&chain_specs(&objs)), &[], &setup, dir, depth);
+    assert_eq!(p.max_delta_depth as usize, depth);
+    (store(&p, id, rows, blobs), objs)
+}
+
+#[test]
+fn prefetch_round_trips_do_not_grow_with_chain_depth() {
+    // Invariant (monorepo benchmark, item 11): prefetching the top of a
+    // delta chain costs the same round trips at depth 50, what `git gc` and
+    // compaction write, as at depth 1, whether the pack's `.idx` is kept
+    // whole (chain map in memory) or sampled (chain map on local disk).
+    // Warm, a whole pack reads the chain in one round; a sampled one looks
+    // the object up (one round) and then reads the chain (one more). Before
+    // chain maps a chain cost one round per level: 51 at depth 50, about
+    // 1 s on S3. A sampled pack without a chain directory still does.
+    let dir = scratch();
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let lock = Lockstep {
+        inner: &blobs,
+        round: AtomicUsize::new(0),
+    };
+    let chains = dir.path().join("chains");
+    let mut measured = Vec::new();
+    for depth in [1, 10, 50] {
+        let (id, objs) = store_chain(depth, depth as i64, &rows, &blobs, dir.path());
+        let search = SearchPacks::new([id]);
+        let top = objs[depth].id();
+        for mode in ["whole", "sampled", "sampled without a chain map"] {
+            let options = LocateOptions {
+                object_cache_bytes: 0,
+                max_whole_idx_bytes: if mode == "whole" { u64::MAX } else { 0 },
+                ..LocateOptions::new(MAX_OBJECT)
+            };
+            let mut stored = StoredPacks::new(&rows, &lock, options);
+            if mode == "sampled" {
+                stored = stored.with_chain_dir(&chains);
+            }
+            let (cold, cold_rounds) = lock.run(stored.prefetch_bases(&search, &candidates(&[top])));
+            let (warm, warm_rounds) = lock.run(stored.prefetch_bases(&search, &candidates(&[top])));
+            for (pre, _) in [cold.unwrap(), warm.unwrap()] {
+                let mut buf = Vec::new();
+                pre.bases.find_base(&top, &mut buf).unwrap().unwrap();
+                assert_eq!(buf, objs[depth].data);
+            }
+            eprintln!("depth {depth}, {mode}: {cold_rounds} rounds cold, {warm_rounds} warm");
+            measured.push((depth, mode, cold_rounds, warm_rounds));
+        }
+    }
+    for (depth, mode, cold, warm) in measured {
+        match mode {
+            "whole" => assert_eq!((cold, warm), (2, 1), "depth {depth}, {mode}"),
+            "sampled" => assert_eq!(warm, 2, "depth {depth}, {mode}"),
+            _ => assert_eq!(warm, depth + 2, "depth {depth}, {mode}"),
+        }
+    }
+    // Nothing is left on disk once the locators are gone.
+    assert_eq!(std::fs::read_dir(&chains).unwrap().count(), 0);
+}
+
+#[test]
+fn a_lookup_probes_every_sampled_pack_in_one_round_trip() {
+    // Invariant (item 11): a lookup in sampled packs costs one round trip
+    // however many of them the search holds (it cost two per pack, in
+    // turn), and the earliest pack in probe order still answers.
+    let dir = scratch();
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let lock = Lockstep {
+        inner: &blobs,
+        round: AtomicUsize::new(0),
+    };
+    let mut ids = Vec::new();
+    let mut tops = Vec::new();
+    for depth in [2, 3, 4, 5] {
+        let (id, objs) = store_chain(depth, depth as i64, &rows, &blobs, dir.path());
+        ids.push(id);
+        tops.push(objs[depth].id());
+    }
+    // The depth-2 pack again under another row, last in probe order: its
+    // objects are in the first and the last pack.
+    let (again_id, _) = store_chain(2, 99, &rows, &blobs, dir.path());
+    ids.push(again_id);
+    let sampled = StoredPacks::new(
+        &rows,
+        &lock,
+        LocateOptions {
+            max_whole_idx_bytes: 0,
+            ..LocateOptions::new(MAX_OBJECT)
+        },
+    );
+    let whole = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let search = SearchPacks::new(ids.iter().copied());
+    let mut want = tops.clone();
+    want.push(ObjectId::from_bytes([0x42; 20]));
+    let want = SortedIds::from_unsorted(want);
+    // Build the samples.
+    let (first, _) = lock.run(sampled.locate(&search, &want));
+    let (again, rounds) = lock.run(sampled.locate(&search, &want));
+    assert_eq!(first.unwrap(), ready(whole.locate(&search, &want)).unwrap());
+    let again = again.unwrap();
+    assert_eq!(again, ready(whole.locate(&search, &want)).unwrap());
+    assert_eq!(rounds, 1, "5 sampled packs, warm");
+    let at = want
+        .as_slice()
+        .iter()
+        .position(|id| *id == tops[0])
+        .unwrap();
+    assert_eq!(
+        again[at].map(|l| l.pack),
+        Some(ids[0]),
+        "the first pack answers"
+    );
+    // In the other probe order, the other copy answers.
+    let reversed = SearchPacks::new(ids.iter().rev().copied());
+    let (got, _) = lock.run(sampled.locate(&reversed, &want));
+    let got = got.unwrap();
+    assert_eq!(got[at].map(|l| l.pack), Some(again_id));
+    assert_eq!(got, ready(whole.locate(&reversed, &want)).unwrap());
+}
+
+#[test]
+fn a_damaged_entry_table_never_gives_a_wrong_base() {
+    // Invariant: a chain map only decides which entries are read up front;
+    // each entry read is resolved by its own header. An entry table that
+    // does not list the pack's entries (here, an entry's offset changed)
+    // is corruption beside a whole `.idx`, which it is checked against;
+    // beside a sampled one it can only cost reads, never a wrong object.
+    let dir = scratch();
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let (id, objs) = store_chain(3, 3, &rows, &blobs, dir.path());
+    let key = rows.0.lock().unwrap()[&id].keys().entries;
+    let record = aspen_core::pack::ENTRY_TABLE_HEADER_LEN + aspen_core::pack::ENTRY_RECORD_LEN;
+    blobs.data.lock().unwrap().get_mut(&key).unwrap()[record + 7] ^= 1;
+    let search = SearchPacks::new([id]);
+    let top = objs[3].id();
+    for max_whole_idx_bytes in [u64::MAX, 0] {
+        let stored = StoredPacks::new(
+            &rows,
+            &blobs,
+            LocateOptions {
+                max_whole_idx_bytes,
+                ..LocateOptions::new(MAX_OBJECT)
+            },
+        )
+        .with_chain_dir(dir.path().join("chains"));
+        match ready(stored.prefetch(&search, &candidates(&[top]))) {
+            Err(e) => assert!(e.is_corruption(), "{e}"),
+            Ok(pre) => {
+                assert_eq!(max_whole_idx_bytes, 0, "a whole .idx checks its table");
+                let mut buf = Vec::new();
+                pre.bases.find_base(&top, &mut buf).unwrap().unwrap();
+                assert_eq!(buf, objs[3].data);
+            }
+        }
+    }
 }

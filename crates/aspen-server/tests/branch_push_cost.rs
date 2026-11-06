@@ -54,14 +54,26 @@ async fn pushes_to_a_long_branch_do_not_walk_its_history() {
             assert_eq!(v.value.closure(), Some(Closure::Exact), "{branch} push {i}");
         }
         // Walking back to trunk on every push costs about one commit per
-        // commit of the branch (about 40 by now); without that, a push
-        // walks a few commits (more when equal commit times make the
-        // fast-forward check explore).
+        // commit of the branch (about 40 by now).
         let late: u64 = per_push[30..].iter().sum::<u64>() / 10;
         assert!(
             late <= 8,
             "{branch}: the 31st to 40th pushes walked {late} commits on average \
              (it grows with the branch when every push walks back to trunk): {per_push:?}"
+        );
+        // Without that walk, a fast-forward by one commit expands one
+        // commit per ancestry question (the commit check and the closure
+        // ask the same one), whatever the commit times. These pushes come
+        // several a second, so the old and new tips usually share a
+        // committer time; when ties were broken by object ID, a push could
+        // walk down every same-second commit of the branch (up to 70 on CI;
+        // the average check above failed about 1 run in 30, while every
+        // run had a push walking more than 4).
+        let worst = per_push.iter().max().copied().unwrap_or(0);
+        assert!(
+            worst <= 4,
+            "{branch}: a push walked {worst} commits; a fast-forward by one \
+             commit should expand about one per question: {per_push:?}"
         );
     }
     // Trunk moves: the branch's version depends on the old trunk version,

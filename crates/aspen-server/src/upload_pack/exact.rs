@@ -38,21 +38,39 @@
 //!
 //! # Building
 //!
-//! A missing pack is built in a task of its own: the full-closure plan of
-//! the want gives the source packs, the walk that writes `shallow-info`
-//! gives the region, and `aspen_compact::Compactor::build_shallow_pack`
-//! writes, verifies, registers, uploads and records the pack. The request
-//! that started the build, and every request for the same version and depth
-//! that arrives meanwhile, waits for it up to
-//! [`ShallowCacheConfig::build_wait`]; a fetch storm after a push builds the
-//! pack once and serves it to all. A request that stops waiting is served
-//! the full closure while the build goes on. At most
-//! [`ShallowCacheConfig::max_builds`] builds run at once per process; a
-//! request that finds none free is served the full closure. A build that
-//! fails or finds the closure over [`ShallowCacheConfig::max_source_bytes`]
-//! is not retried for [`ShallowCacheConfig::retry_after`]; one that finds
-//! the closure already exact is remembered for a day. Several servers may build the same
-//! pack at once; the bytes are the same and the first recording wins.
+//! A missing pack is built in a task of its own: the walk that writes
+//! `shallow-info` gives the region, and
+//! `aspen_compact::Compactor::build_shallow_pack` writes, verifies,
+//! registers, uploads and records the pack. Its sources are the version's
+//! layered answer (below) when it has one, else the packs of the version's
+//! full-closure plan. The request that started the build, and every
+//! request for the same version and depth that arrives meanwhile, waits
+//! for it; a fetch storm after a push builds the pack once and serves it to
+//! all. At most [`ShallowCacheConfig::max_builds`] builds run at once per
+//! process. A build that fails or finds the closure over
+//! [`ShallowCacheConfig::max_source_bytes`] is not retried for
+//! [`ShallowCacheConfig::retry_after`]; one that finds the closure already
+//! exact is remembered for a day. Several servers may build the same pack
+//! at once; the bytes are the same and the first recording wins.
+//!
+//! # Layered answers
+//!
+//! A build copies and verifies a whole snapshot, so on a large repository
+//! it takes longer than a fetch should wait (about 20 s for a 300,000-file
+//! trunk), and a busy trunk has a new tip on every landing. A request that
+//! has waited [`ShallowCacheConfig::layered_wait`] for a build, or that
+//! finds no build slot free or its version's last build failed, is
+//! therefore served the version's **layered answer** when it has one
+//! (`super::layered`; single-want requests only): the exact pack recorded
+//! for an earlier version of the same ref at the same depth, without that
+//! version's commits, plus a small patch pack of everything else the region
+//! needs. That is the region plus the earlier snapshot's replaced trees
+//! and blobs, never the full history;
+//! the build goes on for later fetches. A request without a layered answer
+//! waits up to [`ShallowCacheConfig::build_wait`] in all, and is served the
+//! full closure when the build does not end in time, no slot is free or the
+//! last build failed (a cold start: no version of the ref within reach has
+//! a recorded pack).
 //!
 //! # Bounds (issue #108)
 //!
@@ -80,17 +98,19 @@ use aspen_compact::{CompactConfig, CompactError, Compactor, ShallowBuild, Shallo
 use aspen_core::blob::BlobStore;
 use aspen_core::error::{FetchError, StoreError, ToWire};
 use aspen_core::fetch::{Deepen, FetchRequest, PlanMode};
-use aspen_core::id::{ObjectId, RefVersionId};
+use aspen_core::id::{ObjectId, PackId, RefVersionId, RepoId};
 use aspen_core::meta::{MetaStore, ShallowDepth};
+use aspen_core::name::RefName;
 use aspen_core::pack::PackRecord;
 use aspen_core::refs::RefVersion;
 use aspen_core::repo::Repo;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OnceCell, Semaphore, watch};
 
 use super::Failure;
-use super::fetch::plan_quietly;
+use super::fetch::{ShallowRows, plan_quietly};
 use super::graph::LoadedGraph;
+use super::layered::{self, Layered};
 use super::resolve::Want;
 use super::shallow;
 use crate::Server;
@@ -126,6 +146,14 @@ pub struct ShallowCacheConfig {
     pub max_inflated_bytes: MaxInflatedBytes,
     /// Longest delta chain an exact pack may hold (as for compaction packs).
     pub max_delta_depth: u32,
+    /// How long a request waits for a build before it is served the
+    /// version's layered answer, when it has one (module docs). At most
+    /// [`Self::build_wait`].
+    pub layered_wait: Duration,
+    /// The most bytes of objects a layered answer reads to check that it is
+    /// complete (per tree level), and the most its patch pack may hold;
+    /// over either there is no layered answer.
+    pub max_layered_bytes: u64,
     /// The most bytes (packs, `.idx` files and entry tables) one
     /// repository's recorded exact packs may take together. Recording a new
     /// pack evicts the repository's least recently used ones to stay
@@ -137,7 +165,8 @@ pub struct ShallowCacheConfig {
 
 impl ShallowCacheConfig {
     /// The defaults: depths up to 64, at most 8 wants, wait 20 s for a
-    /// build, 2 builds at once, 10 minutes before a failed build is tried
+    /// build (500 ms when a layered answer is ready, which may read and
+    /// patch up to 256 MiB), 2 builds at once, 10 minutes before a failed build is tried
     /// again, closures up to 4 GiB, 10 million objects, delta depth 50,
     /// 8 GiB of recorded packs per repository.
     pub fn new(spool_dir: impl Into<PathBuf>, max_inflated_bytes: MaxInflatedBytes) -> Self {
@@ -146,6 +175,8 @@ impl ShallowCacheConfig {
             max_depth: 64,
             max_wants: 8,
             build_wait: Duration::from_secs(20),
+            layered_wait: Duration::from_millis(500),
+            max_layered_bytes: 256 << 20,
             max_builds: 2,
             retry_after: Duration::from_secs(600),
             max_source_bytes: 4 << 30,
@@ -173,7 +204,32 @@ pub(crate) struct ShallowCache<M, B> {
     builds: Mutex<HashMap<Key, Build>>,
     /// When this process last updated each recording's last use.
     noted: Mutex<HashMap<Key, Instant>>,
+    /// Layered answers, computed once per version and depth at a time.
+    layered: Mutex<HashMap<Key, LayeredCell>>,
+    /// The newest version of each ref and depth this process saw recorded:
+    /// where a layered answer looks for its base first.
+    hints: Mutex<HashMap<HintKey, (u64, RefVersionId)>>,
+    /// The commits and tags of recorded packs used as a layered answer's
+    /// base (immutable, so remembered).
+    base_commits: Mutex<HashMap<PackId, Arc<Vec<ObjectId>>>>,
 }
+
+/// A layered answer being computed or computed (when the cell was made).
+type LayeredCell = (Instant, Arc<OnceCell<Option<Arc<Layered>>>>);
+
+/// A repository, ref and depth.
+type HintKey = (RepoId, RefName, ShallowDepth);
+
+/// How long a computed layered answer is reused. Well under the garbage
+/// collection grace period, which its patch pack's registration starts.
+const LAYERED_TTL: Duration = Duration::from_secs(60);
+
+/// How long a computation that found no layered answer is remembered.
+const NO_LAYERED_TTL: Duration = Duration::from_secs(5);
+
+/// Entries in [`ShallowCache::layered`] and [`ShallowCache::hints`] past
+/// which all are dropped, to bound memory.
+const LAYERED_PRUNE_AT: usize = 1024;
 
 impl<M, B> std::fmt::Debug for ShallowCache<M, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,6 +278,8 @@ enum Share {
     Pack(PackRecord, bool),
     /// Its full closure, which is exact.
     Closure,
+    /// Its layered answer.
+    Layered(Arc<Layered>),
 }
 
 impl<M, B> ShallowCache<M, B>
@@ -247,6 +305,61 @@ where
             config,
             builds: Mutex::new(HashMap::new()),
             noted: Mutex::new(HashMap::new()),
+            layered: Mutex::new(HashMap::new()),
+            hints: Mutex::new(HashMap::new()),
+            base_commits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The remembered commits and tags of `pack`, a layered answer's base.
+    pub(crate) fn base_commits(&self, pack: PackId) -> Option<Arc<Vec<ObjectId>>> {
+        self.base_commits
+            .lock()
+            .expect("base commits lock")
+            .get(&pack)
+            .cloned()
+    }
+
+    /// Remembers the commits and tags of `pack`.
+    pub(crate) fn note_base_commits(&self, pack: PackId, ids: Arc<Vec<ObjectId>>) {
+        let mut known = self.base_commits.lock().expect("base commits lock");
+        if known.len() >= LAYERED_PRUNE_AT {
+            known.clear();
+        }
+        known.insert(pack, ids);
+    }
+
+    pub(crate) fn config(&self) -> &ShallowCacheConfig {
+        &self.config
+    }
+
+    /// The newest recorded version this process knows of for `name` at
+    /// `depth`: its `seq` and ID.
+    pub(crate) fn hint(
+        &self,
+        repo: RepoId,
+        name: &RefName,
+        depth: ShallowDepth,
+    ) -> Option<(u64, RefVersionId)> {
+        self.hints
+            .lock()
+            .expect("hints lock")
+            .get(&(repo, name.clone(), depth))
+            .copied()
+    }
+
+    /// Notes that `version` has a recorded pack at `depth`.
+    pub(crate) fn note_recorded(&self, repo: RepoId, version: &RefVersion, depth: ShallowDepth) {
+        let mut hints = self.hints.lock().expect("hints lock");
+        if hints.len() >= LAYERED_PRUNE_AT {
+            hints.clear();
+        }
+        let seq = version.seq.get();
+        let slot = hints
+            .entry((repo, version.name.clone(), depth))
+            .or_insert((seq, version.id));
+        if slot.0 <= seq {
+            *slot = (seq, version.id);
         }
     }
 
@@ -290,7 +403,7 @@ pub(crate) async fn packs<M, B>(
     repo: &Repo,
     request: &FetchRequest,
     wants: &[Want],
-) -> Result<Option<Vec<PackRecord>>, Failure>
+) -> Result<Option<ShallowRows>, Failure>
 where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
@@ -301,6 +414,24 @@ where
     let Some(depth) = cache.depth(request, wants.len()) else {
         return Ok(None);
     };
+    let started = Instant::now();
+    let rows = choose(server, cache, repo, wants, depth).await;
+    server.metrics().shallow_wait(started.elapsed());
+    rows
+}
+
+/// [`packs`] for a request that can use exact packs at `depth`.
+async fn choose<M, B>(
+    server: &Server<M, B>,
+    cache: &ShallowCache<M, B>,
+    repo: &Repo,
+    wants: &[Want],
+    depth: ShallowDepth,
+) -> Result<Option<ShallowRows>, Failure>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
     let metrics = server.metrics();
     let mut versions = Vec::with_capacity(wants.len());
     for want in wants {
@@ -324,9 +455,14 @@ where
         versions.push(version);
     }
     let mut rows: Vec<PackRecord> = Vec::with_capacity(wants.len());
+    let mut leave_out = Vec::new();
     let mut how = Served::Recorded;
+    // A layered answer leaves its base's commits out of the pack; with
+    // several wants another want's pack could hold the same commit, so
+    // only a single want is served one.
+    let layered_ok = wants.len() == 1;
     for (want, version) in wants.iter().zip(versions) {
-        let share = match pack_for(server, cache, repo, want, version, depth).await? {
+        let share = match pack_for(server, cache, repo, want, version, depth, layered_ok).await? {
             Ok(share) => share,
             Err(why) => {
                 metrics.shallow_fallback(why);
@@ -346,6 +482,11 @@ where
                 }
                 closure(server, repo, want).await?
             }
+            Share::Layered(l) => {
+                how = Served::Layered;
+                leave_out.extend_from_slice(&l.leave_out);
+                l.rows.clone()
+            }
         };
         for row in add {
             if !rows.iter().any(|r| r.id == row.id) {
@@ -354,7 +495,7 @@ where
         }
     }
     metrics.shallow_served(how);
-    Ok(Some(rows))
+    Ok(Some(ShallowRows { rows, leave_out }))
 }
 
 /// The packs of one want's full closure, in plan order.
@@ -379,6 +520,77 @@ where
     Ok(rows)
 }
 
+/// The layered answer of `want` (the tip of `version`) at `depth`, computed
+/// once per version and depth for every request and build that asks while
+/// it is fresh (module docs). `None` when there is none; a failure to
+/// compute one is logged and is `None` too, since the request can still be
+/// served without it.
+async fn layered_answer<M, B>(
+    server: &Server<M, B>,
+    cache: &ShallowCache<M, B>,
+    repo: &Repo,
+    want: &Want,
+    version: &RefVersion,
+    depth: ShallowDepth,
+) -> Option<Arc<Layered>>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    let key = (version.id, depth);
+    let cell = {
+        let mut cells = cache.layered.lock().expect("layered lock");
+        let fresh = |(at, cell): &LayeredCell| match cell.get() {
+            None => true,
+            Some(Some(_)) => at.elapsed() < LAYERED_TTL,
+            Some(None) => at.elapsed() < NO_LAYERED_TTL,
+        };
+        match cells.get(&key) {
+            Some(entry) if fresh(entry) => Arc::clone(&entry.1),
+            _ => {
+                if cells.len() >= LAYERED_PRUNE_AT {
+                    cells.retain(|_, e| fresh(e));
+                }
+                let cell = Arc::new(OnceCell::new());
+                cells.insert(key, (Instant::now(), Arc::clone(&cell)));
+                cell
+            }
+        }
+    };
+    cell.get_or_init(|| async {
+        let started = Instant::now();
+        match layered::compute(server, cache, repo, want, version, depth).await {
+            Ok(Some(l)) => {
+                tracing::info!(
+                    repo = repo.name.as_str(),
+                    version = version.id.get(),
+                    depth = depth.get(),
+                    base = l.base.get(),
+                    increments = l.increments,
+                    patched = l.patched,
+                    ms = started.elapsed().as_millis() as u64,
+                    "layered shallow answer ready"
+                );
+                server.metrics().shallow_layered_patched(l.patched as u64);
+                Some(Arc::new(l))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    repo = repo.name.as_str(),
+                    version = version.id.get(),
+                    depth = depth.get(),
+                    error = %e.to_wire().message,
+                    "layered shallow answer failed"
+                );
+                None
+            }
+        }
+    })
+    .await
+    .clone()
+}
+
 /// What one want's version at `depth` contributes; or why the request
 /// falls back.
 async fn pack_for<M, B>(
@@ -388,6 +600,7 @@ async fn pack_for<M, B>(
     want: &Want,
     version: RefVersion,
     depth: ShallowDepth,
+    layered_ok: bool,
 ) -> Result<Result<Share, ShallowFallback>, Failure>
 where
     M: MetaStore + Clone + 'static,
@@ -399,6 +612,7 @@ where
         .await
         .map_err(FetchError::Store)?
     {
+        cache.note_recorded(repo.id, &version, depth);
         if cache.note_due((version.id, depth)) {
             // Off the fetch's path: a failure only leaves the last use a
             // little older, which the unused window allows for.
@@ -412,19 +626,34 @@ where
         return Ok(Ok(Share::Pack(row, false)));
     }
     let key = (version.id, depth);
-    let mut done = {
+    let layered = |why: ShallowFallback| {
+        let version = version.clone();
+        async move {
+            if !layered_ok {
+                return Ok::<_, Failure>(Err(why));
+            }
+            Ok(
+                match layered_answer(server, cache, repo, want, &version, depth).await {
+                    Some(l) => Ok(Share::Layered(l)),
+                    None => Err(why),
+                },
+            )
+        }
+    };
+    // Either a build to wait for, or why there is none.
+    let next: Result<watch::Receiver<Option<Delivered>>, ShallowFallback> = {
         let mut builds = cache.builds.lock().expect("builds lock");
         match builds.get(&key) {
-            Some(Build::Running(rx)) => rx.clone(),
+            Some(Build::Running(rx)) => Ok(rx.clone()),
             Some(Build::ClosureIsExact(at)) if at.elapsed() < CLOSURE_MEMORY => {
                 return Ok(Ok(Share::Closure));
             }
             Some(Build::Settled(at)) if at.elapsed() < cache.config.retry_after => {
-                return Ok(Err(ShallowFallback::RecentlyFailed));
+                Err(ShallowFallback::RecentlyFailed)
             }
-            _ => {
+            _ => 'start: {
                 let Ok(permit) = Arc::clone(&cache.permits).try_acquire_owned() else {
-                    return Ok(Err(ShallowFallback::NoBuildSlot));
+                    break 'start Err(ShallowFallback::NoBuildSlot);
                 };
                 let retry_after = cache.config.retry_after;
                 builds.retain(|_, b| match b {
@@ -434,7 +663,8 @@ where
                 });
                 let (tx, rx) = watch::channel(None);
                 builds.insert(key, Build::Running(rx.clone()));
-                let (server, repo, want) = (server.clone(), repo.clone(), want.clone());
+                let (server, repo, want, version) =
+                    (server.clone(), repo.clone(), want.clone(), version.clone());
                 tokio::spawn(async move {
                     let task = {
                         let server = server.clone();
@@ -464,18 +694,41 @@ where
                     }
                     let _ = tx.send(Some(delivered));
                 });
-                rx
+                Ok(rx)
             }
         }
     };
-    let waited =
-        tokio::time::timeout(cache.config.build_wait, done.wait_for(Option::is_some)).await;
+    let mut done = match next {
+        Ok(rx) => rx,
+        Err(why) => return layered(why).await,
+    };
+    let delivered = |result: &Option<Delivered>| match result.clone() {
+        Some(Delivered::Pack(row)) => Ok(Share::Pack(row, true)),
+        Some(Delivered::Closure) => Ok(Share::Closure),
+        _ => Err(ShallowFallback::BuildRecordedNothing),
+    };
+    // First the short wait, then the layered answer if there is one: a
+    // build that ends quickly gives the exact pack, a slow one keeps
+    // nobody waiting.
+    let first = if layered_ok {
+        cache.config.layered_wait.min(cache.config.build_wait)
+    } else {
+        cache.config.build_wait
+    };
+    match tokio::time::timeout(first, done.wait_for(Option::is_some)).await {
+        Ok(Ok(result)) => return Ok(delivered(&result)),
+        // The build task is gone without a result: treat as failed.
+        Ok(Err(_)) => return Ok(Err(ShallowFallback::BuildRecordedNothing)),
+        Err(_) => {}
+    }
+    if layered_ok && let Some(l) = layered_answer(server, cache, repo, want, &version, depth).await
+    {
+        return Ok(Ok(Share::Layered(l)));
+    }
+    let rest = cache.config.build_wait.saturating_sub(first);
+    let waited = tokio::time::timeout(rest, done.wait_for(Option::is_some)).await;
     match waited {
-        Ok(Ok(result)) => match result.clone() {
-            Some(Delivered::Pack(row)) => Ok(Ok(Share::Pack(row, true))),
-            Some(Delivered::Closure) => Ok(Ok(Share::Closure)),
-            _ => Ok(Err(ShallowFallback::BuildRecordedNothing)),
-        },
+        Ok(Ok(result)) => Ok(delivered(&result)),
         // The build task is gone without a result: treat as failed.
         Ok(Err(_)) => Ok(Err(ShallowFallback::BuildRecordedNothing)),
         Err(_) => Ok(Err(ShallowFallback::WaitTimedOut)),
@@ -507,6 +760,9 @@ where
     );
     match outcome {
         Ok(Some(ShallowBuild::Recorded { pack: row, evicted })) => {
+            if let Some(cache) = server.shallow_cache() {
+                cache.note_recorded(repo.id, version, depth);
+            }
             metrics.shallow_build(ShallowBuildResult::Recorded);
             metrics.shallow_build_time(took);
             metrics.shallow_limit_evictions(evicted);
@@ -644,26 +900,19 @@ where
         max_objects: cache.config.max_objects,
         max_repo_bytes: cache.config.max_repo_bytes,
     };
-    // First from the last recorded pack of this ref at this depth and the
-    // packs pushed since: a few small downloads, and no full-closure plan
-    // (which loads every version of the closure: seconds on a ref with
-    // thousands of versions), so a busy branch's tip gets its pack in about
-    // the time of one push. The region walk reads `commit_index`, and only
-    // unindexed commits from these sources. When the walk or the build
-    // needs an object these sources lack (a tree that brings back an
-    // object from deeper history, say), or the build ends any other way,
-    // build from the full closure as before.
-    if let Some(sources) = incremental_sources(server, repo, version, depth).await? {
-        let attempt = match region(server, repo, want, depth, sources.clone()).await {
-            Ok(Some(region)) => cache
-                .compactor
-                .build_shallow_pack(&spec(region, sources, false))
-                .await
-                .map_err(|e| e.to_string()),
-            Ok(None) => return Ok(None),
-            Err(_) => Err("the region walk needs a commit the sources lack".to_owned()),
-        };
-        match attempt {
+    // First from the version's layered answer: the patch pack and the last
+    // recorded pack of this ref at this depth. One small download besides
+    // the base, and no
+    // full-closure plan (which loads every version of the closure: seconds
+    // on a ref with thousands of versions). When there is none (a cold
+    // start), or the build ends any other way, build from the full closure.
+    if let Some(l) = layered_answer(server, cache, repo, want, version, depth).await {
+        let sources = l.rows.iter().map(|r| r.id).collect();
+        match cache
+            .compactor
+            .build_shallow_pack(&spec(l.region.clone(), sources, false))
+            .await
+        {
             Ok(built @ ShallowBuild::Recorded { .. }) => {
                 server.metrics().shallow_build_incremental();
                 return Ok(Some(built));
@@ -674,7 +923,7 @@ where
                 outcome = ?other,
                 "incremental exact shallow pack not recorded; building from the full closure"
             ),
-            Err(e) => tracing::debug!(
+            Err(e) => tracing::warn!(
                 version = version.id.get(),
                 depth = depth.get(),
                 error = %e,
@@ -708,13 +957,13 @@ where
 /// a `deepen <depth>` request for this want, so the pack ends exactly at
 /// the boundary that request is told. `None` when the want peels to a tree
 /// or blob.
-async fn region<M, B>(
+pub(crate) async fn region<M, B>(
     server: &Server<M, B>,
     repo: &Repo,
     want: &Want,
     depth: ShallowDepth,
     sources: Vec<aspen_core::id::PackId>,
-) -> Result<Option<Vec<ObjectId>>, BuildError>
+) -> Result<Option<Vec<ObjectId>>, Failure>
 where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
@@ -738,51 +987,4 @@ where
         .collect();
     region.sort_unstable();
     Ok(Some(region))
-}
-
-/// How far back along a ref's versions an incremental build looks for a
-/// recorded pack at the same depth.
-const INCREMENTAL_VERSIONS: usize = 64;
-
-/// The sources of an incremental build of `version`'s pack at `depth`: the
-/// pack recorded for the nearest earlier version of the same ref at that
-/// depth, then the packs of the versions after it, oldest first. `None`
-/// when no version within [`INCREMENTAL_VERSIONS`] has one.
-async fn incremental_sources<M, B>(
-    server: &Server<M, B>,
-    repo: &Repo,
-    version: &RefVersion,
-    depth: ShallowDepth,
-) -> Result<Option<Vec<aspen_core::id::PackId>>, FetchError>
-where
-    M: MetaStore + Clone + 'static,
-    B: BlobStore + Clone + 'static,
-{
-    let meta = server.meta();
-    let mut pushed = Vec::new();
-    let mut at = version.clone();
-    for _ in 0..INCREMENTAL_VERSIONS {
-        pushed.extend(at.value.pack());
-        let Some(parent) = at.parent else {
-            return Ok(None);
-        };
-        if let Some(row) = meta
-            .shallow_pack(repo.id, parent, depth)
-            .await
-            .map_err(FetchError::Store)?
-        {
-            let mut sources = vec![row.id];
-            for id in pushed.into_iter().rev() {
-                if !sources.contains(&id) {
-                    sources.push(id);
-                }
-            }
-            return Ok(Some(sources));
-        }
-        match meta.ref_version(parent).await.map_err(FetchError::Store)? {
-            Some(v) => at = v,
-            None => return Ok(None),
-        }
-    }
-    Ok(None)
 }

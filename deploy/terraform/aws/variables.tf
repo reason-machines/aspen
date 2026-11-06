@@ -319,6 +319,12 @@ variable "db_password_version" {
   default     = 1
 }
 
+variable "db_apply_immediately" {
+  description = "Apply database changes (instance class, storage) as soon as Terraform applies them, rather than in the next maintenance window. A class change restarts a single-AZ instance, a few minutes without a database."
+  type        = bool
+  default     = false
+}
+
 variable "db_deletion_protection" {
   description = "Protect the database from deletion. Turn off (and apply) before `terraform destroy`."
   type        = bool

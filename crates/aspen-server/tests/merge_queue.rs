@@ -465,21 +465,21 @@ async fn outcomes_older_than_the_ttl_are_deleted() {
     seeded(&s, "seed").await;
     const TTL: std::time::Duration = std::time::Duration::from_secs(2);
     // Outcomes are written by a queue that keeps them, and expired by one
-    // with a TTL, so a slow machine cannot expire them early.
-    let keep = MergeQueue::new(
-        s.svc.clone(),
-        QueueConfig {
-            outcome_ttl: None,
-            ..QueueConfig::default()
-        },
-    );
+    // with a TTL, so a slow machine cannot expire them early. Both are the
+    // same worker (one lease owner), configured two ways.
+    let keep_config = QueueConfig {
+        outcome_ttl: None,
+        ..QueueConfig::default()
+    };
     let expiring = MergeQueue::new(
         s.svc.clone(),
         QueueConfig {
             outcome_ttl: Some(TTL),
+            owner: keep_config.owner.clone(),
             ..QueueConfig::default()
         },
     );
+    let keep = MergeQueue::new(s.svc.clone(), keep_config);
     let enqueue = |name: &'static str, file: &'static str| {
         let s = &s;
         async move {
@@ -533,4 +533,137 @@ async fn outcomes_older_than_the_ttl_are_deleted() {
     tokio::time::sleep(TTL + std::time::Duration::from_millis(100)).await;
     assert_eq!(keep.run_once().await.unwrap().expired, 0);
     assert_eq!(ls_remote(&main, &s.url(), "refs/queue-done/main/").len(), 1);
+}
+
+/// Invariant: one worker at a time builds a repository's batches (the
+/// per-repository merger lease). Two workers started together on a
+/// backlog: exactly one builds, and every entry lands once. A worker whose
+/// holder died takes the lease over once it lapses, and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_worker_builds_at_a_time_and_a_dead_holders_lease_is_taken_over() {
+    let s = start().await;
+    seeded(&s, "seed").await;
+    for i in 0..8 {
+        let w = client(&s, &format!("c{i}")).await;
+        w.commit(&format!("lease{i}.txt"), "x\n", &format!("change {i}"));
+        let (ok, out) = push(&w, &s.url(), &[&format!("HEAD:refs/queue/main/c{i}")]).await;
+        assert!(ok, "{out}");
+    }
+    let ttl = std::time::Duration::from_secs(1);
+    let make = || {
+        MergeQueue::new(
+            s.svc.clone(),
+            QueueConfig {
+                lease_ttl: ttl,
+                ..QueueConfig::default()
+            },
+        )
+    };
+    let (a, b) = (make(), make());
+    let (ra, rb) = tokio::join!(a.run_once(), b.run_once());
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(ra.merged + rb.merged, 8, "{ra:?} {rb:?}");
+    assert!(
+        ra.batches == 0 || rb.batches == 0,
+        "both workers built batches: {ra:?} {rb:?}"
+    );
+    let (holder, other) = if ra.batches > 0 { (a, b) } else { (b, a) };
+    // The holder "dies" (stops renewing) with its lease live.
+    drop(holder);
+    let w = client(&s, "late").await;
+    w.commit("late.txt", "late\n", "late");
+    assert!(push(&w, &s.url(), &["HEAD:refs/queue/main/late"]).await.0);
+    let r = other.run_once().await.unwrap();
+    assert_eq!(r.merged, 0, "the lease is still live: {r:?}");
+    assert_eq!(ls_remote(&w, &s.url(), "refs/queue/main/").len(), 1);
+    tokio::time::sleep(ttl + std::time::Duration::from_millis(200)).await;
+    let r = other.run_once().await.unwrap();
+    assert_eq!(r.merged, 1, "taken over after it lapsed: {r:?}");
+    checked_clone(&s, "full").await;
+}
+
+/// `git push -o land` of a branch also queues it, as a push to
+/// `refs/queue/main/<branch>` would: the branch moves, the change lands
+/// on `main`, and the outcome is `refs/queue-done/main/<branch>`. With the
+/// queue off the option is refused, not ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_option_land_queues_the_branch() {
+    let s = start().await;
+    seeded(&s, "seed").await;
+    let w = client(&s, "agent").await;
+    let tip = w.commit("feature/file.txt", "feature\n", "a feature");
+    let (ok, out) = push(&w, &s.url(), &["-o", "land", "HEAD:refs/heads/feature"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        ls_remote(&w, &s.url(), "refs/heads/feature")
+            .first()
+            .map(|(_, o)| o.clone()),
+        Some(tip.clone()),
+        "the branch itself is pushed"
+    );
+    assert_eq!(ls_remote(&w, &s.url(), "refs/queue/main/feature").len(), 1);
+    let r = queue(&s).run_once().await.unwrap();
+    assert_eq!(r.merged, 1, "{r:?}");
+    let done = ls_remote(&w, &s.url(), "refs/queue-done/main/feature");
+    assert_eq!(done.len(), 1);
+    let full = checked_clone(&s, "full").await;
+    assert_eq!(
+        full.git(&["show", "origin/main:feature/file.txt"]),
+        "feature\n"
+    );
+    assert_eq!(full.rev("origin/main"), done[0].1);
+
+    let off = Server::start().await;
+    let w = off.clone_dir("w");
+    w.commit("a.txt", "a\n", "a");
+    let (ok, out) = push(&w, &off.url(), &["-o", "land", "HEAD:refs/heads/b"]).await;
+    assert!(!ok, "{out}");
+    assert!(out.contains("needs the merge queue"), "{out}");
+}
+
+/// A batch that is not full waits for the batch interval after its oldest
+/// entry was queued, so changes queued close together land together; a
+/// full batch does not wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_waits_for_the_interval_unless_it_is_full() {
+    let s = start().await;
+    seeded(&s, "seed").await;
+    // Long enough for the second client to clone and push on a busy machine.
+    let interval = std::time::Duration::from_secs(4);
+    let w = client(&s, "one").await;
+    w.commit("one.txt", "1\n", "one");
+    assert!(push(&w, &s.url(), &["HEAD:refs/queue/main/one"]).await.0);
+    let waiting_config = QueueConfig {
+        interval,
+        ..QueueConfig::default()
+    };
+    let owner = waiting_config.owner.clone();
+    let waiting = MergeQueue::new(s.svc.clone(), waiting_config);
+    // A second change queued while the first waits lands in the same batch.
+    let late = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let w = client(&s, "two").await;
+        w.commit("two.txt", "2\n", "two");
+        assert!(push(&w, &s.url(), &["HEAD:refs/queue/main/two"]).await.0);
+    };
+    let (r, ()) = tokio::join!(waiting.run_once(), late);
+    let r = r.unwrap();
+    assert_eq!((r.batches, r.merged), (1, 2), "one batch for both: {r:?}");
+    // A full batch (batch = 1) goes at once.
+    let w = client(&s, "three").await;
+    w.commit("three.txt", "3\n", "three");
+    assert!(push(&w, &s.url(), &["HEAD:refs/queue/main/three"]).await.0);
+    let full = MergeQueue::new(
+        s.svc.clone(),
+        QueueConfig {
+            interval: std::time::Duration::from_secs(30),
+            batch: 1,
+            owner,
+            ..QueueConfig::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    let r = full.run_once().await.unwrap();
+    assert_eq!(r.merged, 1, "{r:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

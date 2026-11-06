@@ -44,6 +44,16 @@ resource "aws_db_parameter_group" "this" {
   }
 }
 
+# RDS PostgreSQL on gp3: below 400 GiB the volume has a fixed 3,000 IOPS and
+# 125 MiB/s, and RDS refuses either setting; from 400 GiB its baseline is
+# 12,000 IOPS and 500 MiB/s. Name that baseline from 400 GiB on: growing an
+# existing database across 400 GiB otherwise fails, because the AWS provider
+# sends the old 3,000 IOPS along with the new size and RDS refuses it
+# ("Invalid iops value for engine name postgres and storage type gp3: 3000").
+locals {
+  db_gp3_baseline = var.db_allocated_storage >= 400 ? { iops = 12000, throughput = 500 } : null
+}
+
 resource "aws_db_instance" "this" {
   identifier_prefix = "${var.name}-"
 
@@ -61,6 +71,8 @@ resource "aws_db_instance" "this" {
   storage_type          = "gp3"
   allocated_storage     = var.db_allocated_storage
   max_allocated_storage = var.db_max_allocated_storage
+  iops                  = try(local.db_gp3_baseline.iops, null)
+  storage_throughput    = try(local.db_gp3_baseline.throughput, null)
   storage_encrypted     = true
 
   multi_az               = var.db_multi_az
@@ -75,5 +87,5 @@ resource "aws_db_instance" "this" {
   final_snapshot_identifier = "${var.name}-final"
 
   performance_insights_enabled = false
-  apply_immediately            = false
+  apply_immediately            = var.db_apply_immediately
 }

@@ -1,4 +1,8 @@
-//! API tokens in the metadata database (`tokens`, migration 0002).
+//! API tokens in the metadata database (`tokens`, migration 0002), and
+//! [`CachedTokens`], which keeps the rows requests read for a short TTL.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use aspen_auth::token::{IssueError, issue};
 use aspen_auth::{
@@ -8,6 +12,8 @@ use aspen_auth::{
 use aspen_core::error::StoreError;
 use aspen_core::id::UnixMicros;
 use aspen_meta::{SqlStore, TokenRow};
+
+use super::cache::TtlCache;
 
 /// A [`TokenStore`] on the metadata database.
 #[derive(Debug, Clone)]
@@ -51,6 +57,71 @@ impl TokenStore for SqlTokens {
             .await
             .map_err(|e| TokenStoreError(e.to_string()))?;
         row.map(from_row).transpose()
+    }
+}
+
+/// A [`TokenStore`] that keeps each token row it reads for `ttl`
+/// ([`super::cache`]), so a caller's requests within one TTL cost one
+/// lookup between them. Clones share the cache.
+///
+/// What the cache may hold back is bounded by the TTL: a token revoked
+/// elsewhere (another instance, `aspen token revoke`) is refused here
+/// within `ttl` of its revocation; one revoked through
+/// [`CachedTokens::revoke`] (or followed by [`CachedTokens::forget`]) on
+/// this instance at once. Expiry needs no lookup: the cached record carries
+/// `expires_at`, and [`aspen_auth::AuthService`] checks liveness against the
+/// clock on every request. Unknown token IDs are not remembered, so a token
+/// created elsewhere works on its first request.
+#[derive(Debug, Clone)]
+pub struct CachedTokens<T> {
+    inner: T,
+    rows: Arc<TtlCache<TokenId, TokenRecord>>,
+}
+
+impl<T> CachedTokens<T> {
+    /// `inner`, with rows kept for `ttl` (zero keeps nothing).
+    pub fn new(inner: T, ttl: Duration) -> Self {
+        Self {
+            inner,
+            rows: Arc::new(TtlCache::new(ttl, super::cache::CAPACITY)),
+        }
+    }
+
+    /// The store behind the cache.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Drops this instance's copy of token `id`: its next request reads
+    /// the store. Call it after changing the token through any other path.
+    pub fn forget(&self, id: &TokenId) {
+        self.rows.remove(id);
+    }
+}
+
+impl CachedTokens<SqlTokens> {
+    /// Revokes a token ([`SqlTokens::revoke`]) and drops this instance's
+    /// copy, so it is refused here from the next request.
+    pub async fn revoke(&self, id: &TokenId, now: UnixMicros) -> Result<bool, StoreError> {
+        let revoked = self.inner.revoke(id, now).await;
+        // Even when the store reports a failure: the update may have
+        // landed, and a lookup is cheaper than a stale grant.
+        self.forget(id);
+        revoked
+    }
+}
+
+impl<T: TokenStore> TokenStore for CachedTokens<T> {
+    async fn token(&self, id: &TokenId) -> Result<Option<TokenRecord>, TokenStoreError> {
+        if let Some(record) = self.rows.get(id) {
+            return Ok(Some(record));
+        }
+        let ticket = self.rows.ticket();
+        let record = self.inner.token(id).await?;
+        if let Some(record) = &record {
+            self.rows.insert(*id, record.clone(), ticket);
+        }
+        Ok(record)
     }
 }
 

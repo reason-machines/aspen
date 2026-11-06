@@ -9,11 +9,23 @@
 //! flags that reached `a` would be both above and below `a`. Committer time
 //! only orders the walk; a skewed clock costs visits, never correctness.
 //!
+//! Among commits with equal committer times (common: an agent commits and
+//! pushes several times a second), commits with both flags go first, then
+//! the rest first in, first out, `b` before `a`. First in, first out moves
+//! both sides one generation at a time, so a walk costs about the distance
+//! between the two commits: a fast-forward by one commit expands one. Both
+//! flags first lets the paint that ends the walk catch up with `b`'s side
+//! when `a` is the newer commit, which in a first-in-first-out queue stays
+//! one generation behind it down to the root. Ties used to be broken by
+//! object ID, and then the old tip's side of a fast-forward check walked
+//! down every same-second ancestor whose ID sorted above the new tip's.
+//!
 //! A commit the walk cannot resolve (no `commit_index` row, and not in any
 //! pack it may read) makes the answer [`Ancestry::Undecided`], as does a
 //! walk past its visit budget. The commit check turns that into a
 //! retryable `ng`, never a guessed verdict (decisions log, S5 review).
 
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 
@@ -53,6 +65,27 @@ pub(crate) trait CommitSource: Send + Sync {
 
 const FROM_A: u8 = 1;
 const FROM_B: u8 = 2;
+const BOTH: u8 = FROM_A | FROM_B;
+
+/// The walk's queue: newest committer time first; among equal times,
+/// commits with both flags first, then first in, first out.
+#[derive(Default)]
+struct Queue {
+    heap: BinaryHeap<(i64, bool, Reverse<u64>, ObjectId)>,
+    pushed: u64,
+}
+
+impl Queue {
+    fn push(&mut self, time: i64, flags: u8, id: ObjectId) {
+        self.heap
+            .push((time, flags == BOTH, Reverse(self.pushed), id));
+        self.pushed += 1;
+    }
+
+    fn pop(&mut self) -> Option<ObjectId> {
+        self.heap.pop().map(|(_, _, _, id)| id)
+    }
+}
 
 /// An ancestry walker with a cache of the commits it has seen, shared by
 /// every question of one push.
@@ -139,17 +172,22 @@ impl Walker {
         // Each commit is queued at most once; one whose flags grow after it
         // was expanded is queued again. `b_only` counts queued commits whose
         // flags are exactly FROM_B: the walk ends when it reaches zero.
-        let mut heap: BinaryHeap<(i64, ObjectId)> = BinaryHeap::new();
+        // Newest first; among equal times, both flags first, then first
+        // queued first. A queued commit that gets both flags is pushed again
+        // with the higher rank, and its older entry is skipped when popped.
+        let mut heap = Queue::default();
         let mut queued: HashSet<ObjectId> = HashSet::new();
         let mut b_only = 1usize;
-        for id in [a, b] {
-            heap.push((time(self, &id).expect("a commit"), id));
+        for (id, f) in [(b, FROM_B), (a, FROM_A)] {
+            heap.push(time(self, &id).expect("a commit"), f, id);
             queued.insert(id);
         }
         let mut expanded = 0usize;
         while b_only > 0 {
-            let Some((_, c)) = heap.pop() else { break };
-            queued.remove(&c);
+            let Some(c) = heap.pop() else { break };
+            if !queued.remove(&c) {
+                continue;
+            }
             let f = flags[&c];
             if f == FROM_B {
                 b_only -= 1;
@@ -192,9 +230,12 @@ impl Walker {
                     if old == FROM_B && new != FROM_B {
                         b_only -= 1;
                     }
+                    if new == BOTH {
+                        heap.push(t, new, p);
+                    }
                 } else {
                     queued.insert(p);
-                    heap.push((t, p));
+                    heap.push(t, new, p);
                     if new == FROM_B {
                         b_only += 1;
                     }
@@ -347,6 +388,111 @@ mod tests {
         let looked_up = mem.1.load(std::sync::atomic::Ordering::Relaxed);
         assert!(looked_up < 50, "looked up {looked_up} commits");
         assert_eq!(ask(&mem, 990, 2002), Ancestry::Descendant);
+    }
+
+    /// Expansions of one fresh walk of "is `a` an ancestor of `b`".
+    fn cost(mem: &Mem, a: u32, b: u32) -> (Ancestry, u64) {
+        let mut w = Walker::new(10_000);
+        let got = futures_util::FutureExt::now_or_never(w.is_ancestor(mem, oid(a), oid(b)))
+            .expect("in-memory source is ready")
+            .unwrap();
+        (got, w.expanded())
+    }
+
+    /// Commit `k`'s label in [`Mem`]: object IDs are hashes, so their order
+    /// says nothing about the history's.
+    fn scrambled(k: u32) -> u32 {
+        k.wrapping_mul(0x9E37_79B1)
+    }
+
+    /// Invariant: with equal committer times (an agent commits and pushes
+    /// several times a second), what a walk costs follows the distance
+    /// between the commits, not their object IDs. Ties used to fall back
+    /// to the ID, so the old tip's side of a fast-forward check went down
+    /// every same-second ancestor whose ID was larger than the new tip's
+    /// (`branch_push_cost.rs` failed intermittently on that).
+    #[test]
+    fn equal_commit_times_cost_the_distance_not_the_history() {
+        let s = scrambled;
+        let mut edges: Vec<(u32, Vec<u32>, i64)> = (1..=300)
+            .map(|c| (s(c), if c == 1 { vec![] } else { vec![s(c - 1)] }, 1_000))
+            .collect();
+        let mem = |edges: &[(u32, Vec<u32>, i64)]| {
+            let refs: Vec<(u32, &[u32], i64)> = edges
+                .iter()
+                .map(|(c, ps, t)| (*c, ps.as_slice(), *t))
+                .collect();
+            Mem::new(&refs)
+        };
+        let linear = mem(&edges);
+        for b in 2..=300 {
+            // A fast-forward by one commit, the push path's common case.
+            assert_eq!(
+                cost(&linear, s(b - 1), s(b)),
+                (Ancestry::Descendant, 1),
+                "b={b}"
+            );
+            for d in [2, 5, 20] {
+                if b > d {
+                    let (got, n) = cost(&linear, s(b - d), s(b));
+                    assert_eq!(got, Ancestry::Descendant);
+                    assert!(n <= 2 * u64::from(d), "{d} back from {b}: {n} expansions");
+                }
+            }
+            // The reverse question stops near the two commits too.
+            let (got, n) = cost(&linear, s(b), s(b - 1));
+            assert_eq!(got, Ancestry::NotDescendant);
+            assert!(n <= 4, "{b} above {}: {n} expansions", b - 1);
+        }
+        // Two forks off a shared same-second history stop near their merge
+        // base, not at the root.
+        edges.push((s(1001), vec![s(300)], 1_000));
+        edges.push((s(1002), vec![s(1001)], 1_000));
+        edges.push((s(2001), vec![s(300)], 1_000));
+        let forks = mem(&edges);
+        for (a, b) in [(2001, 1002), (1002, 2001), (1001, 2001)] {
+            let (got, n) = cost(&forks, s(a), s(b));
+            assert_eq!(got, Ancestry::NotDescendant);
+            assert!(n <= 12, "{a} and {b}: {n} expansions");
+        }
+    }
+
+    /// Invariant: exact on random DAGs where most commits share a few
+    /// committer times, so the tie order decides the walk.
+    #[test]
+    fn answers_match_reachability_when_times_tie() {
+        let mut rng = aspen_testkit::rng::Rng::new(0x71E5);
+        for _ in 0..40 {
+            let n = 2 + rng.below(30) as u32;
+            let mut edges: Vec<(u32, Vec<u32>, i64)> = Vec::new();
+            for c in 1..=n {
+                let mut ps = Vec::new();
+                if c > 1 {
+                    for _ in 0..(1 + rng.below(2)) {
+                        if rng.below(8) != 0 {
+                            ps.push(1 + rng.below(c as usize - 1) as u32);
+                        }
+                    }
+                }
+                ps.dedup();
+                edges.push((c, ps, rng.below(3) as i64));
+            }
+            let refs: Vec<(u32, &[u32], i64)> = edges
+                .iter()
+                .map(|(c, ps, t)| (*c, ps.as_slice(), *t))
+                .collect();
+            let mem = Mem::new(&refs);
+            for a in 1..=n {
+                for b in 1..=n {
+                    let want = if reaches(&mem, b, a) {
+                        Ancestry::Descendant
+                    } else {
+                        Ancestry::NotDescendant
+                    };
+                    assert_eq!(ask(&mem, a, b), want, "a={a} b={b} edges={edges:?}");
+                }
+            }
+        }
     }
 
     #[test]

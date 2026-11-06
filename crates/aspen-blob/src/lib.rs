@@ -21,6 +21,7 @@
 //! idempotent and write-once uploads, multipart uploads, and presigned
 //! URLs. The S3 backend runs it against a real MinIO server.
 
+mod dns;
 mod local;
 mod object;
 
@@ -131,7 +132,9 @@ pub fn open(url: &str) -> Result<AnyBlobStore, OpenError> {
                     "credentials do not belong in the URL; use AWS_* variables",
                 ));
             }
-            let builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let builder = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .with_client_options(client_options_from_env());
             let store = ObjectBlobStore::s3(builder, UploadOptions::default())?;
             let prefix = parsed.path().trim_matches('/');
             Ok(AnyBlobStore::Object(if prefix.is_empty() {
@@ -142,6 +145,30 @@ pub fn open(url: &str) -> Result<AnyBlobStore, OpenError> {
         }
         other => Err(OpenError::UnsupportedScheme(other.to_owned())),
     }
+}
+
+/// The HTTP client options `AmazonS3Builder::from_env` would read from the
+/// `AWS_*` environment (`AWS_ALLOW_HTTP`, timeouts, proxies, ...), plus the
+/// in-process DNS cache ([`dns::CachingResolver`]). Setting client options on
+/// the builder replaces the ones `from_env` read, so they are read again
+/// here.
+fn client_options_from_env() -> object_store::ClientOptions {
+    let mut options = object_store::ClientOptions::new();
+    for (key, value) in std::env::vars_os() {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        let Some(name) = key.strip_prefix("AWS_") else {
+            continue;
+        };
+        if let Ok(k) = name
+            .to_ascii_lowercase()
+            .parse::<object_store::ClientConfigKey>()
+        {
+            options = options.with_config(k, value);
+        }
+    }
+    options.with_dns_resolver(std::sync::Arc::new(dns::CachingResolver::default()))
 }
 
 impl BlobStore for AnyBlobStore {

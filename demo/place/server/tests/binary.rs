@@ -338,3 +338,29 @@ fn an_empty_trusted_proxy_list_is_unset() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("PLACE_TRUSTED_PROXIES"));
 }
+
+/// A pool size that is not a positive number refuses the start and names
+/// the variable, before the server listens.
+#[test]
+fn a_bad_pool_size_refuses_the_start() {
+    let data = tempfile::tempdir().unwrap();
+    let child = start(
+        data.path(),
+        free_port(),
+        &[("PLACE_DB_MAX_CONNECTIONS", "0")],
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PLACE_DB_MAX_CONNECTIONS"));
+}
+
+/// A valid pool size starts the server as usual.
+#[test]
+fn a_pool_size_starts_the_server() {
+    let data = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = start(data.path(), port, &[("PLACE_DB_MAX_CONNECTIONS", "64")]);
+    wait_ready(&mut child, port);
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+}

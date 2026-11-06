@@ -2,9 +2,10 @@
 # The canvas mirror sidecar (place.tf): at start and then every
 # MIRROR_INTERVAL seconds (15 minutes by default), fetch the canvas's main
 # from aspen-place in the same task and, when it moved, push it to the
-# GitHub repository MIRROR_REPO: one fast-forward push per run. The push is never forced: a main that
-# does not fast-forward is refused by GitHub and logged, and the mirror
-# waits for an operator.
+# GitHub repository MIRROR_REPO: one push per run. The push is forced,
+# because place starts main's history again from one root commit whenever
+# it outgrows PLACE_HISTORY_MAX_BYTES; the GitHub repository is a read-only
+# copy whose only writer is this sidecar.
 #
 # MIRROR_CREDENTIAL is either an SSH deploy key (OpenSSH private key; SSH
 # goes over port 443, ssh.github.com, the only egress the place task has)
@@ -38,11 +39,11 @@ while :; do
   if git fetch --quiet "$MIRROR_SOURCE" +refs/heads/main:refs/heads/main; then
     tip=$(git rev-parse refs/heads/main)
     if [ "$tip" != "$pushed" ]; then
-      if git push --quiet "$remote" refs/heads/main:refs/heads/main; then
+      if git push --quiet "$remote" +refs/heads/main:refs/heads/main; then
         echo "canvas-mirror: pushed main $tip to $MIRROR_REPO"
         pushed=$tip
       else
-        echo "canvas-mirror: push of $tip to $MIRROR_REPO failed (not a fast-forward, or GitHub refused)"
+        echo "canvas-mirror: push of $tip to $MIRROR_REPO failed (GitHub refused)"
       fi
     fi
   else

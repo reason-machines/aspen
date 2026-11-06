@@ -28,7 +28,8 @@
 //! `set_cover_pack` and `set_shallow_pack` take it before they write. The
 //! sweep:
 //!
-//! 1. Picks candidates with `FOR UPDATE OF p SKIP LOCKED`. `FOR UPDATE`
+//! 1. Locks its candidates (registrations its walk or audit read, nothing
+//!    naming them) with `FOR UPDATE OF p SKIP LOCKED`. `FOR UPDATE`
 //!    conflicts with `FOR KEY SHARE`, so a pack that an open transaction is
 //!    referencing or re-registering is skipped, and once the sweep holds the
 //!    lock, no transaction can add a reference to the pack (its foreign key
@@ -37,6 +38,12 @@
 //!    These run after the lock is held, with a new snapshot, so they see
 //!    every reference and registration committed before the lock was taken,
 //!    which the candidate query's older snapshot might not have.
+//!
+//! Which packs a batch looks at (the walk after a watermark, the audit, and
+//! why a skipped row holds the watermark) only decides when an orphan is
+//! found, never whether a named pack is safe: that rests on the two steps
+//! above alone. The batch is described at [`sweep_orphan_packs`] and in
+//! `crates/aspen-meta/SCHEMA.md`.
 //!
 //! A transaction that waited on the sweep's lock then finds the row gone:
 //! its foreign key check fails, or (in `commit_push`, `register_pack`,
@@ -74,11 +81,12 @@
 //! [`MetaStore::register_pack`]: aspen_core::meta::MetaStore::register_pack
 //! [`MetaStore::sweep_orphan_packs`]: aspen_core::meta::MetaStore::sweep_orphan_packs
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aspen_core::error::StoreError;
 use aspen_core::id::{PackChecksum, PackId, RepoId, UnixMicros};
-use aspen_core::meta::PackTombstone;
+use aspen_core::meta::{Lease, PackTombstone, SweepBatch};
 use aspen_core::pack::{NewPack, PackGeneration, PackKeys, PackRecord};
 use sqlx::AssertSqlSafe;
 
@@ -126,9 +134,91 @@ pub(crate) async fn register_pack(
 ) -> Result<PackRecord, StoreError> {
     pack.validate()
         .map_err(|e| conflict(format!("pack {}: {e}", pack.checksum)))?;
+    if store.dialect() == Dialect::Postgres {
+        // One statement, its own transaction, in the common cases; the
+        // transaction below otherwise.
+        let mut conn = store.admit().await?;
+        if let Some(record) = register_one(&mut conn, pack, store.now()).await? {
+            return same_or_conflict(record, pack);
+        }
+    }
     store
         .write(async |tx| register_in(store, tx, pack).await)
         .await
+}
+
+/// Postgres: a registration as one statement, or `None` when it needs the
+/// transaction ([`register_in`]).
+///
+/// It inserts the row at the first generation only when the statement's
+/// snapshot holds neither a row nor a tombstone for the checksum, and
+/// otherwise locks the existing row `FOR KEY SHARE` as [`find`] does; in
+/// both cases it touches the row, unless an existing row describes another
+/// pack (which [`same_or_conflict`] then refuses). `None` means it did
+/// neither: the checksum has a tombstone (so the new row needs a later
+/// generation), or the row the snapshot held was deleted meanwhile (the
+/// sweep), or a concurrent registration inserted one after the snapshot.
+///
+/// Why inserting at the first generation without reading the tombstones
+/// after the insert is safe here, when [`register_in`] must read them
+/// after: the read after is needed because an insert can wait for a sweep
+/// that is deleting this checksum's old row, and only a later statement
+/// sees the tombstone that sweep writes. A sweep deletes only a row whose
+/// last registration is a grace period old, so that row was committed
+/// before this statement began and is in its snapshot, and then this
+/// statement does not insert. That holds while servers' clocks agree to
+/// within the grace period, which every push already needs (a pack whose
+/// registration clock is further behind is swept before its push commits).
+async fn register_one(
+    conn: &mut crate::conn::Conn,
+    pack: &NewPack,
+    now: UnixMicros,
+) -> Result<Option<PackRecord>, StoreError> {
+    let keys = PackKeys::new(pack.repo, &pack.checksum, PackGeneration::FIRST);
+    let received = match pack.origin {
+        aspen_core::pack::PackOrigin::Push { received_bytes } => {
+            Some(i64::try_from(received_bytes).expect("validated"))
+        }
+        aspen_core::pack::PackOrigin::Compaction { .. } => None,
+    };
+    let int = |v: u64| i64::try_from(v).expect("validated against DB_MAX");
+    let sql = format!(
+        "WITH seen AS (SELECT id FROM packs WHERE repo_id = $1 AND checksum = $2), \
+         tomb AS (SELECT generation FROM pack_tombstones WHERE repo_id = $1 AND checksum = $2), \
+         f AS (SELECT {PACK_COLS} FROM packs WHERE repo_id = $1 AND checksum = $2 FOR KEY SHARE), \
+         ins AS (INSERT INTO packs (repo_id, checksum, pack_key, size, idx_key, idx_size, \
+         entries_key, entries_size, object_count, ref_delta_count, level, origin, received_bytes) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 \
+         WHERE NOT EXISTS (SELECT 1 FROM seen) AND NOT EXISTS (SELECT 1 FROM tomb) \
+         ON CONFLICT (repo_id, checksum) DO NOTHING RETURNING {PACK_COLS}), \
+         got AS (SELECT {PACK_COLS} FROM ins UNION ALL SELECT {PACK_COLS} FROM f), \
+         t AS (INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) \
+         SELECT id, repo_id, $14 FROM got WHERE size = $4 AND idx_size = $6 \
+         AND entries_size = $8 AND object_count = $9 AND ref_delta_count = $10 AND level = $11 \
+         AND origin = $12 {TOUCH_UPSERT}) \
+         SELECT {PACK_COLS} FROM got"
+    );
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(pack.repo.get())
+        .bind(pack.checksum.as_bytes().to_vec())
+        .bind(keys.pack.as_str().to_owned())
+        .bind(int(pack.size))
+        .bind(keys.idx.as_str().to_owned())
+        .bind(int(pack.idx_size))
+        .bind(keys.entries.as_str().to_owned())
+        .bind(int(pack.entries_size))
+        .bind(i64::from(pack.object_count))
+        .bind(i64::from(pack.ref_delta_count))
+        .bind(i64::from(pack.level().get()))
+        .bind(pack.origin.as_str())
+        .bind(received)
+        .bind(now.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(store_error)?
+        .as_ref()
+        .map(rows::pack)
+        .transpose()
 }
 
 /// [`MetaStore::register_packs`]: every pack in one transaction, each
@@ -157,21 +247,41 @@ pub(crate) async fn register_packs(
                 .cmp(&(packs[b].repo, packs[b].checksum.as_bytes()))
                 .then(a.cmp(&b))
         });
-        let parts = store
-            .write(async |tx| {
-                let mut parts = Vec::with_capacity(valid.len());
-                for &i in &valid {
-                    crate::tx::savepoint(tx).await?;
-                    let result = register_in(store, tx, &packs[i]).await;
-                    match &result {
-                        Ok(_) => crate::tx::release(tx).await?,
-                        Err(_) => crate::tx::rollback_to(tx).await?,
+        // On Postgres most registrations are one statement that writes
+        // everything or nothing ([`register_one`]) and need no savepoint;
+        // only the others do. If a statement fails, the transaction is
+        // aborted and the batch runs again with a savepoint around every
+        // registration, so a failure still fails only its own pack.
+        let pg = store.dialect() == Dialect::Postgres;
+        let batch = async |savepoints: bool| {
+            store
+                .write(async |tx| {
+                    let mut parts = Vec::with_capacity(valid.len());
+                    for &i in &valid {
+                        if pg
+                            && !savepoints
+                            && let Some(record) = register_one(tx, &packs[i], store.now()).await?
+                        {
+                            parts.push((i, same_or_conflict(record, &packs[i])));
+                            continue;
+                        }
+                        crate::tx::savepoint(tx).await?;
+                        let result = register_in(store, tx, &packs[i]).await;
+                        match &result {
+                            Ok(_) => crate::tx::release(tx).await?,
+                            Err(_) => crate::tx::rollback_to(tx).await?,
+                        }
+                        parts.push((i, result));
                     }
-                    parts.push((i, result));
-                }
-                Ok::<_, StoreError>(parts)
-            })
-            .await?;
+                    Ok::<_, StoreError>(parts)
+                })
+                .await
+        };
+        let parts = match batch(false).await {
+            Ok(parts) => parts,
+            Err(_) if pg => batch(true).await?,
+            Err(e) => return Err(e),
+        };
         for (i, result) in parts {
             out[i] = Some(result);
         }
@@ -183,51 +293,102 @@ pub(crate) async fn register_packs(
 }
 
 /// The statements of one registration, inside a write transaction.
+///
+/// The insert comes first and, when it inserts, is the only statement
+/// before the generation read; an existing row is read and locked after.
+/// On Postgres the touch rides in the same statement as the insert or the
+/// read (a `WITH` clause), so a new pack costs two statements and an
+/// existing one one; SQLite cannot write in a `WITH` clause and touches in
+/// a statement of its own.
 async fn register_in(
     store: &SqlStore,
     tx: &mut WriteTx,
     pack: &NewPack,
 ) -> Result<PackRecord, StoreError> {
     let now = store.now();
-    let record = match find(store, tx, pack.repo, &pack.checksum).await? {
-        Some(existing) => same_or_conflict(existing, pack)?,
-        None => match insert(tx, pack).await? {
-            Some(id) => {
-                // After the insert, not before: on Postgres a sweep
-                // deleting this checksum's old row holds its unique
-                // index entry, so the insert waits for the sweep to
-                // commit, and only a statement after it sees the
-                // sweep's tombstone.
-                let generation = next_generation(tx, pack).await?;
-                if generation != PackGeneration::FIRST {
-                    set_generation(tx, id, pack, generation).await?;
-                }
-                find(store, tx, pack.repo, &pack.checksum)
-                    .await?
-                    .filter(|r| r.id == id)
-                    .ok_or_else(|| corrupt(format!("pack {id} vanished in its insert")))?
-            }
-            // A concurrent registration inserted the row after our
-            // read and has committed (the insert waited for it).
-            None => {
-                let existing = find(store, tx, pack.repo, &pack.checksum)
-                    .await?
-                    .ok_or_else(|| StoreError::Unavailable {
-                        reason: format!(
-                            "pack {} was registered and removed concurrently",
-                            pack.checksum
-                        ),
-                    })?;
-                same_or_conflict(existing, pack)?
-            }
-        },
+    let pg = store.dialect() == Dialect::Postgres;
+    if pg && let Some(record) = register_one(tx, pack, now).await? {
+        return same_or_conflict(record, pack);
+    }
+    if let Some(inserted) = insert(tx, pack, pg.then_some(now)).await? {
+        if !pg {
+            touch(tx, inserted.id, pack.repo, now).await?;
+        }
+        // After the insert, not before: on Postgres a sweep deleting this
+        // checksum's old row holds its unique index entry, so the insert
+        // waits for the sweep to commit, and only a statement after it
+        // sees the sweep's tombstone.
+        let generation = next_generation(tx, pack).await?;
+        if generation == PackGeneration::FIRST {
+            return Ok(inserted);
+        }
+        let id = inserted.id;
+        set_generation(tx, id, pack, generation).await?;
+        return find(store, tx, pack.repo, &pack.checksum)
+            .await?
+            .filter(|r| r.id == id)
+            .ok_or_else(|| corrupt(format!("pack {id} vanished in its insert")));
+    }
+    // A row with the checksum exists: registered before, or by a
+    // concurrent registration that has committed (the insert waited for
+    // it).
+    let existing = if pg {
+        find_and_touch(tx, pack.repo, &pack.checksum, now).await?
+    } else {
+        let found = find(store, tx, pack.repo, &pack.checksum).await?;
+        if let Some(r) = &found {
+            touch(tx, r.id, pack.repo, now).await?;
+        }
+        found
     };
-    touch(tx, record.id, pack.repo, now).await?;
-    Ok(record)
+    let existing = existing.ok_or_else(|| StoreError::Unavailable {
+        reason: format!(
+            "pack {} was registered and removed concurrently",
+            pack.checksum
+        ),
+    })?;
+    same_or_conflict(existing, pack)
 }
 
-/// Inserts the row; `None` if a row with the checksum exists.
-async fn insert(tx: &mut WriteTx, pack: &NewPack) -> Result<Option<PackId>, StoreError> {
+/// The upsert that records a registration time, never moving it back
+/// ([`touch`]), after the `INSERT INTO pack_touches` that supplies the row.
+const TOUCH_UPSERT: &str = "ON CONFLICT (pack_id) DO UPDATE SET touched_at_us = CASE \
+     WHEN excluded.touched_at_us > pack_touches.touched_at_us \
+     THEN excluded.touched_at_us ELSE pack_touches.touched_at_us END";
+
+/// Postgres: the row with this checksum, locked `FOR KEY SHARE` as
+/// [`find`] locks it, touched at `now` in the same statement.
+async fn find_and_touch(
+    tx: &mut WriteTx,
+    repo: RepoId,
+    checksum: &PackChecksum,
+    now: UnixMicros,
+) -> Result<Option<PackRecord>, StoreError> {
+    let sql = format!(
+        "WITH f AS (SELECT {PACK_COLS} FROM packs WHERE repo_id = $1 AND checksum = $2 \
+         FOR KEY SHARE), t AS (INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) \
+         SELECT id, repo_id, $3 FROM f {TOUCH_UPSERT}) SELECT {PACK_COLS} FROM f"
+    );
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(repo.get())
+        .bind(checksum.as_bytes().to_vec())
+        .bind(now.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(store_error)?
+        .as_ref()
+        .map(rows::pack)
+        .transpose()
+}
+
+/// Inserts the row at the first generation and returns it; `None` if a row
+/// with the checksum exists. With `touch_at` (Postgres), the same statement
+/// records the registration time.
+async fn insert(
+    tx: &mut WriteTx,
+    pack: &NewPack,
+    touch_at: Option<UnixMicros>,
+) -> Result<Option<PackRecord>, StoreError> {
     let keys = PackKeys::new(pack.repo, &pack.checksum, PackGeneration::FIRST);
     let received = match pack.origin {
         aspen_core::pack::PackOrigin::Push { received_bytes } => {
@@ -236,33 +397,40 @@ async fn insert(tx: &mut WriteTx, pack: &NewPack) -> Result<Option<PackId>, Stor
         aspen_core::pack::PackOrigin::Compaction { .. } => None,
     };
     let int = |v: u64| i64::try_from(v).expect("validated against DB_MAX");
-    let inserted = sqlx::query(
-        "INSERT INTO packs (repo_id, checksum, pack_key, size, idx_key, idx_size, entries_key, \
-         entries_size, object_count, ref_delta_count, level, origin, received_bytes) \
+    let insert = "INSERT INTO packs (repo_id, checksum, pack_key, size, idx_key, idx_size, \
+         entries_key, entries_size, object_count, ref_delta_count, level, origin, received_bytes) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-         ON CONFLICT (repo_id, checksum) DO NOTHING RETURNING id",
-    )
-    .bind(pack.repo.get())
-    .bind(pack.checksum.as_bytes().to_vec())
-    .bind(keys.pack.as_str().to_owned())
-    .bind(int(pack.size))
-    .bind(keys.idx.as_str().to_owned())
-    .bind(int(pack.idx_size))
-    .bind(keys.entries.as_str().to_owned())
-    .bind(int(pack.entries_size))
-    .bind(i64::from(pack.object_count))
-    .bind(i64::from(pack.ref_delta_count))
-    .bind(i64::from(pack.level().get()))
-    .bind(pack.origin.as_str())
-    .bind(received)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(store_error)?;
-    inserted
-        .map(|row| {
-            let id: i64 = rows::get(&row, "id")?;
-            PackId::new(id).map_err(|e| corrupt(format!("packs.id: {e}")))
-        })
+         ON CONFLICT (repo_id, checksum) DO NOTHING";
+    let sql = match touch_at {
+        Some(_) => format!(
+            "WITH ins AS ({insert} RETURNING {PACK_COLS}), \
+             t AS (INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) \
+             SELECT id, repo_id, $14 FROM ins {TOUCH_UPSERT}) SELECT {PACK_COLS} FROM ins"
+        ),
+        None => format!("{insert} RETURNING {PACK_COLS}"),
+    };
+    let mut q = sqlx::query(AssertSqlSafe(sql))
+        .bind(pack.repo.get())
+        .bind(pack.checksum.as_bytes().to_vec())
+        .bind(keys.pack.as_str().to_owned())
+        .bind(int(pack.size))
+        .bind(keys.idx.as_str().to_owned())
+        .bind(int(pack.idx_size))
+        .bind(keys.entries.as_str().to_owned())
+        .bind(int(pack.entries_size))
+        .bind(i64::from(pack.object_count))
+        .bind(i64::from(pack.ref_delta_count))
+        .bind(i64::from(pack.level().get()))
+        .bind(pack.origin.as_str())
+        .bind(received);
+    if let Some(now) = touch_at {
+        q = q.bind(now.0);
+    }
+    q.fetch_optional(&mut **tx)
+        .await
+        .map_err(store_error)?
+        .as_ref()
+        .map(rows::pack)
         .transpose()
 }
 
@@ -322,18 +490,17 @@ pub(crate) async fn touch(
     repo: RepoId,
     now: UnixMicros,
 ) -> Result<(), StoreError> {
-    sqlx::query(
+    let sql = format!(
         "INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) VALUES ($1, $2, $3) \
-         ON CONFLICT (pack_id) DO UPDATE SET touched_at_us = CASE \
-         WHEN excluded.touched_at_us > pack_touches.touched_at_us \
-         THEN excluded.touched_at_us ELSE pack_touches.touched_at_us END",
-    )
-    .bind(id.get())
-    .bind(repo.get())
-    .bind(now.0)
-    .execute(&mut **tx)
-    .await
-    .map_err(store_error)?;
+         {TOUCH_UPSERT}"
+    );
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(id.get())
+        .bind(repo.get())
+        .bind(now.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(store_error)?;
     Ok(())
 }
 
@@ -381,11 +548,105 @@ pub(crate) fn micros(d: Duration) -> i64 {
     i64::try_from(d.as_micros()).unwrap_or(i64::MAX)
 }
 
+/// The sweep's ordered walk: registrations after the watermark `($1, $2)`
+/// whose grace period ended by `$3`, oldest first, at most `$4`. A range
+/// scan of index `pack_touches_due` (migration 0009); public so tests can
+/// check its plan.
+pub const SWEEP_WALK_SQL: &str = "SELECT pack_id, touched_at_us FROM pack_touches \
+     WHERE (touched_at_us, pack_id) > ($1, $2) AND touched_at_us <= $3 \
+     ORDER BY touched_at_us, pack_id LIMIT $4";
+
+/// The sweep's audit: the `$2` packs after ID `$1`, with their
+/// registration times. A range scan of the `packs` primary key with one
+/// keyed lookup per row; public so tests can check its plan. The lookup is
+/// a subquery, not a join: Postgres plans a join as a merge that reads
+/// `pack_touches` from its start, which grows with the table.
+pub const SWEEP_AUDIT_SQL: &str = "SELECT p.id, p.repo_id, \
+     (SELECT t.touched_at_us FROM pack_touches t WHERE t.pack_id = p.id) AS touched_at_us \
+     FROM packs p WHERE p.id > $1 ORDER BY p.id LIMIT $2";
+
+/// The `gc_cursors` row of the orphan sweep.
+const SWEEP_CURSOR: &str = "orphan_packs";
+
+/// Where the sweep resumes ([`SWEEP_CURSOR`]): the `(touched_at_us,
+/// pack_id)` key of the last registration the ordered walk examined, and
+/// the last pack ID the audit examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    watermark: (i64, i64),
+    audit: i64,
+}
+
+impl Cursor {
+    /// Before the first sweep: before every registration and every pack.
+    const START: Self = Self {
+        watermark: (i64::MIN, 0),
+        audit: 0,
+    };
+}
+
+async fn read_cursor(tx: &mut WriteTx) -> Result<Cursor, StoreError> {
+    let row =
+        sqlx::query("SELECT touched_at_us, pack_id, audit_pack_id FROM gc_cursors WHERE name = $1")
+            .bind(SWEEP_CURSOR)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(store_error)?;
+    let Some(row) = row else {
+        return Ok(Cursor::START);
+    };
+    Ok(Cursor {
+        watermark: (
+            rows::get(&row, "touched_at_us")?,
+            rows::get(&row, "pack_id")?,
+        ),
+        audit: rows::get(&row, "audit_pack_id")?,
+    })
+}
+
+async fn write_cursor(tx: &mut WriteTx, c: Cursor) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO gc_cursors (name, touched_at_us, pack_id, audit_pack_id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO UPDATE SET \
+         touched_at_us = excluded.touched_at_us, pack_id = excluded.pack_id, \
+         audit_pack_id = excluded.audit_pack_id",
+    )
+    .bind(SWEEP_CURSOR)
+    .bind(c.watermark.0)
+    .bind(c.watermark.1)
+    .bind(c.audit)
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)?;
+    Ok(())
+}
+
+/// One sweep batch (module docs, and `crates/aspen-meta/SCHEMA.md`,
+/// "Garbage collection"). Every step is a range scan of an index bounded by
+/// `limit`, so a batch costs the same with a thousand packs or a million:
+///
+/// 1. Extend the lease, or refuse ([`crate::lease::fence`]).
+/// 2. The ordered walk: up to `limit` registrations (`pack_touches`) after
+///    the watermark whose grace period is over, oldest first (index
+///    `pack_touches_due`).
+/// 3. The audit: the next `limit` packs by ID after the audit cursor,
+///    wrapping to the start at the end. A pack with no registration time
+///    (registered before migration 0005) gets one now; a pack whose grace
+///    period is over and whose registration the watermark already passed
+///    is a candidate again, so an orphan the walk missed is found within
+///    one audit cycle.
+/// 4. Lock the candidates no row names (`FOR UPDATE SKIP LOCKED` on
+///    Postgres) and delete them, re-checking every condition (module docs).
+/// 5. Advance the watermark past what was decided, but never past a
+///    candidate a concurrent transaction held locked: that transaction may
+///    roll back and leave it an orphan, so the next batch looks at it
+///    again.
 pub(crate) async fn sweep_orphan_packs(
     store: &SqlStore,
+    lease: &Lease,
     grace: Duration,
     limit: u32,
-) -> Result<Vec<PackRecord>, StoreError> {
+) -> Result<SweepBatch, StoreError> {
     let lock = match store.dialect() {
         Dialect::Postgres => " FOR UPDATE OF p SKIP LOCKED",
         Dialect::Sqlite => "",
@@ -394,58 +655,119 @@ pub(crate) async fn sweep_orphan_packs(
         .write(async |tx| {
             let now = store.now().0;
             let cutoff = now.saturating_sub(micros(grace));
+            crate::lease::fence(tx, lease, now).await?;
             if limit == 0 {
-                return Ok(Vec::new());
+                return Ok(SweepBatch::default());
             }
+            let cursor = read_cursor(tx).await?;
 
-            // Step 1: candidates, never seen or registered at least `grace`
-            // ago, locked (module docs). Young touched orphans are left out,
-            // so they cannot use up the limit while older ones wait.
-            let sql = format!(
-                "SELECT p.id, p.repo_id, t.touched_at_us FROM packs p \
-                 LEFT JOIN pack_touches t ON t.pack_id = p.id \
-                 WHERE (t.pack_id IS NULL OR t.touched_at_us <= $1) AND {} \
-                 ORDER BY p.id LIMIT $2{lock}",
-                unreferenced("p.id")
-            );
-            let rows = sqlx::query(AssertSqlSafe(sql))
+            // Step 2: the ordered walk.
+            let walk = sqlx::query(SWEEP_WALK_SQL)
+                .bind(cursor.watermark.0)
+                .bind(cursor.watermark.1)
                 .bind(cutoff)
                 .bind(i64::from(limit))
                 .fetch_all(&mut **tx)
                 .await
                 .map_err(store_error)?;
-            let mut first_seen = Vec::new();
-            let mut aged = Vec::new();
-            for row in &rows {
+            let mut walked = Vec::with_capacity(walk.len());
+            for row in &walk {
+                let id: i64 = rows::get(row, "pack_id")?;
+                let touched: i64 = rows::get(row, "touched_at_us")?;
+                walked.push((touched, id));
+            }
+
+            // Step 3: the audit.
+            let audit = sqlx::query(SWEEP_AUDIT_SQL)
+                .bind(cursor.audit)
+                .bind(i64::from(limit))
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(store_error)?;
+            let mut candidates: BTreeSet<i64> = walked.iter().map(|&(_, id)| id).collect();
+            let mut audit_end = cursor.audit;
+            for row in &audit {
                 let id: i64 = rows::get(row, "id")?;
                 let repo: i64 = rows::get(row, "repo_id")?;
                 let touched: Option<i64> = rows::get(row, "touched_at_us")?;
+                audit_end = id;
                 match touched {
-                    None => first_seen.push((id, repo)),
-                    Some(_) => aged.push(id),
+                    // A pack with no registration time (registered before
+                    // migration 0005) gets one now and is deleted a grace
+                    // period later: the walk reaches it then.
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) \
+                             VALUES ($1, $2, $3) ON CONFLICT (pack_id) DO NOTHING",
+                        )
+                        .bind(id)
+                        .bind(repo)
+                        .bind(now)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(store_error)?;
+                    }
+                    Some(t) if t <= cutoff && (t, id) <= cursor.watermark => {
+                        candidates.insert(id);
+                    }
+                    // Not due yet, or the walk will reach it.
+                    Some(_) => {}
+                }
+            }
+            let audit_next = if audit.len() < limit as usize {
+                0
+            } else {
+                audit_end
+            };
+
+            // Step 4: lock the candidates no row names (module docs).
+            let candidates: Vec<i64> = candidates.into_iter().collect();
+            let mut locked = BTreeSet::new();
+            for chunk in candidates.chunks(CHUNK) {
+                let sql = format!(
+                    "SELECT p.id FROM packs p WHERE p.id IN ({}) AND {}{lock}",
+                    placeholders(1, chunk.len()),
+                    unreferenced("p.id")
+                );
+                let mut q = sqlx::query(AssertSqlSafe(sql));
+                for id in chunk {
+                    q = q.bind(*id);
+                }
+                for row in q.fetch_all(&mut **tx).await.map_err(store_error)? {
+                    locked.insert(rows::get::<i64>(&row, "id")?);
+                }
+            }
+            // Walked candidates neither locked nor named: a concurrent
+            // transaction holds them (only Postgres skips rows).
+            let mut held = BTreeSet::new();
+            if store.dialect() == Dialect::Postgres {
+                let unlocked: Vec<i64> = walked
+                    .iter()
+                    .map(|&(_, id)| id)
+                    .filter(|id| !locked.contains(id))
+                    .collect();
+                for chunk in unlocked.chunks(CHUNK) {
+                    let sql = format!(
+                        "SELECT p.id FROM packs p WHERE p.id IN ({}) AND {}",
+                        placeholders(1, chunk.len()),
+                        unreferenced("p.id")
+                    );
+                    let mut q = sqlx::query(AssertSqlSafe(sql));
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    for row in q.fetch_all(&mut **tx).await.map_err(store_error)? {
+                        held.insert(rows::get::<i64>(&row, "id")?);
+                    }
                 }
             }
 
-            // A pack with no registration time (registered before migration
-            // 0005) gets one now and is deleted by a later sweep.
-            for (id, repo) in first_seen {
-                sqlx::query(
-                    "INSERT INTO pack_touches (pack_id, repo_id, touched_at_us) \
-                     VALUES ($1, $2, $3) ON CONFLICT (pack_id) DO NOTHING",
-                )
-                .bind(id)
-                .bind(repo)
-                .bind(now)
-                .execute(&mut **tx)
-                .await
-                .map_err(store_error)?;
-            }
-
-            // Step 2: delete, re-checking every condition with a fresh
-            // snapshot (module docs). The touch row goes first: its foreign
-            // key names the pack.
+            // Delete, re-checking every condition with a fresh snapshot
+            // (module docs). The touch row goes first: its foreign key
+            // names the pack.
+            let locked: Vec<i64> = locked.into_iter().collect();
             let mut deleted = Vec::new();
-            for chunk in aged.chunks(CHUNK) {
+            for chunk in locked.chunks(CHUNK) {
                 let sql = format!(
                     "DELETE FROM pack_touches WHERE touched_at_us <= $1 AND pack_id IN ({}) \
                      AND {} RETURNING pack_id",
@@ -494,8 +816,28 @@ pub(crate) async fn sweep_orphan_packs(
                 .await
                 .map_err(store_error)?;
             }
+
+            // Step 5: the watermark stops before the first held candidate.
+            let decided = walked.iter().take_while(|(_, id)| !held.contains(id));
+            let watermark = decided.last().copied().unwrap_or(cursor.watermark);
+            write_cursor(
+                tx,
+                Cursor {
+                    watermark,
+                    audit: audit_next,
+                },
+            )
+            .await?;
+
             deleted.sort_by_key(|p| p.id);
-            Ok(deleted)
+            Ok(SweepBatch {
+                deleted,
+                examined: (walked.len() + audit.len()) as u64,
+                // A batch that could not move the watermark (its first
+                // candidate is held) also stops the caller's repeats: the
+                // next pass looks again, rather than spinning on the lock.
+                caught_up: walked.len() < limit as usize || watermark == cursor.watermark,
+            })
         })
         .await
 }

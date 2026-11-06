@@ -417,7 +417,20 @@ impl MetaStore for Fake {
     ) -> Result<Option<PackRecord>, StoreError> {
         unreachable!()
     }
-    async fn sweep_orphan_packs(&self, _: Duration, _: u32) -> Result<Vec<PackRecord>, StoreError> {
+    async fn acquire_lease(
+        &self,
+        _: &str,
+        _: &str,
+        _: Duration,
+    ) -> Result<Option<aspen_core::meta::Lease>, StoreError> {
+        unreachable!()
+    }
+    async fn sweep_orphan_packs(
+        &self,
+        _: &aspen_core::meta::Lease,
+        _: Duration,
+        _: u32,
+    ) -> Result<aspen_core::meta::SweepBatch, StoreError> {
         unreachable!()
     }
     async fn pending_pack_deletes(&self, _: u32) -> Result<Vec<PackTombstone>, StoreError> {

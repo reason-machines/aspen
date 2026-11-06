@@ -59,6 +59,14 @@ that the dashboard and alert rules use only these names.
 | `aspen_alert_store_corruption_total` | counter | Fetches that read stored data not matching its metadata row (a missing or short blob, a wrong checksum) |
 | `aspen_alert_express_corrupt_pack_total` | counter | Express reads of a pack that does not hash to the checksum in its key ([EXPRESS.md](EXPRESS.md)) |
 
+**Admission** (memory pressure; `ASPEN_MEMORY_HIGH_WATER_BYTES`).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `aspen_admission_memory_refusals_total` | counter | Fetch, push and stitch requests refused with `503` because the process's resident memory was over the mark. Any rate means the instance is near its memory limit: lower its caches or concurrency, or give it more memory |
+| `aspen_process_resident_memory_bytes` | gauge | This process's resident memory (`VmRSS`; Linux only) |
+| `aspen_admission_memory_high_water_bytes` | gauge | The mark; absent when it is off |
+
 **Database gauges** (`Server::with_store_gauges`).
 
 | Metric | Type | Meaning |
@@ -82,11 +90,16 @@ that the dashboard and alert rules use only these names.
 | `aspen_push_trunk_versions_total{closure}` | counter | Trunk versions committed, `exact` or `wider` |
 | `aspen_push_branch_versions_total{closure}` | counter | Versions of every other ref committed, `exact` or `wider`. A `wider` one makes incremental fetches of that ref send more than they need; a write that depends on a `wider` version is `wider` too, so after a lost compare-and-swap across a forced update makes a branch version `wider`, later plain-URL fast-forwards of that branch stay `wider` until a forced update or a scoped-URL push that does not depend on it (issue #203) |
 | `aspen_push_grace_exceeded_total` | counter | Pushes refused because garbage collection deleted their pack before they committed: registering to committing took longer than `gc_grace` (2 hours). Logged as a `warn`; the client retries and the push registers its pack again |
+| `aspen_push_widened_total` | counter | Pushes built on commits outside their dependencies: with `git config push.negotiate true`, Git leaves out every commit Aspen acknowledged, which can belong to another ref (a branch created from another branch, a merge into trunk, an amended forced push, a tag). Each such write copies what it reaches from those commits' versions into its own pack, so these pushes read from storage what the client did not send. A plain fast-forward of the pushed branch never counts here |
 | `aspen_push_stage_seconds_total{stage}` | counter | Time in each push stage (`search`, `receive`, `gate_wait`, `prefetch`, `complete`, `graph`, `check`, `hook`, `upload`, `commit`; `search` is computing the packs a push searches, `hook` the push hook's checks with their range walks), summed over pushes |
 | `aspen_push_prefetch_slots` | gauge | Pushes the prefetch gate admits at once while each holds its 64 MiB floor (`ASPEN_PREFETCH_MEMORY_BYTES` / floor) |
 | `aspen_push_prefetch_escalations_total` | counter | Reads of stored packs whose bases needed more than the floor, so their slot grew to the full per-push budget. A high rate relative to pushes means the floor admits fewer pushes than `aspen_push_prefetch_slots` suggests |
+| `aspen_push_db_statements_total{kind}` | counter | Metadata statements pushes sent, summed over pushes: `kind="query"` the push's reads and writes, `kind="transaction_control"` its `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints, `kind="advertisement"` the queries of the `info/refs` request before it. Repository and token lookups and group-commit batches (which run on a task of their own) are not counted. Divide the sum by `aspen_push_duration_seconds_count`: on PostgreSQL a branch push is about 4 (throughput item 6b); a figure that grows means pushes read more than they need |
 | `aspen_push_ancestry_commits_total` | counter | Commits the push path's ancestry walks expanded (fast-forward checks and closure exactness), summed over pushes. Each is a `commit_index` read (one round trip) or a pack read unless an earlier walk of the same push cached it. Divide by `aspen_push_duration_seconds_count`: a per-push figure that grows means walks over long histories (issue #284) |
 | `aspen_push_base_cache_hits_total`, `aspen_push_base_cache_misses_total` | counter | Delta bases and other objects read from stored packs, answered by the in-memory base-object cache or read from the blob store. The cache holds trees each push stored (the next push to the same ref deltas against them) and objects earlier prefetches resolved. A falling hit share means the cache (64 MiB) turns over faster than pushes reuse it |
+| `aspen_push_idx_loads_total`, `aspen_push_idx_sampled_loads_total` | counter | Pack indexes (`.idx`) read from the blob store into the locator's cache, and how many of them were kept as a sample (over `ASPEN_IDX_WHOLE_MAX_BYTES`, or not fitting `ASPEN_IDX_CACHE_BYTES` beside the other indexes of their search). Flat once a repository is warm; a steady rate means the cache turns over (raise `ASPEN_IDX_CACHE_BYTES`) |
+| `aspen_push_idx_load_waits_total` | counter | Index cache misses that waited for another request's read of the same `.idx` instead of reading it again (single flight). High right after a start, when many pushes miss the same indexes together |
+| `aspen_push_idx_read_bytes_total` | counter | Bytes of `.idx` read from the blob store: whole loads, samples, and the few kilobytes each lookup in a sample reads |
 | `aspen_push_group_commit_batches_total`, `aspen_push_group_commit_pushes_total` | counter | Group commit (`ASPEN_GROUP_COMMIT=on` only): commit transactions run, and the push commits they took; pushes per transaction is their ratio. Near 1 means pushes rarely arrive within `ASPEN_GROUP_COMMIT_WINDOW_MS` of each other, so the window only adds latency |
 | `aspen_push_group_register_batches_total`, `aspen_push_group_registrations_total` | counter | Group commit: pack registration transactions run, and the registrations they took |
 | `aspen_push_group_failed_batches_total` | counter | Group commit: batches whose transaction failed as a whole (a savepoint statement or the `COMMIT` failed). Every push in such a batch is refused, never acknowledged; any rate above zero needs the database's logs |
@@ -96,6 +109,7 @@ that the dashboard and alert rules use only these names.
 | `aspen_queue_wait_seconds_total` | counter | Seconds from enqueue to the outcome landing, summed over entries; divide by merged + rejected for the mean wait |
 | `aspen_queue_ancestry_commits_total` | counter | Commits the merge queue's ancestry walks expanded: base searches that trunk's recent first-parent chain (kept per repository by each worker) did not answer, each a commit-index or pack read. Near zero in steady state; a steady rate means entries based on commits off trunk's first-parent line, or a trunk moved by direct pushes |
 | `aspen_queue_outcomes_expired_total` | counter | Merge-queue outcome refs deleted after `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS` |
+| `aspen_queue_stage_seconds_total{stage}` | counter | Time the merge queue spent building and landing batches, by stage: `list` (pending entries and trunk), `trunk` (trunk's closure, chain and tree), `prepare` (entries' packs, commits, bases, changes), `trunk_trees`, `place` (conflicts, new trees and commits), `outcomes`, `pack`, `push` (the atomic in-process push). Divide by `aspen_queue_batches_total` for a batch's cost |
 | `aspen_push_prefetch_slots_in_use` | gauge | Slots held now |
 | `aspen_push_prefetch_slots_peak` | gauge | Most slots held at once since the process started |
 | `aspen_push_prefetch_slots_acquired_total` | counter | Slots granted |
@@ -126,16 +140,37 @@ introduced, unchanged.
 **Exact shallow packs** (node C8, on when `ASPEN_SHALLOW_PACKS` is on). A
 `git fetch --depth=N` of a ref version's tip is served the pack that holds
 exactly what that depth needs, built once per version and depth; see
-`aspen_server::upload_pack::exact`. Fetches served this way are not
-planned, so they are not in `aspen_fetches_total`.
+`aspen_server::upload_pack::exact`. While a new tip's pack is being built,
+a fetch of it is served a **layered answer** instead: the exact pack of an
+earlier version of the same ref without that version's commits, plus a
+patch pack of everything else the new tip needs. Fetches served this way are not planned, so they
+are not in `aspen_fetches_total`.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `aspen_shallow_exact_fetches_total{pack}` | counter | Shallow fetches served exactly: `recorded` (every pack already built), `built` (waited for a build), `closure` (a want's full closure was already exact) |
+| `aspen_shallow_exact_fetches_total{pack}` | counter | Shallow fetches served without the full history: `recorded` (every pack already built), `built` (waited for a build), `closure` (a want's full closure was already exact), `layered` (a layered answer, about one snapshot plus what changed since the earlier version) |
+| `aspen_shallow_wait_seconds` | histogram | Time a shallow fetch that could use exact packs spent choosing them: waiting for a build (up to 500 ms when a layered answer exists, else up to the 20 s build wait) and computing the layered answer |
+| `aspen_shallow_layered_patch_objects_total` | counter | Objects written to layered answers' patch packs: the new commits and everything changed since the earlier version's exact pack, including objects only older history holds (a revert) |
 | `aspen_shallow_fallbacks_total{reason}` | counter | Shallow fetches that could have used exact packs and were sent the full history instead: `not_a_tip`, `no_build_slot`, `recently_failed`, `wait_timed_out`, `build_recorded_nothing`. A steady `wait_timed_out` or `no_build_slot` rate during fetch storms means builds are too slow or too few for the traffic |
 | `aspen_shallow_builds_total{result}` | counter | Builds: `recorded`, `not_needed` (the closure is already exact), `too_large` (over the source limit), `not_a_commit`, `grace_exceeded` (the build took longer than `gc_grace`, so its pack was garbage-collected before it was recorded; logged), `over_limit` (the pack alone is larger than `ASPEN_SHALLOW_MAX_REPO_BYTES`, so it was not stored and the fetch got the full history; logged; issue #108), `failed` (logged; corruption also counts in `aspen_alert_store_corruption_total`) |
+| `aspen_shallow_builds_incremental_total` | counter | Recorded builds whose sources were the version's layered answer rather than its full closure (also in `aspen_shallow_builds_total`) |
 | `aspen_shallow_build_duration_seconds` | histogram | Time to download the closure, build, verify, upload and record one exact pack |
 | `aspen_shallow_limit_evictions_total` | counter | Recordings evicted, least recently used first, to keep a repository's exact packs under `ASPEN_SHALLOW_MAX_REPO_BYTES` (issue #108). A steady rate means the cap is too small for what clients fetch: every eviction is a later rebuild |
+
+**Garbage collection** (throughput item 7; processes whose `ASPEN_ROLE`
+runs the background worker). One process at a time holds the
+garbage-collection lease and collects, so `sum` the counters across
+instances: the holder's are the ones that move.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `aspen_gc_passes_total{result}` | counter | Passes: `ran`, `lease_held_elsewhere` (another process collects), `lease_lost` (the lease expired or changed hands partway, so the pass stopped sweeping), `failed` (a store error; logged, retried next pass) |
+| `aspen_gc_lease_held` | gauge | 1 when this process's last pass held the lease. Across instances, `sum` should be 1; 0 for longer than `ASPEN_GC_LEASE_SECS` plus `ASPEN_GC_EVERY_SECS` means nothing collects |
+| `aspen_gc_sweep_batches_total` | counter | Sweep transactions |
+| `aspen_gc_sweep_rows_examined_total` | counter | Registrations and packs those transactions read. In the steady state it grows with the push rate, not with the number of packs stored |
+| `aspen_gc_sweep_packs_deleted_total` | counter | Orphaned pack rows deleted; their blobs are deleted in the same pass |
+| `aspen_gc_sweep_batch_duration_seconds` | histogram | One sweep transaction, from its lease check to its commit |
+| `aspen_gc_sweep_batch_rows` | histogram | Rows one sweep transaction read: at most twice `ASPEN_GC_SWEEP_BATCH` |
 
 **Client addresses** (the access layer, issue #121). Behind proxies
 (`ASPEN_TRUSTED_PROXY_HOPS` above 0), a request whose forwarded client

@@ -21,7 +21,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 sha2 = "0.11"
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 url = "2"
 
 [dev-dependencies]

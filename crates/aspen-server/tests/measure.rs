@@ -98,6 +98,9 @@ fn minus(a: Timings, b: Timings) -> Timings {
         ancestry_commits: a.ancestry_commits - b.ancestry_commits,
         located: a.located - b.located,
         changed_entries: a.changed_entries - b.changed_entries,
+        db_queries: a.db_queries - b.db_queries,
+        db_transaction_control: a.db_transaction_control - b.db_transaction_control,
+        advert_db_queries: a.advert_db_queries - b.advert_db_queries,
     }
 }
 

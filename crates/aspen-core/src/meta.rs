@@ -319,14 +319,120 @@ pub struct RefListQuery {
     pub limit: u32,
 }
 
-/// Sequence numbers of the earlier versions to advertise as `.have` lines,
-/// log-spaced back from `current`: 1, 2, 4, 8, ... versions earlier, at
-/// most `n` of them, none below 1 (S2).
-pub fn have_tip_seqs(current: Seq, n: u8) -> Vec<Seq> {
-    (0..u32::from(n))
-        .map_while(|i| 1u64.checked_shl(i))
-        .map_while(|back| current.back(back))
-        .collect()
+/// Where a reader of one repository's refs left off
+/// ([`MetaStore::ref_changes`]): every ref version that reader did not see
+/// was written by a transaction numbered at least [`RefCursor::from`] or
+/// listed in [`RefCursor::also`]. The numbers are the store's own
+/// (`ref_versions.txid`), so a cursor is only meaningful to the store that
+/// returned it.
+///
+/// Postgres numbers are transaction IDs: `from` is the reading statement's
+/// snapshot `xmax` and `also` the transactions that snapshot saw in
+/// progress, so a write that commits after a later-numbered one is still
+/// found. SQLite writes one transaction at a time, so `from` is one past
+/// the largest version ID the read saw and `also` is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefCursor {
+    /// Every transaction numbered this or higher had not committed when
+    /// the reader read.
+    pub from: i64,
+    /// Lower-numbered transactions still in progress when the reader read.
+    pub also: Vec<i64>,
+}
+
+/// One ref as [`MetaStore::ref_changes`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefChange {
+    /// The ref.
+    pub name: RefName,
+    /// Its current tip; `None` when its current version is a deletion.
+    pub tip: Option<ObjectId>,
+}
+
+/// The answer of [`MetaStore::ref_changes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefChanges {
+    /// Where this read left off: pass it as `since` next time.
+    pub cursor: RefCursor,
+    /// The refs read, at most the `limit` asked for, in no particular
+    /// order.
+    pub refs: Vec<RefChange>,
+    /// Whether `refs` is every ref the read matched; `false` when more
+    /// than `limit` did.
+    pub complete: bool,
+}
+
+/// Versions per unit of `have_tips` in the dense window of the push
+/// advertisement ([`have_tip_seqs`]): the default 8 tips give a window of
+/// the 64 newest earlier trunk versions.
+pub const HAVE_WINDOW_PER_TIP: u64 = 8;
+
+/// Sequence numbers of the earlier trunk versions to advertise as `.have`
+/// lines on a push, newest first, when trunk's current version is at
+/// `current` and `held` are the `seq` ranges of trunk versions in its
+/// closure (the versions a push searches; `current` itself may be among
+/// them, and is never returned).
+///
+/// A client leaves out whatever the newest advertised tip it holds
+/// reaches, so the gap between two advertised tips is what a client whose
+/// base lies inside it sends again. With `n = have_tips` (0 advertises
+/// nothing):
+///
+/// - **dense window:** every version from 1 to `8 × n` back
+///   ([`HAVE_WINDOW_PER_TIP`]), so a client a few landings behind sends
+///   only its own objects;
+/// - **tail:** each further distance about a quarter more than the one
+///   before, so a client `d` versions behind resends at most about `d / 4`
+///   landings, and the tail reaches the oldest held version, which is
+///   always advertised: no client that holds any trunk version a push
+///   searches resends the whole history (item 10; 8 log-spaced tips used
+///   to stop 128 versions back, about 13 s of landings at 9.6 pushes/s).
+///
+/// A distance that falls in a gap of `held` (versions a forced trunk
+/// update skipped) takes the newest held version below it instead.
+///
+/// The result holds at most `8n + 2 + log_{5/4}(current / 8n)` seqs: 108
+/// for `n = 8` and a million versions, whatever the repository's size
+/// otherwise.
+pub fn have_tip_seqs(current: Seq, n: u8, held: &[SeqRange]) -> Vec<Seq> {
+    let mut out: Vec<Seq> = Vec::new();
+    if n == 0 {
+        return out;
+    }
+    let current = current.get();
+    // The newest held version at or below `s`.
+    let below = |s: u64| {
+        held.iter()
+            .filter(|r| r.first().get() <= s)
+            .map(|r| r.last().get().min(s))
+            .max()
+    };
+    let Some(oldest) = held
+        .iter()
+        .map(|r| r.first().get())
+        .filter(|&f| f < current)
+        .min()
+    else {
+        return out;
+    };
+    let window = HAVE_WINDOW_PER_TIP * u64::from(n);
+    let mut back = 1u64;
+    while let Some(want) = current.checked_sub(back).filter(|&w| w >= oldest) {
+        if let Some(s) = below(want)
+            && out.last().is_none_or(|l| l.get() != s)
+        {
+            out.push(Seq::new(s).expect("a held seq"));
+        }
+        back = if back < window {
+            back + 1
+        } else {
+            back.saturating_add((back / 4).max(1))
+        };
+    }
+    if out.last().is_none_or(|l| l.get() != oldest) {
+        out.push(Seq::new(oldest).expect("a held seq"));
+    }
+    out
 }
 
 /// An inclusive range of one ref's version numbers, `first <= last`.
@@ -432,6 +538,42 @@ impl PackTombstone {
     pub fn keys(&self) -> PackKeys {
         PackKeys::new(self.repo, &self.checksum, self.generation)
     }
+}
+
+/// The lease garbage collection runs under ([`MetaStore::acquire_lease`]):
+/// one process at a time sweeps.
+pub const GC_LEASE: &str = "gc";
+
+/// A time-limited lease on work only one process may do at a time
+/// ([`MetaStore::acquire_lease`]). Work done under it names it, and the
+/// store refuses that work ([`StoreError::lease_lost`]) once the lease
+/// expired or changed hands, so a holder that stalled past its expiry
+/// cannot act after another process took over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    /// What the lease is for, such as [`GC_LEASE`].
+    pub name: String,
+    /// Who holds it; unique per process.
+    pub owner: String,
+    /// Grows by one each time the lease changes hands or is taken again
+    /// after it expired. Work under the lease is fenced on it.
+    pub epoch: u64,
+    /// How long the lease lasts after it was acquired or last extended.
+    /// Work under it extends it by this much.
+    pub ttl: Duration,
+}
+
+/// What one sweep transaction did ([`MetaStore::sweep_orphan_packs`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepBatch {
+    /// The `packs` rows deleted, each leaving a pending [`PackTombstone`].
+    pub deleted: Vec<PackRecord>,
+    /// Registrations and packs the transaction read: at most twice its
+    /// `limit`, whatever the number of packs stored.
+    pub examined: u64,
+    /// The sweep has read every registration whose grace period is over;
+    /// another call now would find nothing new until more come due.
+    pub caught_up: bool,
 }
 
 /// A compaction cover: a range of one ref's versions, repacked (once `pack`
@@ -1075,6 +1217,41 @@ impl Job {
     }
 }
 
+/// Statements a store sent to its database
+/// ([`MetaStore::count_statements`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Statements {
+    /// Statements that read or write rows.
+    pub queries: u64,
+    /// `BEGIN`, `COMMIT` and `ROLLBACK`.
+    pub transaction_control: u64,
+}
+
+impl Statements {
+    /// Everything sent.
+    pub fn total(&self) -> u64 {
+        self.queries + self.transaction_control
+    }
+}
+
+impl std::ops::AddAssign for Statements {
+    fn add_assign(&mut self, o: Self) {
+        self.queries += o.queries;
+        self.transaction_control += o.transaction_control;
+    }
+}
+
+impl std::ops::Sub for Statements {
+    type Output = Self;
+
+    fn sub(self, o: Self) -> Self {
+        Self {
+            queries: self.queries - o.queries,
+            transaction_control: self.transaction_control - o.transaction_control,
+        }
+    }
+}
+
 /// The metadata store.
 ///
 /// Every method is one short transaction. Methods return `Send` futures so
@@ -1123,6 +1300,94 @@ pub trait MetaStore: Send + Sync {
         id: RefVersionId,
     ) -> impl Future<Output = Result<Option<RefVersion>, StoreError>> + Send;
 
+    /// The current versions of `names`, in the order asked (`None` for a
+    /// name with no `refs` row), read in one statement: what a push reads
+    /// before it searches (trunk and the ref it builds on) and again for its
+    /// commit check.
+    fn current_versions(
+        &self,
+        repo: RepoId,
+        names: &[RefName],
+    ) -> impl Future<Output = Result<Vec<Option<RefVersion>>, StoreError>> + Send {
+        async move {
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                out.push(self.current_version(repo, name).await?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// The current version of `name`, followed by its versions with `seq`
+    /// above `after` and at most `window` below the current one, newest
+    /// first, in one statement; `None` if `name` has no `refs` row. A
+    /// caller that remembers a ref's versions up to `after` (versions never
+    /// change) reads only the ones written since: the receive-pack
+    /// advertisement reads trunk's recent versions for its `.have` tips this
+    /// way.
+    fn current_and_recent(
+        &self,
+        repo: RepoId,
+        name: &RefName,
+        after: Option<Seq>,
+        window: u64,
+    ) -> impl Future<Output = Result<Option<Vec<RefVersion>>, StoreError>> + Send {
+        async move {
+            let Some(current) = self.current_version(repo, name).await? else {
+                return Ok(None);
+            };
+            let seqs: Vec<Seq> = (1..=window)
+                .filter_map(|b| current.seq.back(b))
+                .filter(|s| after.is_none_or(|a| *s > a))
+                .collect();
+            let mut out = vec![current];
+            out.extend(self.versions_by_seq(repo, name, &seqs).await?);
+            Ok(Some(out))
+        }
+    }
+
+    /// The versions `from` names and, read in the same statement, the
+    /// versions they reach through dependencies (`trunk_dep`, `scoped_dep`),
+    /// following no dependency of a version in `stops`: the versions whose
+    /// closures the caller already knows. Every version of `from` that
+    /// exists is returned; besides them at most `limit` more, so a caller
+    /// that needs more asks again from where this answer ends. Unordered.
+    ///
+    /// A push's search set is the closure of the versions it builds on
+    /// (`aspen-server`'s `receive::closure`), and a closure an instance has
+    /// not seen ends in a chain of versions other instances wrote; this
+    /// reads the chain in one statement instead of one per version.
+    fn reachable_versions(
+        &self,
+        from: &[RefVersionId],
+        stops: &[RefVersionId],
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<RefVersion>, StoreError>> + Send {
+        let _ = (stops, limit);
+        async move {
+            let mut out = Vec::with_capacity(from.len());
+            for id in from {
+                out.extend(self.ref_version(*id).await?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Runs `work` and counts the statements this store sent to its
+    /// database for it, from the task `work` runs on; `None` if the store
+    /// does not count them. Receive-pack reports each push's count
+    /// (`aspen_push_db_statements`).
+    fn count_statements<F>(
+        &self,
+        work: F,
+    ) -> impl Future<Output = (F::Output, Option<Statements>)> + Send
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        async move { (work.await, None) }
+    }
+
     /// The versions of `name` with these sequence numbers (for `.have` tips,
     /// see [`have_tip_seqs`]); missing ones are left out.
     fn versions_by_seq(
@@ -1139,6 +1404,33 @@ pub trait MetaStore: Send + Sync {
         repo: RepoId,
         query: &RefListQuery,
     ) -> impl Future<Output = Result<Vec<RefVersion>, StoreError>> + Send;
+
+    /// The refs of `repo` whose current version a reader that left off at
+    /// `since` has not seen, read in one statement, so the answer and its
+    /// cursor describe one moment: with `since` `None`, every live ref
+    /// (deleted refs left out); otherwise every ref whose current version
+    /// was written by a transaction `since` covers, deleted ones included
+    /// (with no tip). Applying the answer to the refs the reader holds
+    /// gives exactly the refs at that moment, whatever order concurrent
+    /// pushes committed in. At most `limit` refs; [`RefChanges::complete`]
+    /// says whether there were more.
+    ///
+    /// The cost is one index probe per transaction in `since.also` plus
+    /// the versions written since: a repository with nothing new costs one
+    /// statement that reads no ref rows, which is what lets `ls-refs` keep
+    /// a listing in memory ([`RefCursor`]).
+    ///
+    /// `Ok(None)` means the store cannot answer this; callers list refs
+    /// with [`MetaStore::list_refs`] instead. That is the provided body.
+    fn ref_changes(
+        &self,
+        repo: RepoId,
+        since: Option<&RefCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Option<RefChanges>, StoreError>> + Send {
+        let _ = (repo, since, limit);
+        async { Ok(None) }
+    }
 
     /// Registers a pack, before its blobs are uploaded: the returned row's
     /// generation fixes the keys to upload to ([`PackRecord::keys`]).
@@ -1318,14 +1610,40 @@ pub trait MetaStore: Send + Sync {
         checksum: &crate::id::PackChecksum,
     ) -> impl Future<Output = Result<Option<PackRecord>, StoreError>> + Send;
 
-    /// Garbage collection of orphaned packs (issue #48): deletes, in one
-    /// transaction, up to `limit` `packs` rows (of any repository) that no
-    /// ref version, cover or job names and that nobody has registered for
+    /// Takes the lease `name` for `owner` for `ttl` (by the store's clock),
+    /// if nobody else holds it: it is free, it expired, or `owner` holds it
+    /// already (then it is extended and keeps its epoch). `None` while
+    /// another owner's lease is live. A lease whose holder died expires
+    /// `ttl` after it was last acquired or extended.
+    fn acquire_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<Option<Lease>, StoreError>> + Send;
+
+    /// Garbage collection of orphaned packs (issue #48), one bounded batch,
+    /// under the [`GC_LEASE`] `lease`: deletes, in one transaction, the
+    /// `packs` rows (of any repository) among those it examines that no ref
+    /// version, cover, job or shallow pack recording names
+    /// ([`MetaStore::set_shallow_pack`]) and that nobody has registered for
     /// at least `grace` (by the store's clock; [`MetaStore::register_pack`]
     /// of an existing row counts as registering it again, and so does
-    /// [`MetaStore::evict_shallow_packs`]). A pack a shallow pack recording
-    /// names ([`MetaStore::set_shallow_pack`]) counts as named. Returns the
-    /// deleted rows.
+    /// [`MetaStore::evict_shallow_packs`]).
+    ///
+    /// The sweep is incremental (throughput item 7): it examines at most
+    /// `limit` registrations, in the order their grace periods end, after
+    /// where the previous call stopped, and at most `limit` packs of a slow
+    /// audit that walks every pack by ID (for rows with no registration
+    /// time, and for any orphan the ordered walk passed). Its cost per call
+    /// does not grow with the number of packs. Anything that stops naming a
+    /// pack must register it again (touch it) in the same transaction, as
+    /// eviction does, or the ordered walk may not see it until the audit
+    /// comes round.
+    ///
+    /// The transaction first extends `lease` and is refused with
+    /// [`StoreError::lease_lost`], writing nothing, once the lease expired or
+    /// changed hands, so two processes never sweep at once.
     ///
     /// Each deleted row leaves a [`PackTombstone`], pending until
     /// [`MetaStore::finish_pack_deletes`]: the caller deletes the blobs of
@@ -1336,13 +1654,14 @@ pub trait MetaStore: Send + Sync {
     /// take from registering to committing: a writer whose row was swept
     /// in between finds it gone, and its commit fails retryably
     /// ([`StoreError::Unavailable`]). A row registered before migration
-    /// 0005 has no registration time: the first sweep that finds it
-    /// orphaned records one, and a later sweep deletes it.
+    /// 0005 has no registration time: the audit records one when it reaches
+    /// the row, and a later sweep deletes it.
     fn sweep_orphan_packs(
         &self,
+        lease: &Lease,
         grace: Duration,
         limit: u32,
-    ) -> impl Future<Output = Result<Vec<PackRecord>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<SweepBatch, StoreError>> + Send;
 
     /// Up to `limit` pending tombstones ([`MetaStore::sweep_orphan_packs`]),
     /// oldest first, of any repository and any sweep (a crashed worker's
@@ -1724,20 +2043,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn have_tips_are_log_spaced() {
+    fn have_seqs(current: u64, n: u8, held: &[(u64, u64)]) -> Vec<u64> {
         let s = |n| Seq::new(n).unwrap();
-        let seqs = |c, n| {
-            have_tip_seqs(s(c), n)
-                .into_iter()
-                .map(Seq::get)
-                .collect::<Vec<_>>()
+        let held: Vec<SeqRange> = held
+            .iter()
+            .map(|&(a, b)| SeqRange::new(s(a), s(b)).unwrap())
+            .collect();
+        have_tip_seqs(s(current), n, &held)
+            .into_iter()
+            .map(Seq::get)
+            .collect()
+    }
+
+    #[test]
+    fn have_tips_are_dense_then_a_quarter_apart() {
+        // The window: every earlier version up to 64 back.
+        assert_eq!(have_seqs(5, 8, &[(1, 5)]), vec![4, 3, 2, 1]);
+        let got = have_seqs(300, 8, &[(1, 300)]);
+        assert_eq!(got[..64], (236..=299).rev().collect::<Vec<_>>()[..]);
+        // Then 64 + 16, 80 + 20, 100 + 25, ... back, and the oldest.
+        assert_eq!(got[64..], [220, 200, 175, 144, 105, 57, 1][..], "{got:?}");
+        assert_eq!(have_seqs(1, 8, &[(1, 1)]), Vec::<u64>::new());
+        assert_eq!(have_seqs(100, 0, &[(1, 100)]), Vec::<u64>::new());
+        assert_eq!(have_seqs(100, 8, &[]), Vec::<u64>::new());
+    }
+
+    /// Invariant: whatever trunk version a client's base is, the newest
+    /// advertised tip at or below it is in the dense window or at most a
+    /// quarter (plus one) of its distance further back, so the client
+    /// resends at most about a quarter of the landings it is behind.
+    #[test]
+    fn every_held_base_has_an_advertised_tip_close_below_it() {
+        for current in [2u64, 3, 65, 66, 300, 4_097, 100_000] {
+            let got = have_seqs(current, 8, &[(1, current)]);
+            for base in 1..current {
+                let tip = got.iter().copied().find(|&t| t <= base).unwrap();
+                let behind = current - base;
+                let extra = base - tip;
+                if behind <= 64 {
+                    assert_eq!(extra, 0, "current {current}, base {base}");
+                } else {
+                    assert!(
+                        extra <= behind / 4 + 1,
+                        "current {current}, base {base}: {extra}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Invariant: the advertisement stays bounded: its size grows with the
+    /// logarithm of trunk's history and nothing else.
+    #[test]
+    fn have_tips_stay_bounded() {
+        let count = |c, n| have_seqs(c, n, &[(1, c)]).len();
+        let bound = |c: u64, n: u8| {
+            let w = (HAVE_WINDOW_PER_TIP * u64::from(n)) as f64;
+            w as usize + 2 + ((c as f64 / w).ln() / 1.25f64.ln()).ceil() as usize
         };
-        assert_eq!(seqs(300, 8), vec![299, 298, 296, 292, 284, 268, 236, 172]);
-        assert_eq!(seqs(5, 8), vec![4, 3, 1]);
-        assert_eq!(seqs(1, 8), Vec::<u64>::new());
-        assert_eq!(seqs(100, 0), Vec::<u64>::new());
-        assert_eq!(have_tip_seqs(s(crate::id::DB_MAX), 32).len(), 32);
+        assert_eq!(count(1_000_000, 8), 108);
+        assert_eq!(count(1_000, 1), 31);
+        for (c, n) in [
+            (1_000, 1),
+            (500_000, 8),
+            (1_000_000, 8),
+            (crate::id::DB_MAX, 8),
+            (crate::id::DB_MAX, 32),
+        ] {
+            assert!(count(c, n) <= bound(c, n), "{c} versions, {n} tips");
+        }
+        assert!(count(crate::id::DB_MAX, 32) <= 430);
+    }
+
+    /// A distance inside a gap (versions a forced trunk update skipped, not
+    /// in the closure) takes the newest held version below it.
+    #[test]
+    fn have_tips_skip_versions_outside_the_closure() {
+        let got = have_seqs(10, 1, &[(1, 3), (7, 10)]);
+        assert_eq!(got, vec![9, 8, 7, 3, 2, 1], "{got:?}");
+        for s in got {
+            assert!(!(4..=6).contains(&s));
+        }
+        // Only the current version held: nothing to advertise.
+        assert_eq!(have_seqs(10, 8, &[(10, 10)]), Vec::<u64>::new());
     }
 
     #[test]

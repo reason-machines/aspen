@@ -212,8 +212,13 @@ fn storm(env: &Env, name: &str, url: &str, tip: &str, depth: u32, jobs: usize) -
                 scope.spawn(move || {
                     // Keep what arrives as a pack, however small, so its
                     // size is the bytes served.
+                    // `fetch.fsckObjects`: index-pack checks every link of
+                    // every object received, as CI fleets that turn it on
+                    // do; a pack that names an object it does not send
+                    // fails here, not only in a later `fsck`.
                     run(git_in(&home, d)
                         .args(["-c", "fetch.unpackLimit=1"])
+                        .args(["-c", "fetch.fsckObjects=true"])
                         .args(["fetch", "--quiet", "--no-tags"])
                         .arg(format!("--depth={depth}"))
                         .arg(url)
@@ -587,8 +592,10 @@ fn a_build_slower_than_the_wait_finishes_for_later_fetches() {
 
 /// Invariant: garbage collection evicts the recording of a version that is
 /// no longer current (never a current one), the sweep then deletes its
-/// pack and blobs, and a later depth-1 fetch of that old tip builds the
-/// pack again (the checksum's next generation) and is served correctly.
+/// pack and blobs (and the patch pack of the layered answer the second
+/// build started from, which nothing names), and a later depth-1 fetch of
+/// that old tip builds the pack again (the checksum's next generation) and
+/// is served correctly.
 #[test]
 fn evicted_packs_are_swept_and_built_again() {
     let env = Env::new();
@@ -613,7 +620,11 @@ fn evicted_packs_are_swept_and_built_again() {
     let compactor = Compactor::new(s.meta.clone(), s.blobs.clone(), config);
     let report = s.block_on(compactor.collect_garbage()).unwrap();
     assert_eq!(report.shallow_evicted, 1, "only the superseded version's");
-    assert_eq!(report.packs_deleted.len(), 1);
+    assert_eq!(
+        report.packs_deleted.len(),
+        2,
+        "the evicted pack and the orphan patch pack"
+    );
     let again = s.block_on(compactor.collect_garbage()).unwrap();
     assert_eq!(again.shallow_evicted, 0, "the current version's stays");
 
@@ -979,7 +990,9 @@ fn a_fetch_served_a_recorded_pack_updates_its_last_use() {
 /// each new tip's depth-1 pack from the whole closure made `git clone
 /// --depth=1` take 5 s when idle and fall back to the full history (20 s
 /// wait) during a burst. A tip whose tree brings back an object from below
-/// the previous pack's region still gets an exact pack, from the closure.
+/// the previous pack's region still gets its exact pack incrementally: the
+/// object comes from the closure into the layered answer's patch pack,
+/// which is one of the build's sources.
 #[test]
 fn later_tips_build_their_packs_from_the_last_recorded_pack() {
     let env = Env::new();
@@ -1010,11 +1023,146 @@ fn later_tips_build_their_packs_from_the_last_recorded_pack() {
     assert_eq!(s.metrics().shallow_builds_recorded(), 3);
     assert_eq!(
         s.metrics().shallow_builds_incremental(),
-        1,
-        "the old blob is in no incremental source, so the closure built it"
+        2,
+        "the old blob came from the closure in a patch, not a closure build"
     );
 
     // Depth 2 starts its own chain.
     fetch_like_stock(&env, &s, &src, "deep", &commits[13], 2);
-    assert_eq!(s.metrics().shallow_builds_incremental(), 1);
+    assert_eq!(s.metrics().shallow_builds_incremental(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Layered answers (a new tip whose exact pack is not built yet)
+
+/// A server whose builds never end within a request's wait, as a build of
+/// a monorepo-sized snapshot does not (about 20 s for 300,000 files):
+/// every request that could wait for one stops at once.
+fn impatient() -> TestServer {
+    writable(|c| {
+        let sc = c.shallow_cache.as_mut().unwrap();
+        sc.build_wait = Duration::ZERO;
+        sc.layered_wait = Duration::ZERO;
+    })
+}
+
+/// Waits until `n` exact packs are recorded.
+fn wait_recorded(s: &TestServer, n: u64) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while s.metrics().shallow_builds_recorded() < n {
+        assert!(Instant::now() < deadline, "the build never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Invariant (monorepo benchmark, item 9): right after trunk moves, a
+/// depth-1 fetch of the new tip, whose exact pack is still being built, is
+/// served at once the last recorded pack plus the packs pushed since: a
+/// valid shallow clone with stock Git's boundary, holding everything stock
+/// Git sends, at about one snapshot's size, never the full history (which
+/// was what such a fetch got when the build outlasted its wait). Once the
+/// build ends, fetches get the exact pack.
+#[test]
+fn a_new_tip_is_served_the_last_recorded_pack_and_the_pushes_since() {
+    let env = Env::new();
+    let (src, commits) = long_history(&env, 30);
+    let s = impatient();
+    let m = s.metrics();
+    push_each(&env, &s, &src, &commits[..29]);
+
+    // A cold start: nothing recorded to build on, so the first fetch gets
+    // the full history while the first build goes on.
+    let cold = storm(&env, "cold", &s.url("demo"), &commits[28], 1, 1);
+    assert_eq!(m.shallow_fallbacks(), 1);
+    let full_b = per_fetch(&cold);
+    wait_recorded(&s, 1);
+
+    // Trunk moves twice; a storm of the new tip does not wait for its
+    // build and is not sent the full history.
+    push_each_more(&env, &s, &src, &commits[29..]);
+    let tip = commits.last().unwrap();
+    let cached = m.shallow_cached();
+    let layered = storm(&env, "layered", &s.url("demo"), tip, 1, 4);
+    let stock = storm(
+        &env,
+        "stock",
+        &format!("file://{}", src.display()),
+        tip,
+        1,
+        1,
+    );
+    assert_eq!(m.shallow_fallbacks(), 1, "no fetch fell back");
+    // A fetch that arrives after the build ended gets the exact pack.
+    assert!(m.shallow_layered() >= 1);
+    assert_eq!(m.shallow_layered() + m.shallow_cached() - cached, 4);
+    let want: std::collections::BTreeSet<_> = objects(&env, &stock[0]).into_iter().collect();
+    for d in &layered {
+        assert_eq!(shallow_file(d), vec![tip.clone()]);
+        let got: std::collections::BTreeSet<_> = objects(&env, d).into_iter().collect();
+        assert!(got.is_superset(&want), "everything stock Git sends");
+    }
+    let (layered_b, stock_b) = (per_fetch(&layered), per_fetch(&stock));
+    eprintln!(
+        "depth-1 after a trunk move, bytes per fetch: stock {stock_b}, layered {layered_b}, \
+         full history {full_b}"
+    );
+    assert!(
+        layered_b * 10 <= stock_b * 15,
+        "about one snapshot: {layered_b} against stock's {stock_b}"
+    );
+    assert!(
+        full_b > stock_b * 4,
+        "the fixture's history is large: {full_b}"
+    );
+
+    // The build goes on; once it is recorded, fetches get the exact pack.
+    wait_recorded(&s, 2);
+    assert_eq!(
+        m.shallow_builds_incremental(),
+        1,
+        "built from the layered answer"
+    );
+    let exact = storm(&env, "exact", &s.url("demo"), tip, 1, 1);
+    assert_eq!(objects(&env, &exact[0]), objects(&env, &stock[0]));
+    assert_eq!(m.shallow_fallbacks(), 1);
+}
+
+/// Invariant: a new tip that brings back an object only older history
+/// holds (a revert) still gets a layered answer: what the last recorded
+/// pack and the pushes since miss comes from the version's closure into
+/// the patch pack. Without it the fetch fails (`missing blob object`).
+#[test]
+fn a_revert_is_patched_into_the_layered_answer() {
+    let env = Env::new();
+    let (src, mut commits) = long_history(&env, 12);
+    let s = impatient();
+    let m = s.metrics();
+    push_each(&env, &s, &src, &commits[..11]);
+    storm(&env, "cold", &s.url("demo"), &commits[10], 1, 1);
+    wait_recorded(&s, 1);
+
+    // dir0/file0.txt goes back to its first content, which only the
+    // initial commit's pack holds.
+    let back = vec![("dir0/file0.txt".to_owned(), lines(150, "f0 v0"))];
+    commits.push(env.commit(&src, &back, "bring back an old blob"));
+    push_each_more(&env, &s, &src, &commits[11..]);
+    let tip = commits.last().unwrap();
+    let (fallbacks, cached) = (m.shallow_fallbacks(), m.shallow_cached());
+    let got = storm(&env, "revert", &s.url("demo"), tip, 1, 2);
+    assert_eq!(m.shallow_fallbacks(), fallbacks, "no fetch fell back");
+    assert_eq!(m.shallow_layered() + m.shallow_cached() - cached, 2);
+    let stock = storm(
+        &env,
+        "revert-stock",
+        &format!("file://{}", src.display()),
+        tip,
+        1,
+        1,
+    );
+    let want: std::collections::BTreeSet<_> = objects(&env, &stock[0]).into_iter().collect();
+    for d in &got {
+        assert_eq!(shallow_file(d), shallow_file(&stock[0]));
+        let have: std::collections::BTreeSet<_> = objects(&env, d).into_iter().collect();
+        assert!(have.is_superset(&want));
+    }
 }

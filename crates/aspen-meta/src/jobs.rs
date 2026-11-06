@@ -24,7 +24,7 @@ use crate::store::SqlStore;
 /// instead of adding another (partial unique indexes `jobs_open_version`
 /// and `jobs_open_pack`).
 pub(crate) async fn enqueue(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     job: &NewJob,
 ) -> Result<JobId, StoreError> {
     let (version, pack) = job_target(&job.kind);
@@ -76,7 +76,7 @@ pub(crate) async fn enqueue(
 /// Writes `next` over `prev`, fenced on what was read: the row must still
 /// be in `prev`'s state, attempt and lease owner.
 async fn write_transition(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     prev: &Job,
     next: &Job,
 ) -> Result<(), StoreError> {
@@ -158,7 +158,7 @@ pub(crate) async fn claim(
 }
 
 async fn claim_in(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     tags: &[JobTag],
     owner: &str,
     lease: Duration,
@@ -257,7 +257,7 @@ pub(crate) async fn add_heat(store: &SqlStore, heat: &[CompactionHeat]) -> Resul
 
 async fn locked_job(
     store: &SqlStore,
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     id: JobId,
 ) -> Result<Job, StoreError> {
     let sql = format!(
@@ -412,7 +412,7 @@ impl SqlStore {
 
     async fn resolve_locked(
         &self,
-        conn: &mut sqlx::AnyConnection,
+        conn: &mut crate::conn::Conn,
         id: JobId,
     ) -> Result<Job, StoreError> {
         let job = locked_job(self, conn, id).await?;

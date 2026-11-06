@@ -1,8 +1,9 @@
 # The check both public-demo roots run on the account's budget: it must be a
 # monthly cost budget in USD over the whole account (no cost filters), of at
-# most $300, whose alerts all reach someone, and at least one of which fires
-# by the time spend passes $300. Spend beyond that
-# is the owner's decision (docs/PLAN.md section 6).
+# most max_limit_usd, whose alerts all reach someone, and at least one of
+# which fires by the time spend passes max_limit_usd. Spend beyond that is
+# the owner's decision (docs/PLAN.md section 6): the owner approved about
+# $650/day (about $20,000 a month) for the public share from 2026-11-06.
 #
 # The budget is read through Cloud Control, not the aws_budgets_budget data
 # source: provider 6.71's data source returns time_unit as null and no
@@ -26,9 +27,10 @@ variable "name" {
 }
 
 variable "max_limit_usd" {
-  description = "Largest monthly limit the check accepts."
+  description = "Largest monthly limit the check accepts: what the owner approved (account stack's budget_limit_usd ceiling)."
   type        = number
-  default     = 300
+  default     = 20000
+  nullable    = false
 }
 
 data "aws_cloudcontrolapi_resource" "budget" {

@@ -117,6 +117,93 @@ pub struct Main {
     /// Root tree entries other than `tiles` (a README), kept by every
     /// commit the server writes.
     pub extras: Arc<Vec<TreeEntry>>,
+    /// How much history `main` holds since its root commit.
+    pub history: History,
+}
+
+/// `main`'s history since its root commit (the first commit, or the last
+/// history reset): what a full clone of `main` fetches. Each commit the
+/// server writes on `main` records the counts before it in a
+/// `Place-History:` trailer ([`History::trailer`]), so a restart picks them
+/// up from the tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct History {
+    /// The root commit.
+    pub root: ObjectId,
+    /// Commits written on top of it.
+    pub commits: u64,
+    /// Bytes of the packs those commits and the root were written in
+    /// (deflated objects, so about what a clone downloads for them). After
+    /// a restart the tip's own pack is missing from the count, so it can
+    /// be up to one commit's pack short.
+    pub bytes: u64,
+}
+
+impl History {
+    /// The history of a `main` whose tip has no `Place-History:` trailer
+    /// and has parents: written before the server counted, so its size is
+    /// unknown and counts as over any limit.
+    pub const UNKNOWN: Self = Self {
+        root: ObjectId::ZERO,
+        commits: u64::MAX,
+        bytes: u64::MAX,
+    };
+
+    /// A history that is only `root`, written in a pack of `bytes`.
+    pub fn root(root: ObjectId, bytes: u64) -> Self {
+        Self {
+            root,
+            commits: 0,
+            bytes,
+        }
+    }
+
+    /// After one more commit, written in a pack of `bytes`.
+    pub fn grow(self, bytes: u64) -> Self {
+        Self {
+            root: self.root,
+            commits: self.commits.saturating_add(1),
+            bytes: self.bytes.saturating_add(bytes),
+        }
+    }
+
+    /// The trailer a commit on top of this history carries (with a
+    /// leading blank line when `first` is true, to start the trailers).
+    pub fn trailer(&self, first: bool) -> String {
+        let blank = if first { "\n" } else { "" };
+        if *self == Self::UNKNOWN {
+            return String::new();
+        }
+        format!(
+            "{blank}\nPlace-History: root={} commits={} bytes={}",
+            self.root, self.commits, self.bytes
+        )
+    }
+
+    /// The history before the commit whose raw object is `commit`: its
+    /// `Place-History:` trailer, or `None` without one.
+    pub fn parse(commit: &[u8]) -> Option<Self> {
+        let text = String::from_utf8_lossy(commit);
+        let line = text
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("Place-History: "))?;
+        let mut root = None;
+        let (mut commits, mut bytes) = (None, None);
+        for field in line.split(' ') {
+            match field.split_once('=') {
+                Some(("root", v)) => root = v.parse::<ObjectId>().ok(),
+                Some(("commits", v)) => commits = v.parse().ok(),
+                Some(("bytes", v)) => bytes = v.parse().ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            root: root?,
+            commits: commits?,
+            bytes: bytes?,
+        })
+    }
 }
 
 /// A branch the page shows.
@@ -737,6 +824,7 @@ mod tests {
             commit: ObjectId::from_bytes([1; 20]),
             pixels: Arc::new(vec![UNSET; 16]),
             extras: Arc::new(Vec::new()),
+            history: History::UNKNOWN,
         };
         let limits = SwarmLimits {
             max_agents: 10,
@@ -750,6 +838,30 @@ mod tests {
 
     fn tile(x: u32, color: u8) -> Tile {
         Tile { x, y: 0, color }
+    }
+
+    #[test]
+    fn history_trailers_round_trip_and_unknown_writes_none() {
+        let root = ObjectId::from_bytes([7; 20]);
+        let h = History::root(root, 100).grow(20).grow(30);
+        assert_eq!((h.commits, h.bytes), (2, 150));
+        let commit = format!(
+            "tree {}\nparent {}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nMerge{}",
+            ObjectId::from_bytes([1; 20]),
+            root,
+            h.trailer(true)
+        );
+        assert_eq!(History::parse(commit.as_bytes()), Some(h));
+        assert!(h.trailer(true).starts_with("\n\nPlace-History: "));
+        assert!(h.trailer(false).starts_with("\nPlace-History: "));
+        assert_eq!(History::UNKNOWN.trailer(true), "");
+        assert_eq!(History::parse(b"tree x\n\nno trailer"), None);
+        assert_eq!(
+            History::parse(b"m\n\nPlace-History: root=zz commits=1 bytes=2"),
+            None
+        );
+        // Saturates instead of wrapping: unknown stays over any limit.
+        assert_eq!(History::UNKNOWN.grow(5).bytes, u64::MAX);
     }
 
     #[test]

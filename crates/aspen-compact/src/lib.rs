@@ -28,7 +28,8 @@
 //!   against the union of its sources' `.idx` files before it uploads it.
 //! - Every compaction pack is **self-contained** and **base-first**, holds
 //!   **no object twice**, and has delta chains of at most
-//!   [`CompactConfig::max_delta_depth`] (50 by default): it is written by
+//!   [`CompactConfig::max_delta_depth`] (50 by default), and of at most
+//!   [`CompactConfig::max_tree_delta_depth`] (10) for trees: it is written by
 //!   [`aspen_pack::repack`] and then checked by
 //!   [`aspen_pack::verify::verify_pack`], whose `.idx` and entry table must
 //!   equal the writer's byte for byte.
@@ -94,7 +95,7 @@ use aspen_pack::verify::VerifyError;
 use aspen_pack::{LayoutError, MaxInflatedBytes, MaxObjectBytes};
 
 pub use build::{CompactReport, Compactor};
-pub use gc::GcReport;
+pub use gc::{GcMetrics, GcReport};
 pub use index::IndexReport;
 pub use shallow::{ShallowBuild, ShallowSpec};
 pub use worker::{JobOutcome, JobReport, Worker, WorkerOptions};
@@ -121,6 +122,35 @@ pub const GC_ROUNDS: u32 = 50;
 /// Default [`CompactConfig::gc_pass_budget`]: 30 seconds.
 pub const DEFAULT_GC_PASS_BUDGET: Duration = Duration::from_secs(30);
 
+/// Default [`CompactConfig::gc_sweep_batch`]: 1,000 registrations per sweep
+/// transaction.
+pub const DEFAULT_GC_SWEEP_BATCH: u32 = 1000;
+
+/// Default [`CompactConfig::gc_lease`]: 5 minutes, one pass interval
+/// ([`WorkerOptions::gc_every`]), so the holder keeps the lease from one
+/// pass to the next.
+pub const DEFAULT_GC_LEASE: Duration = Duration::from_secs(300);
+
+/// The shortest [`CompactConfig::gc_lease`] accepted: 10 seconds. Each
+/// sweep transaction extends the lease, so it only has to outlast the
+/// gaps between them.
+pub const MIN_GC_LEASE: Duration = Duration::from_secs(10);
+
+/// A lease owner unique to this process: its ID and the time it first
+/// asked. Compactors in one process share it, so they share the
+/// garbage-collection lease; another process's differs.
+fn process_owner() -> String {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            format!("aspen-{}-{nanos:x}", std::process::id())
+        })
+        .clone()
+}
+
 // The defaults must pass `CompactConfig::validate`.
 const _: () =
     assert!(DEFAULT_GC_GRACE.as_secs() >= 2 * aspen_core::pack::MAX_PACK_URL_LIFETIME.as_secs());
@@ -144,6 +174,14 @@ pub struct CompactConfig {
     /// stored undeltified. Stitched fetches add the depths of their
     /// segments, so this keeps them far below Git's limit of 4,095 (A2).
     pub max_delta_depth: u32,
+    /// Longest delta chain a tree (any object but a blob) may sit at in a
+    /// compaction pack. Keep-first repacking hangs each version of a hot
+    /// tree (the root, the directories above busy files) off the one
+    /// before, so without its own bound hot trees reached
+    /// [`CompactConfig::max_delta_depth`] in every compaction pack, and a
+    /// push, which needs the trees on its paths as delta bases, read 50
+    /// levels of them (monorepo benchmark, item 11). Default 10.
+    pub max_tree_delta_depth: u32,
     /// How long an orphaned pack must go unregistered (or, for an evicted
     /// exact shallow pack, unnamed) before it is deleted. It bounds two
     /// things (blob deletions are safe however late they run):
@@ -190,10 +228,26 @@ pub struct CompactConfig {
     /// is deleted a full [`CompactConfig::gc_grace`] later. At least
     /// [`MIN_SHALLOW_UNUSED`] ([`CompactConfig::validate`]).
     pub shallow_unused: Duration,
+    /// Registrations one sweep transaction reads, after where the last one
+    /// stopped (plus as many packs of its audit); at least 1. A pass runs
+    /// sweep transactions until the sweep has caught up or
+    /// [`CompactConfig::gc_pass_budget`] is spent, so this bounds the cost
+    /// and lock time of one transaction, not how much a pass collects.
+    pub gc_sweep_batch: u32,
+    /// How long the garbage-collection lease lasts after it was acquired or
+    /// extended ([`aspen_core::meta::MetaStore::acquire_lease`]). One
+    /// process at a time collects garbage; each sweep transaction extends
+    /// the lease, and a holder that dies loses it this long after its last
+    /// extension. At least [`MIN_GC_LEASE`].
+    pub gc_lease: Duration,
+    /// The name this compactor holds the garbage-collection lease under.
+    /// Compactors with the same owner share the lease; processes must use
+    /// different owners. The default is unique per process.
+    pub gc_owner: String,
 }
 
 impl CompactConfig {
-    /// The defaults: fanout 16, depth 50, 2 hours of grace, 100 packs per
+    /// The defaults: fanout 16, depth 50 (10 for trees), 2 hours of grace, 100 packs per
     /// sweep, passes of at most 30 seconds, shallow pack recordings of
     /// superseded versions kept 10 minutes and unused ones 24 hours. With a pass every 5 minutes
     /// ([`WorkerOptions::gc_every`]) unreachable data is deleted within
@@ -209,11 +263,15 @@ impl CompactConfig {
             max_object_bytes,
             max_inflated_bytes,
             max_delta_depth: 50,
+            max_tree_delta_depth: 10,
             gc_grace: DEFAULT_GC_GRACE,
             gc_batch: 100,
             gc_pass_budget: DEFAULT_GC_PASS_BUDGET,
             shallow_ttl: DEFAULT_SHALLOW_TTL,
             shallow_unused: DEFAULT_SHALLOW_UNUSED,
+            gc_sweep_batch: DEFAULT_GC_SWEEP_BATCH,
+            gc_lease: DEFAULT_GC_LEASE,
+            gc_owner: process_owner(),
         }
     }
 
@@ -225,8 +283,14 @@ impl CompactConfig {
     /// while a URL handed out for it still works). `aspen serve` checks
     /// this at startup.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.gc_batch == 0 {
+        if self.gc_batch == 0 || self.gc_sweep_batch == 0 {
             return Err(ConfigError::GcBatchZero);
+        }
+        if self.gc_lease < MIN_GC_LEASE {
+            return Err(ConfigError::GcLeaseTooShort {
+                lease: self.gc_lease,
+                min: MIN_GC_LEASE,
+            });
         }
         if self.shallow_unused < MIN_SHALLOW_UNUSED {
             return Err(ConfigError::ShallowUnusedTooShort {
@@ -257,7 +321,9 @@ impl CompactConfig {
     /// It holds while each pass finishes what is due: at most
     /// [`GC_ROUNDS`] × `gc_batch` items per step that are due in one pass,
     /// within `gc_pass_budget`. A larger backlog is worked off over later
-    /// passes, one batch per step per pass at least.
+    /// passes, one batch per step per pass at least. When the process
+    /// holding the garbage-collection lease dies, add up to
+    /// [`CompactConfig::gc_lease`] for another to take it over.
     pub fn reclaim_bound(&self, gc_every: Duration) -> Duration {
         self.shallow_ttl + self.gc_grace + gc_every * 2
     }
@@ -266,9 +332,17 @@ impl CompactConfig {
 /// Why a [`CompactConfig`] was refused ([`CompactConfig::validate`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    /// `gc_batch` is 0.
-    #[error("gc_batch must be at least 1")]
+    /// `gc_batch` or `gc_sweep_batch` is 0.
+    #[error("gc_batch and gc_sweep_batch must be at least 1")]
     GcBatchZero,
+    /// `gc_lease` is shorter than [`MIN_GC_LEASE`].
+    #[error("gc_lease {lease:?} is shorter than {min:?}")]
+    GcLeaseTooShort {
+        /// The configured lease.
+        lease: Duration,
+        /// The shortest accepted.
+        min: Duration,
+    },
     /// `shallow_unused` is shorter than [`MIN_SHALLOW_UNUSED`].
     #[error("shallow_unused {unused:?} is shorter than {min:?}")]
     ShallowUnusedTooShort {
@@ -360,6 +434,34 @@ mod tests {
         let mut c = config();
         c.gc_batch = 0;
         assert_eq!(c.validate(), Err(ConfigError::GcBatchZero));
+        let mut c = config();
+        c.gc_sweep_batch = 0;
+        assert_eq!(c.validate(), Err(ConfigError::GcBatchZero));
+    }
+
+    /// Throughput item 7: the garbage-collection lease outlasts the gaps
+    /// between sweep transactions, and every process holds it under its own
+    /// name while compactors of one process share it.
+    #[test]
+    fn validate_refuses_a_short_lease_and_owners_are_per_process() {
+        let mut c = config();
+        assert_eq!(c.gc_lease, DEFAULT_GC_LEASE);
+        c.gc_lease = MIN_GC_LEASE;
+        assert_eq!(c.validate(), Ok(()), "exactly the minimum");
+        c.gc_lease = MIN_GC_LEASE - Duration::from_millis(1);
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::GcLeaseTooShort {
+                lease: c.gc_lease,
+                min: MIN_GC_LEASE,
+            })
+        );
+        assert_eq!(config().gc_owner, config().gc_owner);
+        assert!(
+            config()
+                .gc_owner
+                .starts_with(&format!("aspen-{}-", std::process::id()))
+        );
     }
 
     /// Invariant (issue #108): unused recordings are never evicted on a

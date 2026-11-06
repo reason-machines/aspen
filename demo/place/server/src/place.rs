@@ -38,10 +38,10 @@ use crate::git::{
     MODE_FILE, MODE_TREE, PackBuilder, Report, TreeEntry, parse_commit, parse_tree,
     receive_request, write_commit, write_tree,
 };
-use crate::hook::{Accepted, CheckLimits, INTERNAL_KEY, Shared, Waiting, Writer};
+use crate::hook::{Accepted, CheckLimits, INTERNAL_KEY, MainHistory, Shared, Waiting, Writer};
 use crate::limits::{Slots, Windows};
 use crate::rules::{self, Rules, TRUNK_REF, Tile};
-use crate::state::{Actor, Main, State, SwarmLimits, UNSET, now_ms};
+use crate::state::{Actor, History, Main, State, SwarmLimits, UNSET, now_ms};
 
 /// Settings of a `place` deployment.
 #[derive(Debug, Clone)]
@@ -54,16 +54,33 @@ pub struct PlaceConfig {
     pub pushes_per_minute: usize,
     /// A branch idle this long, with all its tiles merged, is deleted.
     pub branch_ttl: Duration,
-    /// How often the merger bot runs.
+    /// How often the merger bot runs while pushes arrive at up to
+    /// [`Self::busy_pushes_per_second`].
     pub merge_interval: Duration,
+    /// Above this many pushes a second (measured since the last merge) the
+    /// merger waits longer between runs, in proportion to the rate, up to
+    /// [`Self::merge_interval_max`] ([`merge_wait`]). A merge costs the
+    /// same however many pushes it folds, so under load fewer, larger
+    /// merges keep the merger's share of the server and the growth of
+    /// `main`'s history down; the page shows unmerged pushes as branch
+    /// overlays meanwhile.
+    pub busy_pushes_per_second: u32,
+    /// The longest the merger waits between runs under load (never less
+    /// than [`Self::merge_interval`]).
+    pub merge_interval_max: Duration,
     /// How often, at most, the merger bot merges when only ambient agents
     /// (`agent/`) have pushes pending; a push from anyone else is merged on
     /// the next run and takes theirs along. Every merge stores a whole
-    /// `tiles/` tree in `main`'s history (about 9 KB on a painted 64 x 64
-    /// canvas, with no deltas yet), and a full clone fetches all of them,
-    /// so this bounds how fast idle painting grows a clone: about 2.6 MB a
-    /// day at the default of 5 minutes.
+    /// `tiles/` tree in `main`'s history (about 12 KiB on a full 64 x 64
+    /// canvas: stored packs have no deltas), so this slows how fast idle
+    /// painting uses up [`Self::history_max_bytes`].
     pub ambient_merge_interval: Duration,
+    /// Once the commits written on `main` since its root (each with its
+    /// whole `tiles/` tree) were stored in packs of this many bytes in all,
+    /// the merger starts `main`'s history again from one root commit
+    /// holding the canvas as it is ([`Place::bound_history`]), so a full
+    /// clone of `main` stays about this size. 0 never starts it again.
+    pub history_max_bytes: u64,
     /// Mean time between the pushes of one sprite an ambient agent paints
     /// (each is spread uniformly over half to one and a half times this).
     /// Every push is a commit on the agent's branch, advertised until it
@@ -146,7 +163,10 @@ impl PlaceConfig {
             pushes_per_minute: 30,
             branch_ttl: Duration::from_secs(600),
             merge_interval: Duration::from_millis(3000),
+            busy_pushes_per_second: 5,
+            merge_interval_max: Duration::from_secs(30),
             ambient_merge_interval: Duration::from_secs(300),
+            history_max_bytes: 8 << 20,
             ambient_interval: Duration::from_secs(30),
             ambient_sprite_pause: Duration::from_secs(1800),
             keep_areas: Vec::new(),
@@ -213,8 +233,30 @@ impl PlaceConfig {
         if self.event_stream_max_age < Duration::from_secs(1) {
             return Err("the event stream age limit must be at least 1 s".into());
         }
+        if self.merge_interval.is_zero() {
+            return Err("the merge interval must be above 0".into());
+        }
+        if self.busy_pushes_per_second == 0 {
+            return Err("busy pushes per second must be at least 1".into());
+        }
         Ok(())
     }
+}
+
+/// How long the merger waits after a run before the next, given `pending`
+/// pushes arrived in the `elapsed` time since it: `merge_interval` while
+/// that is at most `busy_pushes_per_second`, and longer in proportion to
+/// the rate above it, up to `merge_interval_max`. At the defaults (3 s, 5
+/// pushes a second, 30 s) the merger runs every 3 s up to 5 pushes a
+/// second, every 6 s at 10 and every 30 s from 50.
+pub fn merge_wait(config: &PlaceConfig, pending: usize, elapsed: Duration) -> Duration {
+    let base = config.merge_interval;
+    let elapsed_ms = elapsed.as_millis().max(1);
+    // base * (pending / elapsed) / busy, in milliseconds.
+    let wanted_ms = base.as_millis() * (pending as u128) * 1000
+        / (elapsed_ms * u128::from(config.busy_pushes_per_second.max(1)));
+    let wanted = Duration::from_millis(u64::try_from(wanted_ms).unwrap_or(u64::MAX));
+    wanted.clamp(base, config.merge_interval_max.max(base))
 }
 
 fn is_color(c: &str) -> bool {
@@ -509,8 +551,13 @@ pub async fn ensure_repo<M: MetaStore>(meta: &M, name: &str) -> Result<Repo, Pla
 
 /// The state the hook and the service share, before `main` is loaded.
 /// Give `PlaceHook(shared.clone())` to the receive-pack configuration,
-/// then call [`Place::open`].
-pub fn shared(repo: &Repo, config: &PlaceConfig) -> Arc<Shared> {
+/// then call [`Place::open`]. `main_history` is usually
+/// [`crate::hook::IndexedMain`] over the metadata store.
+pub fn shared(
+    repo: &Repo,
+    config: &PlaceConfig,
+    main_history: Arc<dyn MainHistory>,
+) -> Arc<Shared> {
     let rules = Arc::new(config.rules.clone());
     let palette_blobs = rules
         .palette
@@ -521,6 +568,7 @@ pub fn shared(repo: &Repo, config: &PlaceConfig) -> Arc<Shared> {
         commit: ObjectId::ZERO,
         pixels: Arc::new(vec![UNSET; rules.len()]),
         extras: Arc::new(Vec::new()),
+        history: History::UNKNOWN,
     };
     let mut state = State::new(rules.clone(), main, config.swarm, config.event_backlog);
     state.kill.engaged = config.kill_switch;
@@ -537,6 +585,7 @@ pub fn shared(repo: &Repo, config: &PlaceConfig) -> Arc<Shared> {
         accepted: Mutex::new(Waiting::default()),
         committed: Mutex::new(HashMap::new()),
         git_quota: Mutex::new(Windows::new(config.pushes_per_minute, 60_000, 100_000)),
+        main_history,
     })
 }
 
@@ -697,20 +746,20 @@ where
         }
         let mut extras = (*main.extras).clone();
         extras[at].id = id;
-        let commit = self.add_commit(
-            &mut pb,
-            &main.pixels,
-            &extras,
-            &[main.commit],
-            "Update the README\n\nWritten by the place server; the canvas is unchanged.",
+        let message = format!(
+            "Update the README\n\nWritten by the place server; the canvas is unchanged.{}",
+            main.history.trailer(true)
         );
+        let commit = self.add_commit(&mut pb, &main.pixels, &extras, &[main.commit], &message);
+        let pack = pb.finish();
+        let history = main.history.grow(pack.len() as u64);
         match self
             .push(
                 &Self::trunk(),
                 false,
                 main.commit,
                 commit,
-                Some(pb.finish()),
+                Some(pack),
                 "merger",
             )
             .await?
@@ -719,6 +768,7 @@ where
                 self.with_state(|s| {
                     s.main.commit = commit;
                     s.main.extras = Arc::new(extras);
+                    s.main.history = history;
                 });
                 Ok(())
             }
@@ -733,10 +783,27 @@ where
         let main = match current.as_ref().and_then(|v| v.value.tip().map(|t| (v, t))) {
             Some((v, tip)) => {
                 let (pixels, extras) = self.read_canvas(v, tip).await?;
+                let history = match self.svc.read_object(self.repo.id, v.id, tip).await? {
+                    // The trailer counts the history before the tip; the
+                    // tip is one more commit, its pack's size unknown.
+                    Some((ObjectKind::Commit, data)) => History::parse(&data).map_or_else(
+                        || {
+                            match parse_commit(&data) {
+                                // A root without a trailer: the history is the root.
+                                Ok((_, parents)) if parents.is_empty() => History::root(tip, 0),
+                                // Written before the server counted: unknown.
+                                _ => History::UNKNOWN,
+                            }
+                        },
+                        |h| h.grow(0),
+                    ),
+                    _ => return Err(PlaceError::Corrupt(format!("{tip} is not a commit"))),
+                };
                 Main {
                     commit: tip,
                     pixels: Arc::new(pixels),
                     extras: Arc::new(extras),
+                    history,
                 }
             }
             None => {
@@ -749,15 +816,10 @@ where
                 }];
                 let pixels = vec![UNSET; self.shared.rules.len()];
                 let commit = self.add_commit(&mut pb, &pixels, &extras, &[], "Start the canvas");
+                let pack = pb.finish();
+                let history = History::root(commit, pack.len() as u64);
                 match self
-                    .push(
-                        &trunk,
-                        false,
-                        ObjectId::ZERO,
-                        commit,
-                        Some(pb.finish()),
-                        "merger",
-                    )
+                    .push(&trunk, false, ObjectId::ZERO, commit, Some(pack), "merger")
                     .await?
                 {
                     Report::Ok => {}
@@ -768,6 +830,7 @@ where
                     commit,
                     pixels: Arc::new(pixels),
                     extras: Arc::new(extras),
+                    history,
                 }
             }
         };
@@ -1051,11 +1114,9 @@ where
             plan.branches.len(),
             plan.through
         );
-        message.push_str(&memory_trailers(
-            &self.shared.rules,
-            &plan.people,
-            &plan.sprites,
-        ));
+        let memory = memory_trailers(&self.shared.rules, &plan.people, &plan.sprites);
+        message.push_str(&memory);
+        message.push_str(&main.history.trailer(memory.is_empty()));
         let commit = self.add_commit(
             &mut pb,
             &plan.pixels,
@@ -1063,20 +1124,23 @@ where
             &[main.commit],
             &message,
         );
+        let pack = pb.finish();
+        let history = main.history.grow(pack.len() as u64);
         match self
             .push(
                 &Self::trunk(),
                 false,
                 main.commit,
                 commit,
-                Some(pb.finish()),
+                Some(pack),
                 "merger",
             )
             .await?
         {
-            Report::Ok => Ok(Some(
-                self.with_state(|s| s.apply_merge(commit, plan, now_ms())),
-            )),
+            Report::Ok => Ok(Some(self.with_state(|s| {
+                s.main.history = history;
+                s.apply_merge(commit, plan, now_ms())
+            }))),
             Report::Rejected(r) => {
                 // `main` moved under us (an operator, another instance):
                 // start again from what is stored.
@@ -1086,87 +1150,17 @@ where
         }
     }
 
-    /// Replaces `main`'s history with one root commit holding the canvas as
-    /// it is now, after merging what is pending, and deletes every branch
-    /// whose tiles have all merged (they hold the old history). The picture
-    /// does not change; clones made before see a forced update of `main`.
-    /// An operator's tool for a demo whose history has outgrown its use:
-    /// every stroke stores a whole `tiles/` tree, and stored packs have no
-    /// deltas yet, so a full clone grows with every merge. Garbage
-    /// collection then deletes the packs only the old history reached.
-    /// Returns the new root commit.
+    /// Starts `main`'s history again from one root commit holding the
+    /// canvas as it is now, after merging what is pending, and deletes
+    /// every branch whose tiles have all merged (they hold the old
+    /// history). The operator's endpoint (`POST /admin/reset-history`);
+    /// the merger does the same on its own, without deleting branches, when
+    /// the history outgrows [`PlaceConfig::history_max_bytes`]
+    /// ([`Place::bound_history`]). Returns the new root commit.
     pub async fn reset_history(&self) -> Result<ObjectId, PlaceError> {
-        self.merge_once().await?;
-        let commit = {
-            let _guard = self.merge_lock.lock().await;
-            let trunk = Self::trunk();
-            let version = self
-                .meta
-                .current_version(self.repo.id, &trunk)
-                .await?
-                .ok_or_else(|| PlaceError::Corrupt("main does not exist".into()))?;
-            let main = self.with_state(|s| s.main.clone());
-            if version.value.tip() != Some(main.commit) {
-                // `main` moved under us: start again from what is stored.
-                self.load_main().await?;
-                return Err(PlaceError::Refused("main moved; try again".into()));
-            }
-            // An orphan commit's pack holds everything it reaches: the
-            // extras (the README) are read from the current history.
-            let mut pb = PackBuilder::default();
-            for e in main.extras.iter() {
-                match self.svc.read_object(self.repo.id, version.id, e.id).await? {
-                    Some((ObjectKind::Blob, data)) => {
-                        pb.add(ObjectKind::Blob, data);
-                    }
-                    _ => {
-                        return Err(PlaceError::Corrupt(format!(
-                            "{} at the root of main is not a blob",
-                            String::from_utf8_lossy(&e.name)
-                        )));
-                    }
-                }
-            }
-            let message = format!(
-                "Start the canvas again from main at {}\n\nThe history before this commit was removed by an operator; the canvas is\nunchanged.",
-                main.commit
-            );
-            let commit = self.add_commit(&mut pb, &main.pixels, &main.extras, &[], &message);
-            let body = crate::git::forced_receive_request(
-                trunk.as_str(),
-                main.commit,
-                commit,
-                pb.finish(),
-            );
-            let repo = Repo {
-                settings: self
-                    .repo
-                    .settings
-                    .clone()
-                    .with_allow_force(aspen_core::repo::ForcePolicy::All),
-                ..self.repo.clone()
-            };
-            let out = self
-                .svc
-                .push(
-                    &repo,
-                    None,
-                    &Internal("operator"),
-                    None,
-                    std::io::Cursor::new(body),
-                )
-                .await
-                .map_err(|ServiceError::Store(e)| e)?;
-            match crate::git::parse_report(&out.response) {
-                Report::Ok => {}
-                Report::Rejected(r) => {
-                    self.load_main().await?;
-                    return Err(PlaceError::Refused(r));
-                }
-            }
-            self.with_state(|s| s.main.commit = commit);
-            commit
-        };
+        let commit = self
+            .restart_history("The history before this commit was removed by an operator.")
+            .await?;
         let due = self.with_state(|s| s.expirable(0, u64::MAX));
         for (branch, head, deleted) in due {
             let lock = self.branch_lock(&branch);
@@ -1184,6 +1178,129 @@ where
             self.with_state(|s| s.expire(&branch, now_ms()));
             self.locks.lock().expect("not poisoned").remove(&branch);
         }
+        Ok(commit)
+    }
+
+    /// Starts `main`'s history again ([`Self::reset_history`], branches
+    /// left alone) when the packs written on it since its root reach
+    /// [`PlaceConfig::history_max_bytes`]. Returns the new root commit, or
+    /// `None` when the history is within the limit. The merger runs it
+    /// after every merge.
+    ///
+    /// Every merge stores a whole `tiles/` tree (stored packs have no
+    /// deltas), so without this a full clone of `main` grows with every
+    /// merge. Nothing a client relies on is lost:
+    ///
+    /// - pending pushes are merged first, and later ones merge onto the
+    ///   new root (merges replay tiles, never Git history);
+    /// - branches keep their history and their pushes still merge;
+    /// - a clone made before the reset still pushes: its new commits are
+    ///   checked from the earlier `main` they build on
+    ///   ([`crate::hook::MainHistory`]);
+    /// - the earlier history stays in the repository (ref versions are
+    ///   never deleted) and the root commit names its tip, so
+    ///   `git fetch <url> <tip>` still gets all of it.
+    ///
+    /// Clones made before see a forced update of `main`.
+    pub async fn bound_history(&self) -> Result<Option<ObjectId>, PlaceError> {
+        let max = self.config.history_max_bytes;
+        if max == 0 || self.with_state(|s| s.main.history.bytes) < max {
+            return Ok(None);
+        }
+        let why = format!(
+            "main's history since its last root reached {max} bytes of packs\n(PLACE_HISTORY_MAX_BYTES), so the server started it again."
+        );
+        self.restart_history(&why).await.map(Some)
+    }
+
+    /// Merges what is pending, then force-updates `main` to a root commit
+    /// with the same canvas, whose message says `why` and names the old
+    /// tip, and carries the memory of recent paint
+    /// ([`Self::rebuild_memory`] reads it after a restart).
+    async fn restart_history(&self, why: &str) -> Result<ObjectId, PlaceError> {
+        self.merge_once().await?;
+        let _guard = self.merge_lock.lock().await;
+        let trunk = Self::trunk();
+        let version = self
+            .meta
+            .current_version(self.repo.id, &trunk)
+            .await?
+            .ok_or_else(|| PlaceError::Corrupt("main does not exist".into()))?;
+        let main = self.with_state(|s| s.main.clone());
+        if version.value.tip() != Some(main.commit) {
+            // `main` moved under us: start again from what is stored.
+            self.load_main().await?;
+            return Err(PlaceError::Refused("main moved; try again".into()));
+        }
+        // An orphan commit's pack holds everything it reaches: the
+        // extras (the README) are read from the current history.
+        let mut pb = PackBuilder::default();
+        for e in main.extras.iter() {
+            match self.svc.read_object(self.repo.id, version.id, e.id).await? {
+                Some((ObjectKind::Blob, data)) => {
+                    pb.add(ObjectKind::Blob, data);
+                }
+                _ => {
+                    return Err(PlaceError::Corrupt(format!(
+                        "{} at the root of main is not a blob",
+                        String::from_utf8_lossy(&e.name)
+                    )));
+                }
+            }
+        }
+        let (people, sprites) = self.with_state(|s| {
+            let now = now_ms();
+            let fresh = |at: &u64| at.saturating_add(crate::state::HUMAN_MEMORY_MS) > now;
+            let tiles = |m: &HashMap<usize, u64>| {
+                let mut v: Vec<usize> = m
+                    .iter()
+                    .filter(|(_, at)| fresh(at))
+                    .map(|(i, _)| *i)
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            (tiles(&s.human_tiles), tiles(&s.sprite_tiles))
+        });
+        let message = format!(
+            "Start the canvas again from main at {old}\n\n{why} The canvas is unchanged.\nThe earlier history is still in the repository:\n\n    git fetch <this repository's URL> {old}{memory}",
+            old = main.commit,
+            memory = memory_trailers(&self.shared.rules, &people, &sprites),
+        );
+        let commit = self.add_commit(&mut pb, &main.pixels, &main.extras, &[], &message);
+        let pack = pb.finish();
+        let history = History::root(commit, pack.len() as u64);
+        let body = crate::git::forced_receive_request(trunk.as_str(), main.commit, commit, pack);
+        let repo = Repo {
+            settings: self
+                .repo
+                .settings
+                .clone()
+                .with_allow_force(aspen_core::repo::ForcePolicy::All),
+            ..self.repo.clone()
+        };
+        let out = self
+            .svc
+            .push(
+                &repo,
+                None,
+                &Internal("operator"),
+                None,
+                std::io::Cursor::new(body),
+            )
+            .await
+            .map_err(|ServiceError::Store(e)| e)?;
+        match crate::git::parse_report(&out.response) {
+            Report::Ok => {}
+            Report::Rejected(r) => {
+                self.load_main().await?;
+                return Err(PlaceError::Refused(r));
+            }
+        }
+        self.with_state(|s| {
+            s.main.commit = commit;
+            s.main.history = history;
+        });
         Ok(commit)
     }
 
@@ -1358,6 +1475,9 @@ where
         merge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // When a merge with only ambient pushes may next run.
         let mut ambient_due = tokio::time::Instant::now();
+        // The tick of the last merge: the merger waits `merge_wait` after it.
+        // None until the first, so the first tick merges at once.
+        let mut last_merge: Option<tokio::time::Instant> = None;
         let mut agents = tokio::time::interval(Duration::from_millis(100));
         agents.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
@@ -1366,13 +1486,24 @@ where
                 () = &mut shutdown => break,
                 _ = merge.tick() => {
                     let now = tokio::time::Instant::now();
-                    let prompt = self.with_state(|s| {
-                        s.pending.iter().any(|p| !p.branch.starts_with(AMBIENT_PREFIX))
+                    let (prompt, pending) = self.with_state(|s| {
+                        let prompt = s.pending.iter().any(|p| !p.branch.starts_with(AMBIENT_PREFIX));
+                        (prompt, s.pending.len())
                     });
-                    if prompt || now >= ambient_due {
+                    let since = last_merge.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+                    let due = since >= merge_wait(&self.config, pending, since);
+                    if (prompt && due) || (!prompt && now >= ambient_due) {
                         match self.merge_once().await {
                             Ok(Some(_)) => {
+                                last_merge = Some(now);
                                 ambient_due = now + self.config.ambient_merge_interval;
+                                match self.bound_history().await {
+                                    Ok(Some(root)) => eprintln!(
+                                        "place: main's history reached its limit; started again at {root}"
+                                    ),
+                                    Ok(None) => {}
+                                    Err(e) => eprintln!("place: starting main's history again failed: {e}"),
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => eprintln!("place: merge failed: {e}"),

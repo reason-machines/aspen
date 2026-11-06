@@ -526,7 +526,7 @@ async fn a_branch_at_a_non_commit_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_advertisement_shows_trunk_and_log_spaced_haves() {
+async fn the_advertisement_shows_trunk_and_earlier_tips_as_haves() {
     let s = Server::start().await;
     let w = s.clone_dir("w");
     let mut tips = Vec::new();
@@ -543,9 +543,9 @@ async fn the_advertisement_shows_trunk_and_log_spaced_haves() {
         .unwrap();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains(&format!("{} refs/heads/main", tips[5])));
-    // 1, 2 and 4 versions back: seqs 5, 4 and 2.
-    for i in [4, 3, 1] {
-        assert!(text.contains(&format!("{} .have", tips[i])), "{text}");
+    // Every earlier version, inside the dense window.
+    for t in &tips[..5] {
+        assert!(text.contains(&format!("{t} .have")), "{text}");
     }
     assert!(!text.contains("refs/heads/side"));
     let scoped = s

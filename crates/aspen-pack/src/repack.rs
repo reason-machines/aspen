@@ -31,7 +31,14 @@
 //!   stored undeltified instead: its full object is resolved from its own
 //!   source pack and recompressed, and its dependents count from 0 again.
 //!   The output's depth is at most the cap whatever the inputs (decisions
-//!   log, A2: compaction writes packs at depth 50 or less).
+//!   log, A2: compaction writes packs at depth 50 or less). Trees (every
+//!   object that is not a blob) have their own, lower cap,
+//!   [`RepackOptions::max_tree_delta_depth`]: a push needs the trees on the
+//!   paths it changes as delta bases, and keep-first chains each version of
+//!   a hot tree (the root, the directories above busy files) onto the one
+//!   before, so without it every compaction pack held its hot trees at the
+//!   full depth and each push read 50 levels of them (monorepo benchmark,
+//!   item 11). An entry's kind is its chain's: a delta's is its base's.
 //!
 //! The same sources in the same order (and, for a subset, the same kept
 //! set) always give a byte-identical pack, so a retried compaction produces
@@ -97,6 +104,10 @@ pub struct RepackOptions {
     /// deeper is stored undeltified. Compaction uses 50, Git's default
     /// `pack.depth` (decisions log, A2).
     pub max_delta_depth: u32,
+    /// The longest delta chain a tree, commit or tag may sit at (anything
+    /// but a blob); at most `max_delta_depth` applies when this is larger.
+    /// Compaction uses 10 (decisions log, item 11).
+    pub max_tree_delta_depth: u32,
     /// Bounds each object resolved to undeltify an entry.
     pub max_object_bytes: MaxObjectBytes,
 }
@@ -125,6 +136,9 @@ pub struct RepackedPack {
     /// Longest delta chain (0: no deltas); at most
     /// [`RepackOptions::max_delta_depth`].
     pub max_delta_depth: u32,
+    /// Longest delta chain of an object that is not a blob; at most
+    /// [`RepackOptions::max_tree_delta_depth`].
+    pub max_tree_delta_depth: u32,
     /// Kept deltas stored undeltified: because they would have exceeded the
     /// depth cap, or because their base was left out
     /// ([`RepackedPack::base_left_out`] of them).
@@ -163,8 +177,9 @@ impl RepackedPack {
 struct Slot {
     /// Index of the first source that holds it: that copy is kept.
     owner: u32,
-    /// Output offset and delta depth of the kept copy, once emitted.
-    emitted: Option<(u64, u32)>,
+    /// Output offset, delta depth and object kind of the kept copy, once
+    /// emitted.
+    emitted: Option<(u64, u32, Kind)>,
 }
 
 /// Writes one pack holding the union of `sources`' objects, first copy
@@ -271,6 +286,7 @@ fn repack(
             idx_entries: Vec::with_capacity(count as usize),
             entries: Vec::with_capacity(count as usize),
             max_depth: 0,
+            max_tree_depth: 0,
             undeltified: 0,
             base_left_out: 0,
         };
@@ -324,6 +340,7 @@ fn repack(
             object_count: count,
             ref_delta_count: table.ref_delta_count(),
             max_delta_depth: out.max_depth,
+            max_tree_delta_depth: out.max_tree_depth,
             undeltified: out.undeltified,
             base_left_out: out.base_left_out,
             dropped,
@@ -341,8 +358,27 @@ struct Output {
     idx_entries: Vec<IdxEntry>,
     entries: Vec<PackEntry>,
     max_depth: u32,
+    max_tree_depth: u32,
     undeltified: u32,
     base_left_out: u32,
+}
+
+/// What an entry resolves to, as far as the depth caps care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Blob,
+    /// A tree, commit or tag.
+    Tree,
+}
+
+impl Kind {
+    fn of(kind: EntryKind) -> Option<Self> {
+        match kind {
+            EntryKind::Blob => Some(Self::Blob),
+            EntryKind::Tree | EntryKind::Commit | EntryKind::Tag => Some(Self::Tree),
+            EntryKind::OfsDelta { .. } | EntryKind::RefDelta { .. } => None,
+        }
+    }
 }
 
 /// Checks that a source's file, `.idx` and entry table describe the same
@@ -498,8 +534,14 @@ fn copy_source<W: Write>(
             },
         };
         let at = dst.written;
-        let depth = base.map_or(0, |(_, d)| d + 1);
-        if base_left_out || depth > options.max_delta_depth {
+        let depth = base.map_or(0, |(_, d, _)| d + 1);
+        // A delta is what its base is; a full entry says what it is.
+        let kind = base.map(|(_, _, k)| k).or(Kind::of(e.kind));
+        let cap = match kind {
+            Some(Kind::Tree) => options.max_tree_delta_depth.min(options.max_delta_depth),
+            _ => options.max_delta_depth,
+        };
+        if base_left_out || depth > cap {
             // No base in the output, or too deep: store the object whole,
             // which restarts the chain.
             src.skip(len - hl as u64, copy_buf)?;
@@ -520,20 +562,31 @@ fn copy_source<W: Write>(
                 .ok_or_else(|| LayoutError::mismatch(format!("{} is not in its own pack", e.id)))?;
             let kind = core_kind(data.kind);
             let (head_len, crc) = write_full(dst, kind, data.data)?;
+            let full = entry_kind(kind);
             out.undeltified += 1;
             out.base_left_out += u32::from(base_left_out);
             let entry = PackEntry {
                 offset: at,
                 header_len: head_len,
                 id: e.id,
-                kind: entry_kind(kind),
+                kind: full,
             };
-            emit(slots, out, entry, 0, crc);
+            emit(
+                slots,
+                out,
+                entry,
+                0,
+                Kind::of(full).expect("a full entry"),
+                crc,
+            );
             continue;
         }
         let mut new_header = Vec::with_capacity(MAX_HEADER_LEN);
-        let kind = match (e.kind, base) {
-            (EntryKind::OfsDelta { .. }, Some((base_at, _))) => {
+        let kind = kind.ok_or_else(|| {
+            LayoutError::mismatch(format!("the base of {} is not emitted before it", e.id))
+        })?;
+        let new_kind = match (e.kind, base) {
+            (EntryKind::OfsDelta { .. }, Some((base_at, _, _))) => {
                 new_header.extend_from_slice(&raw[..usize::from(h.size_len)]);
                 header::encode_distance(at - base_at, &mut new_header);
                 EntryKind::OfsDelta {
@@ -560,9 +613,9 @@ fn copy_source<W: Write>(
             offset: at,
             header_len: new_header.len() as u8,
             id: e.id,
-            kind,
+            kind: new_kind,
         };
-        emit(slots, out, entry, depth, crc.finalize());
+        emit(slots, out, entry, depth, kind, crc.finalize());
     }
     let data_end = table.pack_size() - PACK_TRAILER_LEN;
     if src.pos != data_end {
@@ -598,18 +651,22 @@ fn header_matches(h: &header::RawHeader, e: &PackEntry) -> bool {
         }
 }
 
-/// Records an emitted entry at `depth` with its CRC32.
+/// Records an emitted entry of `kind` at `depth` with its CRC32.
 fn emit(
     slots: &mut HashMap<ObjectId, Slot>,
     out: &mut Output,
     entry: PackEntry,
     depth: u32,
+    kind: Kind,
     crc32: u32,
 ) {
     if let Some(slot) = slots.get_mut(&entry.id) {
-        slot.emitted = Some((entry.offset, depth));
+        slot.emitted = Some((entry.offset, depth, kind));
     }
     out.max_depth = out.max_depth.max(depth);
+    if kind == Kind::Tree {
+        out.max_tree_depth = out.max_tree_depth.max(depth);
+    }
     out.idx_entries.push(IdxEntry {
         id: entry.id,
         offset: entry.offset,

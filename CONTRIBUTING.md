@@ -1,5 +1,9 @@
 # Contributing to Aspen
 
+> **How this repository works.** Aspen is developed in the maintainers' repository and published
+> here by a regular sync, one commit per sync. Issues and pull requests here are welcome: the
+> maintainers carry accepted changes over, credit the author, and they arrive here in the next sync.
+
 Thanks for your interest. Aspen is pre-alpha (see the
 [README](README.md#pre-alpha-status)), so expect the code and the plan to
 move quickly. Bug reports, interop reports from unusual Git clients, and

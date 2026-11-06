@@ -51,13 +51,36 @@ simulated agents.
   canvas repository. Engaging it ends a running swarm at once, refuses new
   starts, and pauses the ambient agents.
 
-- **Reset history.** `POST /api/v1/admin/reset-history` (operator
-  credential, no body) merges what is pending, force-updates `main` to one
-  root commit holding the canvas as it is, and deletes every merged branch,
-  so a full clone fetches one commit. The picture does not change; earlier
-  clones see a forced update; garbage collection then deletes the packs only
-  the old history reached. It is an operator tool outside the page's API
-  contract: take a `git bundle` of the canvas first if the history matters.
+- **Bounded history.** Every merge stores a whole `tiles/` tree (9 to 25
+  KiB on a painted 64 x 64 canvas: stored packs have no deltas), so a full
+  clone of `main` would grow with every merge. Once the packs written on
+  `main` since its root reach `PLACE_HISTORY_MAX_BYTES` (8 MiB), the
+  merger merges what is pending and force-updates `main` to one root
+  commit holding the canvas as it is: a full clone stays about that size.
+  The picture does not change and no push is lost. Branches are kept, and
+  a clone made before the reset still pushes: the tile check stops at
+  commits of any earlier `main` (found through Aspen's commit index), as it
+  stops at the current one. The root commit names the old tip, and the old
+  history stays in the repository (`git fetch <url> <tip>`); earlier clones
+  see a forced update of `main`. Each commit on `main` records the size so
+  far in a `Place-History:` trailer, so a restart keeps counting; a `main`
+  written before the server counted is started again after its next merge.
+  A branch built on an earlier history still reaches it, so a full clone
+  fetches that history too until the branch expires; `--depth=1` clones
+  never do.
+- **Merge cadence.** The merger runs every `PLACE_MERGE_INTERVAL_MS`
+  while pushes arrive at up to `PLACE_MERGE_BUSY_PUSHES_PER_SECOND`, and
+  waits longer in proportion above that, up to
+  `PLACE_MERGE_INTERVAL_MAX_MS`: at the defaults every 3 s up to 5 pushes a
+  second, every 6 s at 10, every 30 s from 50. A merge costs the same
+  however many pushes it folds, so under load the merger's work and
+  `main`'s growth stay flat; the page shows pushes not merged yet as branch
+  overlays.
+- **Reset history now.** `POST /api/v1/admin/reset-history` (operator
+  credential, no body) does the same as the automatic reset, and also
+  deletes every branch whose tiles have all merged, so a full clone
+  fetches one commit. It is an operator tool outside the page's API
+  contract.
 
 Branch namespaces `visitors/`, `agent/` and `swarm/` belong to the server's
 own painters; `agent/` branches are deleted as soon as their tiles have
@@ -100,6 +123,7 @@ curl -X POST http://127.0.0.1:7070/api/v1/admin/kill-switch \
 | `PLACE_LISTEN` | `127.0.0.1:7070` | Address to serve on. |
 | `PLACE_DATA_DIR` | `.place` | SQLite database, local blobs and the push spool, unless set below. |
 | `PLACE_DATABASE_URL` | SQLite in the data directory | `postgres://...` (password in `PGPASSWORD`) or `sqlite://...`. |
+| `PLACE_DB_MAX_CONNECTIONS` | `10` | Connections in the metadata database's pool. Size it to the database: the public demo's Terraform sets 64 on an 8-vCPU PostgreSQL. |
 | `PLACE_BLOB_URL` | `file://` in the data directory | `s3://bucket/prefix` or `file:///path`. |
 | `PLACE_SPOOL_DIR` | `<data dir>/spool` | Push spool; a real disk, not tmpfs. |
 | `PLACE_DOMAIN` | `example.com` | Clone URL `https://place.<domain>/canvas.git`, dashboard `https://dashboard.<domain>/`. |
@@ -108,12 +132,15 @@ curl -X POST http://127.0.0.1:7070/api/v1/admin/kill-switch \
 | `PLACE_TILES_PER_PUSH` | `64` | Distinct tiles one push may change. |
 | `PLACE_PUSHES_PER_MINUTE` | `30` | Per web session, and per Git caller and branch. |
 | `PLACE_BRANCH_TTL_SECONDS` | `600` | Idle branches whose tiles have merged are deleted after this. |
-| `PLACE_MERGE_INTERVAL_MS` | `3000` | How often the merger bot runs. |
+| `PLACE_MERGE_INTERVAL_MS` | `3000` | How often the merger bot runs while pushes arrive at up to `PLACE_MERGE_BUSY_PUSHES_PER_SECOND`. |
+| `PLACE_MERGE_BUSY_PUSHES_PER_SECOND` | `5` | Above this push rate (since the last merge) the merger waits longer between runs, in proportion to the rate. |
+| `PLACE_MERGE_INTERVAL_MAX_MS` | `30000` | The longest the merger waits between runs under load. |
+| `PLACE_HISTORY_MAX_BYTES` | `8388608` | Once the packs written on `main` since its root reach this size, the merger starts `main`'s history again from one root commit with the same canvas, so a full clone stays about this size. `0` never does. |
 | `PLACE_AGENTS` | `6` | Ambient agents. |
 | `PLACE_AMBIENT_INTERVAL_MS` | `30000` | Mean time between the pushes of one sprite an ambient agent paints. |
 | `PLACE_AMBIENT_SPRITE_PAUSE_SECONDS` | `1800` | Mean time an ambient agent rests between two sprites. |
 | `PLACE_KEEP_AREAS` | | `x,y,width,height;...`: areas ambient agents never paint over (people's work from before the server started; it remembers what people paint for six hours, in memory). |
-| `PLACE_AMBIENT_MERGE_INTERVAL_SECONDS` | `300` | How often, at most, the merger runs when only ambient agents have pushes pending; any other push is merged on the next run. Bounds how fast idle painting grows a full clone (about 2.6 MB a day: each merge stores a whole `tiles/` tree, and stored packs have no deltas yet). |
+| `PLACE_AMBIENT_MERGE_INTERVAL_SECONDS` | `300` | How often, at most, the merger runs when only ambient agents have pushes pending; any other push is merged on the next run. Slows how fast idle painting uses up `PLACE_HISTORY_MAX_BYTES` (each merge stores a whole `tiles/` tree). |
 | `PLACE_SWARM_MAX_AGENTS`, `PLACE_SWARM_PUSHES_PER_SECOND`, `PLACE_SWARM_RUN_SECONDS`, `PLACE_SWARM_COOLDOWN_SECONDS`, `PLACE_SWARM_STARTS_PER_HOUR` | `1000`, `120`, `20`, `40`, `6` | Swarm limits. |
 | `PLACE_SWARM_ENABLED` | `false` | Whether visitors may start the swarm (`POST /api/v1/swarm`); off answers 404. |
 | `PLACE_WEB_TILES_PER_PUSH` | `1` | Tiles one push from the page may carry: one click, one commit, one push. Git pushes keep `PLACE_TILES_PER_PUSH`. |
@@ -135,6 +162,7 @@ Anonymous callers are counted by client address, an IPv6 address by its
 
 ```bash
 cargo test -p aspen-place                       # rules, state, and end to end with stock git
+cargo test --release -p aspen-place --test history -- --ignored --nocapture   # sustained load, history resets
 cargo test -p aspen-server --test push_hook     # the push hook in receive-pack
 python3 demo/place/server/scripts/check-mutations.py   # each guard's test fails without it
 ```

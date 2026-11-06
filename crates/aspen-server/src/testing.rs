@@ -164,6 +164,13 @@ impl TestServer {
             dir.path().join("shallow"),
             MaxInflatedBytes::new(8 << 30).expect("non-zero"),
         ));
+        // A build of a test repository ends in milliseconds, but a loaded
+        // CI runner can stretch that past `layered_wait`; tests that check
+        // exact objects must not see a layered answer by chance. Tests of
+        // layered answers set it back.
+        if let Some(c) = config.shallow_cache.as_mut() {
+            c.layered_wait = c.build_wait;
+        }
         configure(&mut config);
         let receive = crate::receive::ReceiveConfig::new(
             dir.path().join("spool"),

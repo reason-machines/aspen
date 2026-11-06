@@ -64,6 +64,10 @@ pub struct Compactor<M, B> {
     pub(crate) meta: M,
     pub(crate) blobs: B,
     pub(crate) config: CompactConfig,
+    /// Where garbage collection runs its statements, if not `meta`
+    /// ([`Compactor::with_gc_store`]).
+    pub(crate) gc_meta: Option<M>,
+    pub(crate) gc_metrics: Option<std::sync::Arc<crate::GcMetrics>>,
 }
 
 impl<M, B> Compactor<M, B>
@@ -77,6 +81,8 @@ where
             meta,
             blobs,
             config,
+            gc_meta: None,
+            gc_metrics: None,
         }
     }
 
@@ -338,6 +344,7 @@ where
             .await?;
         let options = RepackOptions {
             max_delta_depth: self.config.max_delta_depth,
+            max_tree_delta_depth: self.config.max_tree_delta_depth,
             max_object_bytes: self.config.max_object_bytes,
         };
         let config = self.config.clone();
@@ -459,7 +466,7 @@ pub(crate) struct LocalSource {
 /// Writes the compaction pack and checks it before anything is uploaded:
 /// it must verify on its own (self-contained, base-first, no repeats), its
 /// `.idx` and entry table must equal what verification rebuilds from the
-/// pack bytes alone, its depth must be within the bound, and its objects
+/// pack bytes alone, its depths must be within the bounds, and its objects
 /// must be exactly the union of the sources' `.idx` files.
 fn write_and_check(
     sources: &[LocalSource],
@@ -501,6 +508,12 @@ fn write_and_check(
         return Err(CompactError::Verify(format!(
             "delta depth {} is over the bound {}",
             verified.max_delta_depth, config.max_delta_depth
+        )));
+    }
+    if verified.max_tree_delta_depth > config.max_tree_delta_depth {
+        return Err(CompactError::Verify(format!(
+            "tree delta depth {} is over the bound {}",
+            verified.max_tree_delta_depth, config.max_tree_delta_depth
         )));
     }
     let mut union = BTreeSet::<ObjectId>::new();

@@ -235,6 +235,9 @@ pub enum StoreError {
 /// How every [`StoreError::pack_swept`] reason starts.
 const PACK_SWEPT: &str = "pack garbage-collected after its grace period: ";
 
+/// How every [`StoreError::lease_lost`] reason starts.
+const LEASE_LOST: &str = "lease no longer held: ";
+
 impl StoreError {
     /// Whether the store error means stored data is wrong, which pages.
     pub fn is_corruption(&self) -> bool {
@@ -256,6 +259,22 @@ impl StoreError {
     /// Whether this is a [`StoreError::pack_swept`] refusal.
     pub fn is_pack_swept(&self) -> bool {
         matches!(self, Self::Unavailable { reason } if reason.starts_with(PACK_SWEPT))
+    }
+
+    /// Work done under a [`crate::meta::Lease`] was refused because the
+    /// lease expired or another owner took it: nothing was written.
+    /// [`StoreError::Conflict`], so it is not retried as is; the caller
+    /// stops and acquires the lease again later.
+    /// [`StoreError::is_lease_lost`] tells it apart.
+    pub fn lease_lost(detail: impl std::fmt::Display) -> Self {
+        Self::Conflict {
+            what: format!("{LEASE_LOST}{detail}"),
+        }
+    }
+
+    /// Whether this is a [`StoreError::lease_lost`] refusal.
+    pub fn is_lease_lost(&self) -> bool {
+        matches!(self, Self::Conflict { what } if what.starts_with(LEASE_LOST))
     }
 
     fn wire(&self, surface: Surface) -> WireError {
@@ -326,6 +345,20 @@ pub enum UnpackError {
     BasesOverBudget {
         /// The per-push budget in bytes.
         budget: u64,
+    },
+    /// The push builds on commits its refs do not depend on (with
+    /// `push.negotiate`, Git leaves out every commit the server
+    /// acknowledged, whichever ref it is on), and what its writes would copy
+    /// from those commits' versions into their own packs is more than one
+    /// push may bring (its byte limit, the caller's quota included). Without
+    /// `push.negotiate` the client sends those objects itself, compressed,
+    /// under the same limit.
+    #[error(
+        "this push builds on commits of other refs whose objects take more than {limit} bytes to copy; push it with `git -c push.negotiate=false push`"
+    )]
+    LeftOutTooLarge {
+        /// The push's byte limit.
+        limit: u64,
     },
     /// A store failed during ingest.
     #[error("storage: {0}")]

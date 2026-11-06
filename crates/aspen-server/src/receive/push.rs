@@ -97,6 +97,17 @@ pub struct Timings {
     pub located: u64,
     /// Tree entries the walk of the changed paths compared.
     pub changed_entries: u64,
+    /// Metadata statements the push sent from its own task (the store's
+    /// count, `MetaStore::count_statements`): reads and writes, then
+    /// `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints. The access layer's
+    /// repository and token lookups come before and are not counted, and
+    /// neither is a group-commit batch, which runs on a task of its own.
+    pub db_queries: u64,
+    /// See [`Timings::db_queries`].
+    pub db_transaction_control: u64,
+    /// Statements the receive-pack advertisement (the `info/refs` request
+    /// before a push) sent, counted the same way.
+    pub advert_db_queries: u64,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -115,6 +126,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.ancestry_commits += t.ancestry_commits;
         self.located += t.located;
         self.changed_entries += t.changed_entries;
+        self.db_queries += t.db_queries;
+        self.db_transaction_control += t.db_transaction_control;
+        self.advert_db_queries += t.advert_db_queries;
     }
 }
 
@@ -176,6 +190,24 @@ fn parse_and_receive<R: Read>(
 fn local_io(e: impl std::fmt::Display) -> StoreError {
     StoreError::LocalIo {
         reason: e.to_string(),
+    }
+}
+
+/// The thin bases among `candidates` that `packs` hold, read under `slot`.
+async fn prefetch<M, B>(
+    slot: &super::gate::Slot,
+    stored: &aspen_pack::locate::StoredPacks<M, B>,
+    packs: &SearchPacks,
+    candidates: &CandidateBases,
+) -> Result<aspen_core::ingest::Prefetched<aspen_core::ingest::InMemoryBases>, UnpackError>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    match slot.prefetch(stored, packs, candidates).await {
+        Ok((p, _stats)) => Ok(p),
+        Err(PrefetchError::OverBudget { budget }) => Err(UnpackError::BasesOverBudget { budget }),
+        Err(PrefetchError::Store(e)) => Err(UnpackError::Store(e)),
     }
 }
 
@@ -370,6 +402,11 @@ where
                     trunk_dep: None,
                     scoped_dep: None,
                     search: SearchPacks::default(),
+                    wide: None,
+                    wide_roots: Vec::new(),
+                    filled: HashMap::new(),
+                    copied_bytes: 0,
+                    copy_limit: push_limits.max_pack_bytes,
                     pack: None,
                     entered_trees: Vec::new(),
                     held: Vec::new(),
@@ -390,7 +427,16 @@ where
                     forwarded: HashSet::new(),
                     upstream_detail: HashMap::new(),
                 };
-                match push.run(received, &mut report).await {
+                let (ran, counted) = self
+                    .meta
+                    .count_statements(push.run(received, &mut report))
+                    .await;
+                drop(push);
+                if let Some(n) = counted {
+                    timings.db_queries = n.queries;
+                    timings.db_transaction_control = n.transaction_control;
+                }
+                match ran {
                     Ok(()) => {}
                     Err(e) => {
                         result = PushResult::UnpackFailed;
@@ -453,10 +499,12 @@ enum Contents {
     /// What several non-trunk writes' tips reach together. Frozen once
     /// stored; later writes start a new one.
     Shared(SharedSet),
-    /// A forced trunk write's entries (flags in entry-table order, empty
-    /// when the push sent no pack) and the skipped versions' objects,
-    /// spilled to local disk.
-    Forced {
+    /// A write's entries (flags in entry-table order, empty when the push
+    /// sent no pack) plus objects its tip reaches that only other stored
+    /// packs hold, read from them and spilled to local disk
+    /// ([`Push::fill`]): a forced trunk write's skipped history, or what a
+    /// write reaches through a boundary outside its dependencies.
+    Filled {
         keep: Vec<bool>,
         spill: Option<ExtraSpill>,
     },
@@ -523,8 +571,24 @@ struct Push<'a, M, B> {
     /// the current version of the one branch a plain-URL push updates
     /// (`plain_url_branch_dep`, issue #203).
     scoped_dep: Option<RefVersion>,
-    /// Closure packs of `trunk_dep` and `scoped_dep`.
+    /// Closure packs of `trunk_dep` and `scoped_dep`: what the push's
+    /// writes depend on, so what counts as already stored (`held`).
     search: SearchPacks,
+    /// `search` plus the closures of the versions that hold the pushed
+    /// pack's boundary commits, once the boundary turned out to lie outside
+    /// the dependencies ([`Push::widen`]). Every read searches it (thin
+    /// bases, the connectivity check, objects a write copies); `held` never
+    /// does, so nothing found only here is left out of a write's pack.
+    wide: Option<SearchPacks>,
+    /// The versions `wide` searches besides the dependencies.
+    wide_roots: Vec<RefVersionId>,
+    /// Placement of each tip planned while `wide` is set ([`Push::fill`]).
+    filled: HashMap<ObjectId, Option<Placement>>,
+    /// Bytes the push's writes copied from storage while `wide` is set,
+    /// and the most they may: the push's own byte limit
+    /// ([`UnpackError::LeftOutTooLarge`]).
+    copied_bytes: u64,
+    copy_limit: u64,
     pack: Option<PushedPack>,
     /// Pushed trees the walk of the changed paths entered, by graph
     /// position: trunk's newest trees once a trunk write commits.
@@ -585,6 +649,12 @@ where
         self.repo.settings.trunk()
     }
 
+    /// The packs every read of a stored object searches: the dependencies',
+    /// widened by [`Push::widen`] when the pack's boundary is outside them.
+    fn reads(&self) -> &SearchPacks {
+        self.wide.as_ref().unwrap_or(&self.search)
+    }
+
     fn commits_source(
         &self,
         lazy_roots: Vec<aspen_core::id::RefVersionId>,
@@ -595,7 +665,7 @@ where
             packs: &self.svc.packs,
             gate: &self.svc.gate,
             closures: &self.svc.closures,
-            fallback: vec![self.search.clone()],
+            fallback: vec![self.reads().clone()],
             lazy_roots,
             lazy: tokio::sync::OnceCell::new(),
         }
@@ -617,6 +687,22 @@ where
                 return Ok(());
             }
         };
+        // `-o land`: every branch this push writes is also queued for the
+        // merge queue, as if pushed to `refs/queue/<trunk>/<branch>`.
+        let land = self.req.push_options.iter().any(|o| o == "land");
+        if land && !self.config().merge_queue {
+            for c in &self.req.commands {
+                set(
+                    report,
+                    &c.name,
+                    RefStatus::Rejected(
+                        "push option `land` needs the merge queue (ASPEN_MERGE_QUEUE=on)".into(),
+                    ),
+                );
+                self.svc.metrics.ref_result(RefOutcome::BadPushOptions);
+            }
+            return Ok(());
+        }
         let store = |e: StoreError| UnpackError::Store(e);
         if self.origin == Origin::Client
             && let Some(hook) = self.svc.push_through()
@@ -626,27 +712,39 @@ where
         }
         let meta = &self.svc.meta;
         let trunk = self.trunk().clone();
-        self.trunk_dep = meta
-            .current_version(self.repo.id, &trunk)
-            .await
-            .map_err(store)?
-            .filter(|v| v.value.tip().is_some());
-        if let Some(scope) = self.scope.filter(|s| **s != trunk) {
-            self.scoped_dep = meta
-                .current_version(self.repo.id, scope)
-                .await
-                .map_err(store)?
-                .filter(|v| v.value.tip().is_some());
-        } else if self.scope.is_none()
-            && self.origin == Origin::Client
-            && let Some(branch) = plain_url_branch_dep(&self.req.commands, &trunk, &options)
-        {
-            self.scoped_dep = meta
-                .current_version(self.repo.id, branch)
-                .await
-                .map_err(store)?
-                .filter(|v| v.value.tip().is_some());
+        // Every ref this push reads, in one statement: trunk, the ref it
+        // builds on (the scoped ref, or the branch of a plain-URL push),
+        // and each command's ref for the commit check below.
+        let dep_ref = match self.scope.filter(|s| **s != trunk) {
+            Some(scope) => Some(scope.clone()),
+            None if self.scope.is_none() && self.origin == Origin::Client => {
+                plain_url_branch_dep(&self.req.commands, &trunk, &options).cloned()
+            }
+            None => None,
+        };
+        let mut names = vec![trunk.clone()];
+        names.extend(dep_ref.iter().cloned());
+        for c in &self.req.commands {
+            if !names.contains(&c.name) {
+                names.push(c.name.clone());
+            }
         }
+        let read = meta
+            .current_versions(self.repo.id, &names)
+            .await
+            .map_err(store)?;
+        let current_of = |name: &RefName| -> Option<RefVersion> {
+            names
+                .iter()
+                .position(|n| n == name)
+                .and_then(|i| read[i].clone())
+        };
+        self.trunk_dep = current_of(&trunk).filter(|v| v.value.tip().is_some());
+        self.scoped_dep = dep_ref
+            .as_ref()
+            .and_then(current_of)
+            .filter(|v| v.value.tip().is_some());
+        self.svc.closures.remember(read.iter().flatten());
         let roots: Vec<_> = self
             .trunk_dep
             .iter()
@@ -662,16 +760,33 @@ where
         if let Some(received) = received.filter(|r| r.object_count > 0) {
             self.ingest(received).await?;
         }
+        // A tip the client did not send must be stored already. Outside the
+        // dependencies, it is a commit the negotiation acknowledged (a new
+        // branch at, or a tag of, another branch's commit).
+        if self.may_widen() {
+            let outside: Vec<ObjectId> = self
+                .tips()
+                .into_iter()
+                .filter(|t| {
+                    self.pack
+                        .as_ref()
+                        .is_none_or(|p| p.graph.position(t).is_none())
+                })
+                .collect();
+            self.widen(outside).await?;
+        }
 
         // The commit check, against each ref's current version.
         let started = Instant::now();
         let mut verdicts = Vec::with_capacity(self.req.commands.len());
         let mut currents = Vec::with_capacity(self.req.commands.len());
+        // Against the versions read before the search: a verdict on a
+        // version that has moved since loses its compare-and-swap and is
+        // computed again against the new one (step 4), so reading again
+        // here would only cost a statement per push (decisions log,
+        // throughput item 6b).
         for c in &self.req.commands {
-            let current = meta
-                .current_version(self.repo.id, &c.name)
-                .await
-                .map_err(store)?;
+            let current = current_of(&c.name);
             currents.push(current.as_ref().and_then(|v| v.value.tip()));
             self.stored
                 .insert(c.name.clone(), current.as_ref().and_then(|v| v.value.tip()));
@@ -715,6 +830,11 @@ where
                     .iter()
                     .filter_map(|w| Some((w.name == trunk, w.value.closure()?)))
                     .collect();
+                let queued = if land {
+                    self.land_writes(&mut writes, &trunk).await.map_err(store)?
+                } else {
+                    false
+                };
                 let started = Instant::now();
                 let outcome = self
                     .svc
@@ -736,7 +856,8 @@ where
                     );
                 }
                 match outcome.map_err(store)? {
-                    CommitOutcome::Committed(_) => {
+                    CommitOutcome::Committed(created) => {
+                        self.svc.closures.committed(&created);
                         self.seed_base_cache().await;
                         if closures.iter().any(|(is_trunk, _)| *is_trunk) {
                             self.remember_trunk_trees();
@@ -752,6 +873,9 @@ where
                                 );
                             }
                             self.svc.metrics.trunk_committed(c);
+                        }
+                        if queued {
+                            self.svc.queue_signal.mark(self.repo.id);
                         }
                         self.notify_committed(&group, &verdicts).await;
                         break;
@@ -966,6 +1090,46 @@ where
         }
     }
 
+    /// For `-o land`: adds, beside each branch write (not trunk, not a
+    /// delete), a write of its queue ref `refs/queue/<trunk>/<branch>` at
+    /// the same version value and dependencies, so the queue entry lands
+    /// in the same transaction as the branch (its compare-and-swap is on
+    /// the queue ref's current version). Returns whether any was added.
+    async fn land_writes(
+        &self,
+        writes: &mut Vec<RefWrite>,
+        trunk: &RefName,
+    ) -> Result<bool, StoreError> {
+        let Some(short) = trunk.as_str().strip_prefix("refs/heads/") else {
+            return Ok(false);
+        };
+        let mut extra = Vec::new();
+        for w in writes.iter() {
+            let Some(branch) = w.name.as_str().strip_prefix("refs/heads/") else {
+                continue;
+            };
+            if w.name == *trunk || w.value.tip().is_none() {
+                continue;
+            }
+            let name = format!("{}{short}/{branch}", crate::queue::QUEUE_PREFIX);
+            let name = RefName::new(name.clone()).map_err(|e| StoreError::Corrupt {
+                what: format!("queue ref {name}: {e}"),
+            })?;
+            let current = self.svc.meta.current_version(self.repo.id, &name).await?;
+            extra.push(RefWrite {
+                name,
+                expected: current.map(|v| v.id),
+                value: w.value,
+                deps: w.deps,
+                commits: Vec::new(),
+                jobs: Vec::new(),
+            });
+        }
+        let any = !extra.is_empty();
+        writes.extend(extra);
+        Ok(any)
+    }
+
     async fn notify_committed(&self, group: &[usize], verdicts: &[Verdict]) {
         if self.config().merge_queue
             && group.iter().any(|&i| {
@@ -1153,7 +1317,7 @@ where
                 .await?
                 .map_err(|e| local_io(format!("pushed pack: {e}")));
         }
-        let search = self.search.clone();
+        let search = self.reads().clone();
         if let Some(found) = self.svc.read_from(&search, id).await? {
             return Ok(Some(found));
         }
@@ -1375,26 +1539,161 @@ where
         answer.map_err(UnpackError::Store)
     }
 
+    /// Whether this push may search beyond its dependencies
+    /// ([`Push::widen`]): a client's. A mirror import applies what the
+    /// upstream sent, which is always built against what Aspen advertised.
+    fn may_widen(&self) -> bool {
+        self.origin == Origin::Client
+    }
+
+    /// The new value of every command that is not a delete.
+    fn tips(&self) -> Vec<ObjectId> {
+        self.req
+            .commands
+            .iter()
+            .filter(|c| !c.new.is_zero())
+            .map(|c| c.new)
+            .collect()
+    }
+
+    /// The received pack's boundary commits (`aspen_pack::boundary`) plus
+    /// the commands' tips. A pack the scan cannot read gives only the tips:
+    /// completion reports what is wrong with it.
+    async fn boundary_of(&self, received: &Received) -> Result<Vec<ObjectId>, UnpackError> {
+        let spool = received.spool.clone();
+        let max = self.config().max_object_bytes;
+        let scanned = blocking(move || aspen_pack::boundary::boundary(&spool, max))
+            .await
+            .map_err(UnpackError::Store)?;
+        let mut ids = match scanned {
+            Ok(b) => b.as_slice().to_vec(),
+            Err(e) => {
+                tracing::info!(error = %e, "boundary scan of the received pack failed");
+                Vec::new()
+            }
+        };
+        ids.extend(self.tips());
+        Ok(ids)
+    }
+
+    /// **Boundary outside the dependencies.** With `push.negotiate`, Git
+    /// leaves out of its pack every commit Aspen acknowledged in the
+    /// negotiation fetch, and those can belong to any ref: the client never
+    /// says which ref it will push (`upload_pack::fetch::negotiation_acks`).
+    /// When some of `ids` (boundary commits and tips) are in neither the
+    /// pushed pack nor what the push searches, each one's `commit_index` row
+    /// names a version whose closure holds it and everything it reaches;
+    /// those versions' closures are added to the packs every read searches
+    /// (`wide`). Returns whether anything was added.
+    ///
+    /// The writes' dependencies do not change. Instead each write is planned
+    /// with [`Push::fill`], which copies into its own pack every object its
+    /// tip reaches that its dependencies lack, reading those from the wider
+    /// search: the bytes the client would have sent without
+    /// `push.negotiate`, read from storage instead. So every invariant of a
+    /// write stays as it was (connected, exact when its dependencies are,
+    /// trunk never depending on a branch), at the cost of server reads on
+    /// these pushes only. A plain fast-forward of the pushed branch never
+    /// gets here: its acknowledged commits are in the branch's own version,
+    /// which the push already searches (`plain_url_branch_dep`).
+    async fn widen(&mut self, ids: Vec<ObjectId>) -> Result<bool, UnpackError> {
+        let store = UnpackError::Store;
+        let ids = SortedIds::from_unsorted(ids);
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let svc = self.svc;
+        let found = aspen_core::ingest::ObjectLocator::locate(&svc.packs, self.reads(), &ids)
+            .await
+            .map_err(store)?;
+        let outside = SortedIds::from_unsorted(
+            ids.as_slice()
+                .iter()
+                .zip(&found)
+                .filter(|(_, f)| f.is_none())
+                .map(|(id, _)| *id)
+                .collect(),
+        );
+        if outside.is_empty() {
+            return Ok(false);
+        }
+        let started = Instant::now();
+        let rows = svc
+            .meta
+            .lookup_commits(self.repo.id, &outside)
+            .await
+            .map_err(store)?;
+        let mut roots: Vec<RefVersionId> = self
+            .trunk_dep
+            .iter()
+            .chain(&self.scoped_dep)
+            .map(|v| v.id)
+            .chain(self.wide_roots.iter().copied())
+            .collect();
+        let mut added = 0;
+        for row in rows {
+            if let CommitLookup::Indexed(row) = row
+                && !roots.contains(&row.ref_version)
+            {
+                roots.push(row.ref_version);
+                self.wide_roots.push(row.ref_version);
+                added += 1;
+            }
+        }
+        if added == 0 {
+            self.timings.search += started.elapsed();
+            return Ok(false);
+        }
+        self.wide = Some(
+            closure_packs(&svc.meta, &svc.closures, self.repo.id, &roots)
+                .await
+                .map_err(store)?,
+        );
+        self.timings.search += started.elapsed();
+        svc.metrics.push_widened();
+        tracing::info!(
+            outside = outside.len(),
+            versions = added,
+            "push builds on commits outside its dependencies; their versions are searched too"
+        );
+        Ok(true)
+    }
+
     /// Prefetch, completion, the object graph and the whole-pack
-    /// connectivity check.
+    /// connectivity check, widening the search ([`Push::widen`]) when the
+    /// pack's boundary is outside the dependencies.
     async fn ingest(&mut self, received: Received) -> Result<(), UnpackError> {
         let store = UnpackError::Store;
         let svc = self.svc;
         let started = Instant::now();
-        let slot = svc.gate.acquire().await.map_err(store)?;
+        let mut slot = svc.gate.acquire().await.map_err(store)?;
         self.timings.gate_wait = started.elapsed();
         let started = Instant::now();
-        let prefetched = match slot
-            .prefetch(&svc.packs, &self.search, &received.candidates)
-            .await
-        {
-            Ok((p, _stats)) => p,
-            Err(PrefetchError::OverBudget { budget }) => {
-                return Err(UnpackError::BasesOverBudget { budget });
-            }
-            Err(PrefetchError::Store(e)) => return Err(UnpackError::Store(e)),
-        };
+        let mut prefetched =
+            prefetch(&slot, &svc.packs, self.reads(), &received.candidates).await?;
         self.timings.prefetch = started.elapsed();
+        // A REF_DELTA base the dependencies lack is either in the pack (a
+        // libgit2 push) or a thin base of a commit the client left out
+        // because the negotiation acknowledged it although no dependency
+        // holds it (`push.negotiate`). The boundary scan tells them apart.
+        if !prefetched.not_in_deps.is_empty() && self.may_widen() {
+            drop(prefetched);
+            drop(slot);
+            let boundary = self.boundary_of(&received).await?;
+            let widened = self.widen(boundary).await?;
+            let started = Instant::now();
+            slot = svc.gate.acquire().await.map_err(store)?;
+            self.timings.gate_wait += started.elapsed();
+            let started = Instant::now();
+            prefetched = prefetch(&slot, &svc.packs, self.reads(), &received.candidates).await?;
+            if widened {
+                tracing::debug!(
+                    not_in_deps = prefetched.not_in_deps.len(),
+                    "thin bases read again after widening"
+                );
+            }
+            self.timings.prefetch += started.elapsed();
+        }
         let started = Instant::now();
         let options = CompleteOptions {
             thread_limit: self.config().thread_limit,
@@ -1476,21 +1775,43 @@ where
             Some(ch) => {
                 self.timings.changed_entries += ch.stats.entries;
                 let mut held = ch.held;
-                for id in ingested.completion_bases.as_slice() {
-                    if let Some(at) = graph.position(id) {
-                        held[at] = true;
+                // Completion bases came from the packs reads search, which
+                // are the dependencies' unless the search was widened
+                // (`Push::widen`); then a base may be another ref's object,
+                // and only the lookup below may call it held.
+                if self.wide.is_none() {
+                    for id in ingested.completion_bases.as_slice() {
+                        if let Some(at) = graph.position(id) {
+                            held[at] = true;
+                        }
                     }
                 }
+                // One lookup answers both questions: which of the rest the
+                // dependencies hold, and whether what the pack references
+                // and lacks is there. The references of objects that turn
+                // out held are looked up for nothing, which costs IDs, not
+                // a second round trip (item 11).
                 let rest: Vec<usize> = (0..graph.len()).filter(|&at| !held[at]).collect();
-                let ids = SortedIds::from_unsorted(rest.iter().map(|&at| graph.id(at)).collect());
+                let mut ids: Vec<ObjectId> = rest.iter().map(|&at| graph.id(at)).collect();
+                ids.extend_from_slice(&ch.check);
+                for &at in &rest {
+                    if !ch.visited[at] {
+                        ids.extend_from_slice(graph.external_refs(at));
+                    }
+                }
+                let ids = SortedIds::from_unsorted(ids);
                 self.timings.located += ids.len() as u64;
                 let found =
                     aspen_core::ingest::ObjectLocator::locate(&svc.packs, &self.search, &ids)
                         .await
                         .map_err(store)?;
+                let mut present = std::collections::HashSet::with_capacity(ids.len());
                 for (id, f) in ids.as_slice().iter().zip(found) {
                     if f.is_some() {
-                        held[graph.position(id).expect("a pack object")] = true;
+                        present.insert(*id);
+                        if let Some(at) = graph.position(id) {
+                            held[at] = true;
+                        }
                     }
                 }
                 let mut check = ch.check;
@@ -1501,6 +1822,11 @@ where
                 }
                 self.held = held;
                 self.entered_trees = ch.trees;
+                // What the lookup found in the packs the connectivity check
+                // searches needs no second lookup.
+                if self.wide.is_none() {
+                    check.retain(|id| !present.contains(id));
+                }
                 SortedIds::from_unsorted(check)
             }
             None => {
@@ -1515,7 +1841,22 @@ where
             }
         };
         self.timings.located += missing.len() as u64;
-        aspen_pack::scan::check_connectivity(&svc.packs, &self.search, &missing).await?;
+        // A miss may be a commit the negotiation acknowledged that no
+        // dependency holds (`push.negotiate`); what is missing, with the
+        // tips, is then the boundary to widen the search by.
+        if let Err(e) =
+            aspen_pack::scan::check_connectivity(&svc.packs, self.reads(), &missing).await
+        {
+            let mut boundary = missing.as_slice().to_vec();
+            boundary.extend(self.tips());
+            if !(matches!(e, UnpackError::MissingObject { .. })
+                && self.may_widen()
+                && self.widen(boundary).await?)
+            {
+                return Err(e);
+            }
+            aspen_pack::scan::check_connectivity(&svc.packs, self.reads(), &missing).await?;
+        }
         let pos_of_entry = table
             .entries()
             .iter()
@@ -1636,6 +1977,7 @@ where
                 // A no-op placed this tip first (`place_noop`): this write
                 // takes its placement and the commit rows that came with it.
                 Some((rows, all)) => (self.by_tip.get(&tip).copied(), rows, all),
+                None if self.wide.is_some() => self.fill_write(is_trunk, tip).await?,
                 None => self.place(is_trunk, tip),
             };
             (deps, dep_versions, pack, commits, all)
@@ -1749,6 +2091,11 @@ where
     /// Nothing is stored for it unless a write names the pack; the commit
     /// rows the placement hands out are kept for that write.
     fn place_noop(&mut self, name: &RefName, tip: ObjectId) {
+        if self.wide.is_some() {
+            // Writes get their own packs then (`fill_write`), made when
+            // they are planned; no shared pack can be opened late.
+            return;
+        }
         if self.by_tip.contains_key(&tip) {
             return;
         }
@@ -1990,7 +2337,7 @@ where
     ) -> Result<Option<(ObjectKind, Vec<u8>)>, UnpackError> {
         let one = CandidateBases(SortedIds::from_unsorted(vec![id]));
         let slot = self.svc.gate.acquire().await.map_err(UnpackError::Store)?;
-        let fetched = match slot.prefetch(&self.svc.packs, &self.search, &one).await {
+        let fetched = match slot.prefetch(&self.svc.packs, self.reads(), &one).await {
             Ok((f, _)) => f.bases,
             Err(PrefetchError::OverBudget { budget }) => {
                 return Err(UnpackError::BasesOverBudget { budget });
@@ -2092,7 +2439,6 @@ where
                 .map_err(store)?,
             None => SearchPacks::default(),
         };
-        let n = self.pack.as_ref().map_or(0, |p| p.graph.len());
         let held: Vec<bool> = match &self.pack {
             Some(p) => {
                 let all = SortedIds::from_unsorted(p.graph.ids().to_vec());
@@ -2105,6 +2451,54 @@ where
             }
             None => Vec::new(),
         };
+        let (pack, commits) = self.fill(tip, &dep_packs, &held, true).await?;
+        Ok(Some((chosen, pack, commits)))
+    }
+
+    /// Plans a write while the search is widened ([`Push::widen`]): with
+    /// its usual dependencies (`search`), and a pack that holds everything
+    /// its tip reaches that they lack, copied from the wider search where
+    /// the pushed pack lacks it ([`Push::fill`]). Writes at one tip share
+    /// one pack; the first one carries the commit rows.
+    async fn fill_write(
+        &mut self,
+        is_trunk: bool,
+        tip: ObjectId,
+    ) -> Result<(Option<Placement>, Vec<NewCommit>, bool), UnpackError> {
+        if let Some(pl) = self.filled.get(&tip) {
+            return Ok((*pl, Vec::new(), pl.is_none()));
+        }
+        let deps = self.search.clone();
+        let held = std::mem::take(&mut self.held);
+        let filled = self.fill(tip, &deps, &held, is_trunk).await;
+        self.held = held;
+        let (pl, commits) = filled?;
+        self.filled.insert(tip, pl);
+        Ok((pl, commits, true))
+    }
+
+    /// The pack of a write whose dependencies' closure is `dep_packs`: every
+    /// object `tip` reaches that `dep_packs` lack, as entries of the pushed
+    /// pack (those `held` does not mark: `held[i]` says `dep_packs` hold
+    /// the pushed pack's object `i`) plus full objects read from the packs
+    /// every read searches ([`Push::reads`]) and spilled to local disk.
+    /// `None` when the dependencies hold everything. `keep_held_bases` keeps
+    /// a kept delta's held base as an entry, as trunk's pack does
+    /// ([`keep_flags`]); otherwise such a delta is stored whole.
+    ///
+    /// The objects outside the pushed pack are read under one prefetch
+    /// slot, held from the first read until the last object is spilled, so
+    /// the memory held at once is one prefetch call's, as for any other
+    /// read.
+    async fn fill(
+        &mut self,
+        tip: ObjectId,
+        dep_packs: &SearchPacks,
+        held: &[bool],
+        keep_held_bases: bool,
+    ) -> Result<(Option<Placement>, Vec<NewCommit>), UnpackError> {
+        let store = UnpackError::Store;
+        let n = self.pack.as_ref().map_or(0, |p| p.graph.len());
         let mut members = vec![false; n];
         let mut spill: Option<ExtraSpill> = None;
         let budget = self.config().locate.max_prefetch_bytes;
@@ -2136,7 +2530,7 @@ where
             }
             let outside = SortedIds::from_unsorted(outside);
             let in_dep =
-                aspen_core::ingest::ObjectLocator::locate(&self.svc.packs, &dep_packs, &outside)
+                aspen_core::ingest::ObjectLocator::locate(&self.svc.packs, dep_packs, &outside)
                     .await
                     .map_err(store)?;
             let to_read: Vec<ObjectId> = outside
@@ -2156,7 +2550,7 @@ where
             let read = match held_slot
                 .prefetch(
                     &self.svc.packs,
-                    &self.search,
+                    self.reads(),
                     &CandidateBases(SortedIds::from_unsorted(to_read.clone())),
                 )
                 .await
@@ -2172,7 +2566,7 @@ where
             }
             if spill.is_none() {
                 self.next_dir += 1;
-                let path = self.work.join(format!("forced-{}.extras", self.next_dir));
+                let path = self.work.join(format!("fill-{}.extras", self.next_dir));
                 spill = Some(ExtraSpill::create(path).map_err(|e| store(local_io(e)))?);
             }
             let sp = spill.as_mut().expect("created");
@@ -2189,6 +2583,17 @@ where
                     })
                 })?;
                 sp.push(id, kind, &buf).map_err(|e| store(local_io(e)))?;
+                if self.wide.is_some() {
+                    // A small push naming a commit of another ref must not
+                    // make the server copy more than the client could
+                    // have sent.
+                    self.copied_bytes += buf.len() as u64;
+                    if self.copied_bytes > self.copy_limit {
+                        return Err(UnpackError::LeftOutTooLarge {
+                            limit: self.copy_limit,
+                        });
+                    }
+                }
                 if sp.bytes() > budget {
                     return Err(UnpackError::BasesOverBudget { budget });
                 }
@@ -2209,21 +2614,23 @@ where
             None => Vec::new(),
         };
         let keep = match &self.pack {
-            Some(p) if members.iter().any(|m| *m) => keep_flags(p, &members, Some(&held)),
+            Some(p) if members.iter().any(|m| *m) => {
+                keep_flags(p, &members, keep_held_bases.then_some(held))
+            }
             Some(p) => vec![false; p.table.entries().len()],
             None => Vec::new(),
         };
-        // The forced pack is trunk's: charge what it keeps of the pushed
-        // pack against the own-pack budget, as a non-forced trunk's reach
-        // is, so the push's packs still hold at most twice the pushed
-        // pack's objects (plus the spilled skipped-history objects).
+        // Charge what the pack keeps of the pushed pack against the
+        // own-pack budget, as a non-forced trunk's reach is, so the push's
+        // packs still hold at most twice the pushed pack's objects (plus the
+        // spilled objects, which the client did not send).
         self.own_budget = self
             .own_budget
             .saturating_sub(keep.iter().filter(|k| **k).count());
         let pack = if keep.iter().any(|k| *k) || spill.is_some() {
             let id = PlannedId(self.planned.len());
             self.planned.push(PlannedPack {
-                contents: Contents::Forced { keep, spill },
+                contents: Contents::Filled { keep, spill },
                 stored: None,
             });
             Some(Placement {
@@ -2233,7 +2640,7 @@ where
         } else {
             None
         };
-        Ok(Some((chosen, pack, commits)))
+        Ok((pack, commits))
     }
 
     /// Registers a planned pack and uploads it to the row's keys, once; later writes that name
@@ -2265,8 +2672,8 @@ where
                 }
                 (flags_of(&members, None), None)
             }
-            c @ Contents::Forced { .. } => {
-                let Contents::Forced { keep, spill } = std::mem::replace(c, Contents::Done) else {
+            c @ Contents::Filled { .. } => {
+                let Contents::Filled { keep, spill } = std::mem::replace(c, Contents::Done) else {
                     unreachable!()
                 };
                 (keep, spill)
@@ -2342,6 +2749,17 @@ where
         b.map_err(store)?;
         c.map_err(store)?;
         let id = record.id;
+        // Later pushes and fetches of this ref search this pack: hand the
+        // locator its `.idx` and chain map now rather than have them read
+        // back (a round trip per push, #319 and item 11). Best effort.
+        if self.svc.packs.keeps_whole(record.pack.idx_size) {
+            let (idx, entries) = (paths.1.clone(), paths.2.clone());
+            if let Ok((Ok(idx), Ok(table))) =
+                blocking(move || (std::fs::read(idx), std::fs::read(entries))).await
+            {
+                self.svc.packs.remember_pack(record, idx, &table);
+            }
+        }
         self.timings.upload += started.elapsed();
         self.planned[pid.0].stored = Some(id);
         Ok(id)

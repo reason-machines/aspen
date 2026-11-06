@@ -19,11 +19,12 @@ use std::time::Duration;
 use aspen_auth::{Grants, LimitsConfig, NewToken, PolicyConfig};
 use aspen_blob::AnyBlobStore;
 use aspen_core::id::UnixMicros;
-use aspen_meta::SqlStore;
+use aspen_meta::{SqlStore, StoreOptions};
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
 use aspen_place::{PlaceConfig, ServerSettings};
 use aspen_server::access::ClientAddr;
-use aspen_server::access::tokens::SqlTokens;
+use aspen_server::access::cache;
+use aspen_server::access::tokens::{CachedTokens, SqlTokens};
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -48,9 +49,27 @@ async fn open_meta() -> Result<SqlStore, Box<dyn std::error::Error>> {
             format!("sqlite://{}?mode=rwc", data_dir().join("meta.db").display())
         }
     };
-    let meta = SqlStore::connect(&url).await?;
+    let meta = SqlStore::connect_with(&url, &store_options(var)?).await?;
     meta.migrate().await?;
     Ok(meta)
+}
+
+/// The metadata store's connection pool: `PLACE_DB_MAX_CONNECTIONS`
+/// connections (aspen-meta's default of 10 when unset). The other store
+/// settings keep aspen-meta's defaults.
+fn store_options(var: impl Fn(&str) -> Option<String>) -> Result<StoreOptions, String> {
+    let mut options = StoreOptions::default();
+    if let Some(v) = var("PLACE_DB_MAX_CONNECTIONS") {
+        options.max_connections = match v.parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return Err(format!(
+                    "PLACE_DB_MAX_CONNECTIONS={v:?} must be a whole number from 1 to 4294967295"
+                ));
+            }
+        };
+    }
+    Ok(options)
 }
 
 fn config() -> Result<PlaceConfig, String> {
@@ -73,6 +92,15 @@ fn config() -> Result<PlaceConfig, String> {
         "PLACE_MERGE_INTERVAL_MS",
         c.merge_interval.as_millis() as u64,
     )?);
+    c.busy_pushes_per_second = parse(
+        "PLACE_MERGE_BUSY_PUSHES_PER_SECOND",
+        c.busy_pushes_per_second,
+    )?;
+    c.merge_interval_max = Duration::from_millis(parse(
+        "PLACE_MERGE_INTERVAL_MAX_MS",
+        c.merge_interval_max.as_millis() as u64,
+    )?);
+    c.history_max_bytes = parse("PLACE_HISTORY_MAX_BYTES", c.history_max_bytes)?;
     c.ambient_agents = parse("PLACE_AGENTS", c.ambient_agents)?;
     c.ambient_interval = Duration::from_millis(parse(
         "PLACE_AMBIENT_INTERVAL_MS",
@@ -188,7 +216,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let drain = Duration::from_secs(parse("PLACE_SHUTDOWN_DRAIN_SECONDS", 20)?);
-    let built = aspen_place::build(meta.clone(), blobs, SqlTokens(meta), config, settings).await?;
+    // Token rows are kept for a few seconds, as `aspen serve` does by
+    // default (decisions log, "throughput 6a").
+    let tokens = CachedTokens::new(SqlTokens(meta.clone()), cache::DEFAULT_TOKEN_TTL);
+    let built = aspen_place::build(meta.clone(), blobs, tokens, config, settings).await?;
     // Compaction, commit indexing and garbage collection. Jobs are leased
     // and idempotent, so one cut short by exit is redone after its lease.
     let mut background = built.worker;
@@ -330,6 +361,54 @@ fn exit_code(result: Result<(), Box<dyn std::error::Error>>) -> ExitCode {
         Err(e) => {
             eprintln!("aspen-place: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// Unset, the pool keeps aspen-meta's defaults, so a deployment that
+    /// never sets it runs exactly as before.
+    #[test]
+    fn the_pool_keeps_the_store_defaults_when_unset() {
+        assert_eq!(store_options(with(&[])), Ok(StoreOptions::default()));
+    }
+
+    /// The setting sizes the pool and changes nothing else.
+    #[test]
+    fn place_db_max_connections_sizes_the_pool() {
+        let options = store_options(with(&[("PLACE_DB_MAX_CONNECTIONS", "64")])).unwrap();
+        assert_eq!(
+            options,
+            StoreOptions {
+                max_connections: 64,
+                ..StoreOptions::default()
+            }
+        );
+    }
+
+    /// Zero, negative and non-numeric values refuse the start and name the
+    /// variable, never fall back to a default the operator did not ask for.
+    #[test]
+    fn a_pool_size_that_is_not_a_positive_number_is_refused() {
+        for bad in ["0", "-1", "ten", "4294967296"] {
+            let err = store_options(with(&[("PLACE_DB_MAX_CONNECTIONS", bad)])).unwrap_err();
+            assert!(err.contains("PLACE_DB_MAX_CONNECTIONS"), "{err}");
         }
     }
 }

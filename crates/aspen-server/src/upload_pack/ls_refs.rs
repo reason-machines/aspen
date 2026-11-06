@@ -1,8 +1,12 @@
 //! `ls-refs` (fetch path step 1).
 //!
-//! The store answers `ref-prefix` values with prefix scans, page by page,
-//! so a client that asks for `refs/heads/feature` never costs a scan of the
-//! whole ref table. `HEAD` is a symbolic ref to the repository's trunk, and
+//! Refs come from the instance's in-memory listing of the repository
+//! (`upload_pack::ref_snapshot`), brought up to date by one store read of what
+//! changed since the last listing, and are filtered by `ref-prefix` in
+//! memory. Where no listing is held (the cache is off, or the repository
+//! has more refs than it holds) the store answers `ref-prefix` values with
+//! prefix scans, page by page, so a client that asks for
+//! `refs/heads/feature` never costs a scan of the whole ref table. `HEAD` is a symbolic ref to the repository's trunk, and
 //! unborn (`unborn HEAD symref-target:<trunk>`) while trunk has no live
 //! version.
 //!
@@ -13,6 +17,7 @@
 //! `git fetch` does not auto-follow new annotated tags (clone and
 //! `fetch --tags` still get them). Decisions log, B2.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 
 use aspen_core::blob::BlobStore;
@@ -40,7 +45,15 @@ where
     B: BlobStore,
 {
     let mut out = Vec::new();
-    match entries(server.meta(), repo, req).await {
+    let listed = match server.ref_snapshots() {
+        Some(snapshots) => match snapshots.refs(server.meta(), repo.id).await {
+            Ok(Some(refs)) => Ok(held_entries(&refs, repo, req)),
+            Ok(None) => entries(server.meta(), repo, req).await,
+            Err(e) => Err(e),
+        },
+        None => entries(server.meta(), repo, req).await,
+    };
+    match listed {
         Ok(entries) => {
             if let Err(e) = write_ls_refs(&mut out, req, &entries) {
                 out.clear();
@@ -49,6 +62,37 @@ where
         }
         Err(e) => pkt::write_err(&mut out, &FetchError::Store(e).to_wire().message),
     }
+    out
+}
+
+/// The response's entries from a held listing: `HEAD` (a symref to trunk,
+/// unborn while trunk is not live) when the request matches it, then every
+/// matching ref in name order, as [`entries`] lists them from the store.
+fn held_entries(
+    refs: &BTreeMap<RefName, ObjectId>,
+    repo: &Repo,
+    req: &LsRefsRequest,
+) -> Vec<LsRefsEntry> {
+    let trunk = repo.settings.trunk();
+    let mut out = Vec::new();
+    if req.matches("HEAD") {
+        out.push(LsRefsEntry {
+            name: LsRefsName::Head,
+            tip: refs.get(trunk).copied(),
+            symref_target: Some(trunk.clone()),
+            peeled: None,
+        });
+    }
+    out.extend(
+        refs.iter()
+            .filter(|(name, _)| req.matches(name.as_str()))
+            .map(|(name, tip)| LsRefsEntry {
+                name: LsRefsName::Ref(name.clone()),
+                tip: Some(*tip),
+                symref_target: None,
+                peeled: None,
+            }),
+    );
     out
 }
 

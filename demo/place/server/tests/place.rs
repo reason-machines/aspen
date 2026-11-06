@@ -1081,7 +1081,14 @@ async fn git_checks_that_never_commit_cannot_evict_a_pending_stroke() {
     let repo = aspen_place::place::ensure_repo(&meta, &config.repo)
         .await
         .unwrap();
-    let shared = aspen_place::place::shared(&repo, &config);
+    let shared = aspen_place::place::shared(
+        &repo,
+        &config,
+        Arc::new(aspen_place::hook::IndexedMain {
+            meta: meta.clone(),
+            repo: repo.id,
+        }),
+    );
     let hook = Arc::new(FloodingHook {
         inner: PlaceHook(shared.clone()),
         main: Default::default(),

@@ -132,10 +132,13 @@ where
 }
 
 /// Reads every segment's `.idx` and merges them: the stitched pack's object
-/// count and the repeated objects.
+/// count and the repeated objects. Every copy of an object in `leave_out`
+/// is left out (a layered shallow answer's earlier commits, which its
+/// caller checked no kept entry is a delta against).
 pub(crate) async fn stitch_plan<B: BlobStore>(
     blobs: &B,
     rows: &[PackRecord],
+    leave_out: &[ObjectId],
 ) -> Result<StitchPlan, FetchError> {
     // Futures collected first (they start only when polled): a stream
     // mapping `&PackRecord` with a closure is not `Send` for every lifetime.
@@ -144,7 +147,7 @@ pub(crate) async fn stitch_plan<B: BlobStore>(
         .buffered(READ_AHEAD)
         .try_collect()
         .await?;
-    StitchPlan::new(
+    StitchPlan::leaving_out(
         rows.iter()
             .zip(ids)
             .map(|(row, ids)| SegmentIds {
@@ -153,6 +156,7 @@ pub(crate) async fn stitch_plan<B: BlobStore>(
                 ids: ids.into_iter(),
             })
             .collect(),
+        leave_out.iter().copied().collect(),
     )
     .map_err(FetchError::Store)
 }

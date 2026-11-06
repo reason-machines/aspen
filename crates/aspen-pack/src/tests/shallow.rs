@@ -33,6 +33,7 @@ fn ids(lines: &str) -> Vec<ObjectId> {
 fn options(cap: u32) -> RepackOptions {
     RepackOptions {
         max_delta_depth: cap,
+        max_tree_delta_depth: cap,
         max_object_bytes: MAX_OBJECT,
     }
 }

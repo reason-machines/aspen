@@ -38,6 +38,8 @@ const PG_SQL: &str = concat!(
     include_str!("../migrations/postgres/0006_shallow_packs.sql"),
     include_str!("../migrations/postgres/0007_shallow_pack_use.sql"),
     include_str!("../migrations/postgres/0008_job_priority.sql"),
+    include_str!("../migrations/postgres/0009_gc_cursor.sql"),
+    include_str!("../migrations/postgres/0010_ref_version_txid.sql"),
 );
 const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0001_schema_v1.sql"),
@@ -48,6 +50,8 @@ const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0006_shallow_packs.sql"),
     include_str!("../migrations/sqlite/0007_shallow_pack_use.sql"),
     include_str!("../migrations/sqlite/0008_job_priority.sql"),
+    include_str!("../migrations/sqlite/0009_gc_cursor.sql"),
+    include_str!("../migrations/sqlite/0010_ref_version_txid.sql"),
 );
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -630,6 +634,8 @@ async fn fixture(db: &Db) -> Fx {
     db.insert_keyless(&ssh_key_row(1)).await;
     db.insert_keyless(&mirror_row(repo)).await;
     db.insert_keyless(&mirror_ref_row(repo, main)).await;
+    db.insert_keyless(&cursor_row(pack)).await;
+    db.insert_keyless(&lease_row("gc")).await;
     Fx {
         repo,
         other_repo,
@@ -655,6 +661,32 @@ fn chain_row(repo: i64, cover: i64, name: &'static str, first_seq: i64, version:
             ("ref_name", T(name)),
             ("first_seq", I(first_seq)),
             ("first_version_id", I(version)),
+        ],
+    )
+}
+
+/// The sweep's cursor (migration 0009).
+fn cursor_row(pack: i64) -> Row {
+    Row::new(
+        "gc_cursors",
+        &[
+            ("name", T("orphan_packs")),
+            ("touched_at_us", I(5)),
+            ("pack_id", I(pack)),
+            ("audit_pack_id", I(pack)),
+        ],
+    )
+}
+
+/// A lease (migration 0009).
+fn lease_row(name: &'static str) -> Row {
+    Row::new(
+        "leases",
+        &[
+            ("name", T(name)),
+            ("owner", T("aspen-a")),
+            ("epoch", I(1)),
+            ("expires_at_us", I(5)),
         ],
     )
 }
@@ -1345,6 +1377,13 @@ fn cases(f: &Fx) -> (Labelled, Labelled) {
         ),
         ("pack_touches_pack_fk", touch.set("pack_id", I(9999))),
     ]);
+    // gc_cursors, leases (migration 0009)
+    let cursor = cursor_row(f.pack);
+    good.push(("another cursor", cursor.set("name", T("other"))));
+    bad.push(("gc_cursors_pkey", cursor.set("audit_pack_id", I(0))));
+    let lease = lease_row("gc");
+    good.push(("another lease", lease_row("other")));
+    bad.push(("leases_pkey", lease.set("owner", T("aspen-b"))));
     let stone = tombstone_row(f.repo, 50, 0);
     good.push(("tombstone", stone.clone()));
     good.push((
@@ -1540,6 +1579,22 @@ fn expected_indexes() -> BTreeSet<(String, String, bool, String, String)> {
             "priority,run_after_us,id",
             "state='queued'",
         ),
+        // Migration 0009.
+        (
+            "pack_touches",
+            "pack_touches_due",
+            false,
+            "touched_at_us,pack_id",
+            "",
+        ),
+        // Migration 0010.
+        (
+            "ref_versions",
+            "ref_versions_repo_txid",
+            false,
+            "repo_id,txid",
+            "",
+        ),
     ]
     .into_iter()
     .map(|(t, n, u, c, p)| (t.into(), n.into(), u, c.into(), p.into()))
@@ -1604,6 +1659,22 @@ async fn exercise(db: &Db) {
         Dialect::Sqlite => defaults.get(1),
     };
     assert_eq!(attempts, 0);
+
+    // Every version names the transaction that wrote it (migration 0010):
+    // on Postgres its 64-bit transaction ID, on SQLite, where writes run
+    // one at a time, its own ID.
+    let txids = sqlx::query("SELECT id, txid FROM ref_versions")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert!(!txids.is_empty());
+    for row in txids {
+        let (id, txid): (i64, i64) = (row.get(0), row.get(1));
+        match db.dialect {
+            Dialect::Postgres => assert!(txid > 0, "version {id}: txid {txid}"),
+            Dialect::Sqlite => assert_eq!(txid, id, "version {id}"),
+        }
+    }
 
     let indexes = db.indexes().await;
     let named: BTreeSet<_> = indexes

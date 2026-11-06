@@ -8,7 +8,11 @@
 //!   OFS_DELTA's base distance is rewritten, against wherever its base's
 //!   copy was emitted;
 //! - the header's object count is known from the plan before the first byte,
-//!   and the trailing SHA-1 is computed over the output.
+//!   and the trailing SHA-1 is computed over the output;
+//! - a plan may name objects to **leave out** ([`StitchPlan::leaving_out`]):
+//!   every copy of them is dropped. Nothing kept may be a delta against
+//!   one; a stitch that would need that fails with
+//!   [`StoreError::Corrupt`] (the caller checks the entry tables first).
 //!
 //! Stored packs are self-contained and base-first, so one streaming pass
 //! suffices: every kept entry's base is earlier in its own segment, and that
@@ -30,7 +34,7 @@
 //! old-to-new offset map. O(duplicates + entries in the largest segment).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use aspen_core::error::{FetchError, StoreError};
 use aspen_core::id::{ObjectId, PackChecksum, PackId};
@@ -72,6 +76,7 @@ pub struct StitchPlan {
     segments: Vec<PlannedSegment>,
     object_count: u32,
     duplicates: HashMap<ObjectId, Duplicate>,
+    leave_out: HashSet<ObjectId>,
 }
 
 /// One segment's input to [`StitchPlan::new`].
@@ -99,6 +104,17 @@ impl StitchPlan {
     pub fn new<I: Iterator<Item = (ObjectId, u64)>>(
         segments: Vec<SegmentIds<I>>,
     ) -> Result<Self, StoreError> {
+        Self::leaving_out(segments, HashSet::new())
+    }
+
+    /// [`StitchPlan::new`], leaving every copy of the objects in
+    /// `leave_out` out of the stitched pack (an ID no segment holds is
+    /// ignored). The caller must know that no entry it keeps is a delta
+    /// against one of them; [`Stitcher`] refuses one that is.
+    pub fn leaving_out<I: Iterator<Item = (ObjectId, u64)>>(
+        segments: Vec<SegmentIds<I>>,
+        leave_out: HashSet<ObjectId>,
+    ) -> Result<Self, StoreError> {
         let mut planned = Vec::with_capacity(segments.len());
         let mut iters = Vec::with_capacity(segments.len());
         let mut hashes = Vec::with_capacity(segments.len());
@@ -124,9 +140,13 @@ impl StitchPlan {
         let mut duplicates = HashMap::new();
         let mut current: Option<(ObjectId, usize)> = None;
         while let Some(Reverse((id, i))) = heap.pop() {
-            total += 1;
             planned[i].entries += 1;
+            let left = leave_out.contains(&id);
+            if !left {
+                total += 1;
+            }
             match current {
+                _ if left => {}
                 // Equal IDs pop in segment order, so the first is the owner.
                 Some((cur, owner)) if cur == id => {
                     dropped += 1;
@@ -162,6 +182,7 @@ impl StitchPlan {
             segments: planned,
             object_count,
             duplicates,
+            leave_out,
         })
     }
 
@@ -189,6 +210,9 @@ pub struct StitchOutcome {
     pub dropped: u64,
     /// Entries whose OFS_DELTA header was rewritten.
     pub rewritten_headers: u64,
+    /// Entries left out because the plan names their object
+    /// ([`StitchPlan::leaving_out`]).
+    pub left_out: u64,
     /// Longest delta chain in the output (0: no deltas). Keep-first can hang
     /// a later segment's delta off an earlier segment's copy of its base,
     /// so this can approach the sum of the segments' own depths.
@@ -241,6 +265,7 @@ pub struct Stitcher {
     emitted: u64,
     dropped: u64,
     rewritten: u64,
+    left_out: u64,
     max_depth: u32,
 }
 
@@ -261,6 +286,7 @@ impl Stitcher {
             emitted: 0,
             dropped: 0,
             rewritten: 0,
+            left_out: 0,
             max_depth: 0,
         };
         s.emit(&head, out);
@@ -389,6 +415,7 @@ impl Stitcher {
             object_count: self.plan.object_count,
             dropped: self.dropped,
             rewritten_headers: self.rewritten,
+            left_out: self.left_out,
             max_delta_depth: self.max_depth,
         })
     }
@@ -528,6 +555,10 @@ impl Stitcher {
         if !consistent {
             return Err(mismatch());
         }
+        if self.plan.leave_out.contains(&e.id) {
+            self.left_out += 1;
+            return Ok(false);
+        }
         let duplicate = self.plan.duplicates.get(&e.id).copied();
         if let Some(d) = duplicate
             && d.owner != seg.index
@@ -573,6 +604,13 @@ impl Stitcher {
                 Some(at) => at,
                 None => {
                     let id = seg.table.entries()[b].id;
+                    if self.plan.leave_out.contains(&id) {
+                        return Err(corrupt(format!(
+                            "pack {pack_id}: entry at {} is a delta against {id}, which this \
+                             stitch leaves out",
+                            e.offset
+                        )));
+                    }
                     self.plan
                         .duplicates
                         .get(&id)

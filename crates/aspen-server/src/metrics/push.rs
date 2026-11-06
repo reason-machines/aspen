@@ -130,6 +130,9 @@ pub struct PushMetrics {
     /// Pushes refused because their pack was garbage-collected before
     /// they committed (issue #203).
     grace_exceeded: AtomicU64,
+    /// Pushes whose boundary lay outside their dependencies, so the
+    /// versions holding it were searched too (`receive::push`, `widen`).
+    widened: AtomicU64,
 }
 
 impl Default for PushMetrics {
@@ -146,6 +149,7 @@ impl Default for PushMetrics {
             branch_exact: AtomicU64::new(0),
             branch_wider: AtomicU64::new(0),
             grace_exceeded: AtomicU64::new(0),
+            widened: AtomicU64::new(0),
         }
     }
 }
@@ -210,6 +214,17 @@ impl PushMetrics {
     /// before it committed.
     pub(crate) fn grace_exceeded(&self) {
         self.grace_exceeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A push built on commits outside its dependencies (an acknowledged
+    /// commit of another ref, `push.negotiate`) searched their versions.
+    pub(crate) fn push_widened(&self) {
+        self.widened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pushes so far that searched versions beyond their dependencies.
+    pub fn widened_total(&self) -> u64 {
+        self.widened.load(Ordering::Relaxed)
     }
 
     /// Pushes refused so far because their pack outlived the grace period
@@ -313,6 +328,13 @@ impl PushMetrics {
             Kind::Counter,
             [(vec![], get(&self.grace_exceeded))],
         );
+        expo::family(
+            out,
+            "aspen_push_widened_total",
+            "Pushes built on commits outside their dependencies (with push.negotiate: a branch created from another branch, a merge into trunk, an amended forced push, a tag), whose writes copied what they reach from those commits' versions into their own packs.",
+            Kind::Counter,
+            [(vec![], get(&self.widened))],
+        );
         let stages: [(&str, Duration); 10] = [
             ("search", timings.search),
             ("receive", timings.receive),
@@ -333,6 +355,23 @@ impl PushMetrics {
             stages
                 .iter()
                 .map(|(s, d)| (vec![("stage", *s)], d.as_secs_f64())),
+        );
+        expo::family(
+            out,
+            "aspen_push_db_statements_total",
+            "Metadata statements pushes sent, summed over pushes: kind=\"query\" reads and writes rows, kind=\"transaction_control\" is BEGIN, COMMIT, ROLLBACK and savepoints, kind=\"advertisement\" the queries of the info/refs request before a push. Repository and token lookups, and group-commit batches, are not counted. Divide by the sum of aspen_pushes_total for a per-push figure.",
+            Kind::Counter,
+            [
+                (vec![("kind", "query")], timings.db_queries as f64),
+                (
+                    vec![("kind", "transaction_control")],
+                    timings.db_transaction_control as f64,
+                ),
+                (
+                    vec![("kind", "advertisement")],
+                    timings.advert_db_queries as f64,
+                ),
+            ],
         );
         expo::counter(
             out,

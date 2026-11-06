@@ -143,11 +143,17 @@ These are enforced by the server, not by the pre-receive rules:
 ## Merging
 
 The merger bot never does a Git merge of branches, and C7 does not need
-`git merge`. It runs every `mergeIntervalMs`, takes the tile set of every
+`git merge`. It runs every `mergeIntervalMs` (less often under load, up to a
+server-set maximum), takes the tile set of every
 push accepted since its last run (the result `validatePush` returned for
 it), and replays those tile sets onto the trunk tree in `seq` order. It then
 writes one new commit whose only parent is the current trunk tip and
 fast-forwards `main` to it. When two pushes paint the same tile, the one
-with the higher `seq` wins. Trunk history is therefore linear and only ever
-fast-forwards. Branches are left as they are until they expire. The canvas
+with the higher `seq` wins. Trunk history is therefore linear and
+fast-forwards, except when the server starts it again: once `main`'s
+history outgrows a server-set size, the merger replaces it with one root
+commit holding the same canvas (a forced update for earlier clones), after
+merging what is pending. Pushes built on an earlier `main` are still
+checked from the `main` commit they build on, so clones made before keep
+pushing. Branches are left as they are until they expire. The canvas
 on the page is `main` plus each branch's tiles that have not merged yet.

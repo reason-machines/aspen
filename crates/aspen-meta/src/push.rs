@@ -10,15 +10,19 @@ use aspen_core::refs::{Closure, RefValue, RefVersion};
 use sqlx::AssertSqlSafe;
 
 use crate::error::{conflict, is_unique_violation, store_error};
-use crate::rows::{self, VERSION_RETURNING};
+use crate::rows::{self, VERSION_COLS, VERSION_RETURNING};
 use crate::sql::{CHUNK, placeholders};
-use crate::store::{SqlStore, current_version, insert_commits};
+use crate::store::{Dialect, SqlStore, current_version, insert_commits};
 
 /// What one write's statements ended in.
 enum Step {
     Wrote(RefVersion),
     /// The ref was not at the expected version.
     Lost,
+    /// The statement ran and wrote nothing because the store refuses the
+    /// write (its pack was swept, or it expects a version of another ref);
+    /// the transaction it ran in is intact.
+    Refused(StoreError),
 }
 
 pub(crate) async fn commit_push(
@@ -33,14 +37,23 @@ pub(crate) async fn commit_push(
     let mut order: Vec<usize> = (0..push.writes.len()).collect();
     order.sort_by(|&a, &b| push.writes[a].name.cmp(&push.writes[b].name));
 
-    let key_share = crate::gc::key_share(store);
-    match store
-        .write(async |tx| {
-            lock_packs(tx, push, key_share).await?;
-            write_all(tx, push, &order).await
-        })
-        .await
-    {
+    let dialect = store.dialect();
+    let result = if one_statement(dialect, push) {
+        // A single statement is its own transaction: no `BEGIN` and
+        // `COMMIT` round trips (`write_one`).
+        let mut conn = store.admit().await?;
+        match write_one(&mut conn, push, &push.writes[0], true).await? {
+            Step::Wrote(v) => Ok(vec![v]),
+            Step::Lost => Err(Abort::Lost(&push.writes[0].name)),
+            Step::Refused(e) => Err(Abort::Store(e)),
+        }
+    } else {
+        let key_share = crate::gc::key_share(store);
+        store
+            .write(async |tx| write_all(tx, dialect, push, &order, key_share).await)
+            .await
+    };
+    match result {
         Ok(created) => Ok(CommitOutcome::Committed(created)),
         Err(Abort::Lost(name)) => {
             // `write` rolled back before returning: on Postgres the
@@ -114,36 +127,59 @@ pub(crate) async fn commit_pushes(
     });
 
     let key_share = crate::gc::key_share(store);
-    let parts = store
-        .write(async |tx| {
-            let mut parts = Vec::with_capacity(valid.len());
-            for (i, order) in &valid {
-                let push = &pushes[*i];
-                crate::tx::savepoint(tx).await?;
-                let result = async {
-                    lock_packs(tx, push, key_share).await?;
-                    write_all(tx, push, order).await
+    let dialect = store.dialect();
+    // A push that commits in one statement ([`write_one`]) needs no
+    // savepoint: the statement writes everything or nothing, and a lost
+    // compare-and-swap or a swept pack ends it without an error. Only a
+    // statement that fails aborts the transaction, and then the batch runs
+    // again with a savepoint around every push, as it always does on
+    // SQLite, so a failure still undoes only the push it belongs to.
+    let batch = async |savepoints: bool| {
+        store
+            .write(async |tx| {
+                let mut parts = Vec::with_capacity(valid.len());
+                for (i, order) in &valid {
+                    let push = &pushes[*i];
+                    if !savepoints && one_statement(dialect, push) {
+                        let write = &push.writes[0];
+                        let part = match write_one(tx, push, write, true).await? {
+                            Step::Wrote(v) => Part::Wrote(vec![v]),
+                            Step::Lost => Part::Lost(write.name.clone()),
+                            Step::Refused(e) => Part::Failed(e),
+                        };
+                        parts.push((*i, part));
+                        continue;
+                    }
+                    crate::tx::savepoint(tx).await?;
+                    let result = write_all(tx, dialect, push, order, key_share).await;
+                    let part = match result {
+                        Ok(created) => {
+                            crate::tx::release(tx).await?;
+                            Part::Wrote(created)
+                        }
+                        Err(Abort::Lost(name)) => {
+                            crate::tx::rollback_to(tx).await?;
+                            Part::Lost(name.clone())
+                        }
+                        Err(Abort::Store(e)) => {
+                            crate::tx::rollback_to(tx).await?;
+                            Part::Failed(e)
+                        }
+                    };
+                    parts.push((*i, part));
                 }
-                .await;
-                let part = match result {
-                    Ok(created) => {
-                        crate::tx::release(tx).await?;
-                        Part::Wrote(created)
-                    }
-                    Err(Abort::Lost(name)) => {
-                        crate::tx::rollback_to(tx).await?;
-                        Part::Lost(name.clone())
-                    }
-                    Err(Abort::Store(e)) => {
-                        crate::tx::rollback_to(tx).await?;
-                        Part::Failed(e)
-                    }
-                };
-                parts.push((*i, part));
-            }
-            Ok::<_, StoreError>(parts)
-        })
-        .await?;
+                Ok::<_, StoreError>(parts)
+            })
+            .await
+    };
+    let any_without = valid
+        .iter()
+        .any(|(i, _)| one_statement(dialect, &pushes[*i]));
+    let parts = match batch(false).await {
+        Ok(parts) => parts,
+        Err(_) if any_without => batch(true).await?,
+        Err(e) => return Err(e),
+    };
 
     // Committed. A loser's current version is read now, so it sees the
     // winner whether that was another push of this batch or of another
@@ -203,7 +239,7 @@ impl From<StoreError> for Abort<'_> {
 /// reused, so a row that exists under this ID is the generation the push
 /// registered.
 async fn lock_packs(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     push: &PushCommit,
     key_share: &str,
 ) -> Result<(), StoreError> {
@@ -247,16 +283,32 @@ async fn lock_packs(
 /// order, or [`Abort::Lost`] naming the first ref (in name order) that
 /// lost.
 async fn write_all<'p>(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
+    dialect: Dialect,
     push: &'p PushCommit,
     order: &[usize],
+    key_share: &str,
 ) -> Result<Vec<RefVersion>, Abort<'p>> {
+    if one_statement(dialect, push) {
+        let write = &push.writes[0];
+        return match write_one(conn, push, write, true).await? {
+            Step::Wrote(v) => Ok(vec![v]),
+            Step::Lost => Err(Abort::Lost(&write.name)),
+            Step::Refused(e) => Err(Abort::Store(e)),
+        };
+    }
+    lock_packs(conn, push, key_share).await?;
     let mut created: Vec<Option<RefVersion>> = vec![None; push.writes.len()];
     for &i in order {
         let write = &push.writes[i];
-        match write_ref(conn, push, write).await? {
+        let step = match dialect {
+            Dialect::Postgres => write_one(conn, push, write, false).await?,
+            Dialect::Sqlite => write_ref(conn, push, write).await?,
+        };
+        match step {
             Step::Wrote(version) => created[i] = Some(version),
             Step::Lost => return Err(Abort::Lost(&write.name)),
+            Step::Refused(e) => return Err(Abort::Store(e)),
         }
     }
     let created: Vec<RefVersion> = created
@@ -280,7 +332,7 @@ async fn write_all<'p>(
 ///
 /// [`MetaStore::commit_push`]: aspen_core::meta::MetaStore::commit_push
 async fn write_ref(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     push: &PushCommit,
     write: &RefWrite,
 ) -> Result<Step, StoreError> {
@@ -375,4 +427,212 @@ async fn write_ref(
         Err(e) if is_unique_violation(&e, "refs_pkey") => Ok(Step::Lost),
         Err(e) => Err(store_error(e)),
     }
+}
+
+/// Most commit rows a write carries in its one statement
+/// ([`one_statement`]); a write with more uses the transaction, where
+/// [`insert_commits`] writes them in chunks.
+const ONE_STATEMENT_COMMITS: usize = CHUNK / 5;
+
+/// Whether `push` commits in one statement ([`write_one`]): a single write,
+/// with at most [`ONE_STATEMENT_COMMITS`] commit rows, on Postgres. SQLite
+/// cannot put an `INSERT` or `UPDATE` in a `WITH` clause, and an atomic
+/// multi-ref push needs its writes' commit rows in one global order
+/// ([`insert_commits`]), so both use the transaction.
+fn one_statement(dialect: Dialect, push: &PushCommit) -> bool {
+    dialect == Dialect::Postgres
+        && push.writes.len() == 1
+        && push.writes[0].commits.len() <= ONE_STATEMENT_COMMITS
+}
+
+/// A value bound to a statement that [`write_one`] builds.
+enum Arg {
+    Int(Option<i64>),
+    Bytes(Option<Vec<u8>>),
+    Text(String),
+}
+
+/// One write on Postgres as one statement: the compare-and-swap on the
+/// `refs` row, the new version, and (with `rows`) its commit index rows and
+/// jobs, all or nothing.
+///
+/// The `refs` row moves first, to an ID taken from the version table's
+/// identity sequence, and the version is inserted only from the row the
+/// move returned, with that ID and the `seq` the move set. So a lost
+/// compare-and-swap writes nothing: the update finds no row at the
+/// expected version (it waits for a concurrent winner and re-reads the
+/// row, as an `UPDATE` does under read committed), or a create finds the
+/// `refs` row taken. Every foreign key is checked at the end of the
+/// statement, so `refs_version_fk` sees the version the same statement
+/// inserted, and a version whose `seq` another push took still violates
+/// `ref_versions_seq_unique`, also a lost race. The pack is locked
+/// `FOR KEY SHARE` first and the move happens only if it exists, so a pack
+/// garbage collection swept is refused as [`StoreError::pack_swept`], as
+/// [`lock_packs`] refuses it in a transaction.
+async fn write_one(
+    conn: &mut crate::conn::Conn,
+    push: &PushCommit,
+    write: &RefWrite,
+    rows: bool,
+) -> Result<Step, StoreError> {
+    let (tip, closure, pack) = match write.value {
+        RefValue::Live { tip, pack, closure } => (
+            Some(tip.as_bytes().to_vec()),
+            Some(match closure {
+                Closure::Exact => 1_i64,
+                Closure::Wider => 0,
+            }),
+            pack.map(|p| p.get()),
+        ),
+        RefValue::Deleted => (None, None, None),
+    };
+    let mut args: Vec<Arg> = Vec::new();
+    let mut arg = |a: Arg| {
+        args.push(a);
+        format!("${}", args.len())
+    };
+    let repo = arg(Arg::Int(Some(push.repo.get())));
+    let name = arg(Arg::Text(write.name.as_str().to_owned()));
+    let mut sql = String::from(
+        "WITH id AS (SELECT nextval(pg_get_serial_sequence('ref_versions', 'id')) AS id)",
+    );
+    let has_pack = match pack {
+        Some(p) => {
+            let p = arg(Arg::Int(Some(p)));
+            sql.push_str(&format!(
+                ", p AS (SELECT id FROM packs WHERE id = {p} FOR KEY SHARE)"
+            ));
+            " AND EXISTS (SELECT 1 FROM p)"
+        }
+        None => "",
+    };
+    let parent = match write.expected {
+        Some(e) => {
+            let e = arg(Arg::Int(Some(e.get())));
+            sql.push_str(&format!(
+                ", r AS (UPDATE refs SET version_id = (SELECT id FROM id), seq = seq + 1 \
+                 WHERE repo_id = {repo} AND ref_name = {name} AND version_id = {e}{has_pack} \
+                 RETURNING seq)"
+            ));
+            e
+        }
+        None => {
+            sql.push_str(&format!(
+                ", r AS (INSERT INTO refs (repo_id, ref_name, version_id, seq) \
+                 SELECT {repo}, {name}, id.id, 1 FROM id WHERE TRUE{has_pack} \
+                 ON CONFLICT (repo_id, ref_name) DO NOTHING RETURNING seq)"
+            ));
+            "NULL".to_owned()
+        }
+    };
+    let tip = arg(Arg::Bytes(tip));
+    let closure = arg(Arg::Int(closure));
+    let pack_arg = arg(Arg::Int(pack));
+    let trunk = arg(Arg::Int(write.deps.trunk.map(|d| d.get())));
+    let scoped = arg(Arg::Int(write.deps.scoped_old.map(|d| d.get())));
+    sql.push_str(&format!(
+        ", v AS (INSERT INTO ref_versions (id, repo_id, ref_name, seq, parent_version_id, tip_oid, \
+         closure_exact, pack_id, trunk_dep_id, scoped_dep_id) OVERRIDING SYSTEM VALUE \
+         SELECT (SELECT id FROM id), {repo}, {name}, r.seq, {parent}, {tip}, {closure}, \
+         {pack_arg}, {trunk}, {scoped} FROM r RETURNING {VERSION_RETURNING})"
+    ));
+    if rows {
+        // Commit rows in commit ID order, once per commit, as
+        // `insert_commits` writes them (its docs: the global order is what
+        // keeps two pushes of the same commits from deadlocking).
+        let mut commits: Vec<_> = write.commits.iter().collect();
+        commits.sort_by_key(|c| c.commit);
+        commits.dedup_by_key(|c| c.commit);
+        if !commits.is_empty() {
+            let values = commits
+                .iter()
+                .map(|c| {
+                    let o = arg(Arg::Bytes(Some(c.commit.as_bytes().to_vec())));
+                    let p = arg(Arg::Bytes(Some(rows::parents_column(&c.parents))));
+                    let t = arg(Arg::Int(Some(c.committer_time)));
+                    format!("(CAST({o} AS BYTEA), CAST({p} AS BYTEA), CAST({t} AS BIGINT))")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(
+                ", c AS (INSERT INTO commit_index (repo_id, commit_oid, ref_version_id, parents, \
+                 committer_time) SELECT {repo}, x.o, v.id, x.p, x.t FROM v CROSS JOIN \
+                 (VALUES {values}) AS x (o, p, t) ORDER BY x.o \
+                 ON CONFLICT (repo_id, commit_oid) DO NOTHING)"
+            ));
+        }
+        if !write.jobs.is_empty() {
+            let values = write
+                .jobs
+                .iter()
+                .map(|j| {
+                    let k = arg(Arg::Text(job_tag(j.kind).to_owned()));
+                    let a = arg(Arg::Int(Some(j.run_after.0)));
+                    format!("(CAST({k} AS TEXT), CAST({a} AS BIGINT))")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A new version has no jobs yet, so every job is new; `DO
+            // NOTHING` only keeps the statement as idempotent as
+            // `enqueue` is.
+            sql.push_str(&format!(
+                ", j AS (INSERT INTO jobs (repo_id, kind, ref_version_id, run_after_us) \
+                 SELECT {repo}, x.k, v.id, x.a FROM v CROSS JOIN (VALUES {values}) AS x (k, a) \
+                 ON CONFLICT DO NOTHING)"
+            ));
+        }
+    }
+    let packs_found = if pack.is_some() {
+        "(SELECT count(*) FROM p)"
+    } else {
+        "1"
+    };
+    let expected_found = match write.expected {
+        Some(_) => format!(
+            "(SELECT count(*) FROM ref_versions e WHERE e.id = {parent} \
+             AND e.repo_id = {repo} AND e.ref_name = {name})"
+        ),
+        None => "1".to_owned(),
+    };
+    sql.push_str(&format!(
+        " SELECT {packs_found} AS packs_found, {expected_found} AS expected_found, {VERSION_COLS} \
+         FROM (SELECT 1 AS one) AS one LEFT JOIN v ON TRUE"
+    ));
+    let mut q = sqlx::query(AssertSqlSafe(sql));
+    for a in args {
+        q = match a {
+            Arg::Int(i) => q.bind(i),
+            Arg::Bytes(b) => q.bind(b),
+            Arg::Text(t) => q.bind(t),
+        };
+    }
+    let row = match q.fetch_one(&mut *conn).await {
+        Ok(row) => row,
+        Err(e) if is_unique_violation(&e, "ref_versions_seq_unique") => return Ok(Step::Lost),
+        Err(e) => return Err(store_error(e)),
+    };
+    if rows::get::<i64>(&row, "packs_found")? == 0 {
+        return Ok(Step::Refused(StoreError::pack_swept(format_args!(
+            "pack {} no longer exists; retry the push",
+            pack.expect("counted only with a pack")
+        ))));
+    }
+    if rows::get::<Option<i64>>(&row, "id")?.is_some() {
+        return rows::version(&row).map(Step::Wrote);
+    }
+    if rows::get::<i64>(&row, "expected_found")? == 0 {
+        return Ok(Step::Refused(conflict(format!(
+            "{}: expected version {} is not a version of this ref",
+            write.name,
+            write.expected.map_or(0, |v| v.get())
+        ))));
+    }
+    Ok(Step::Lost)
+}
+
+/// The `jobs.kind` of a version job.
+fn job_tag(kind: aspen_core::meta::VersionJobKind) -> &'static str {
+    // Any ID gives the tag; the version's is filled in by the statement.
+    let any = RefVersionId::new(1).expect("1 is a valid row ID");
+    kind.for_version(any).tag().as_str()
 }

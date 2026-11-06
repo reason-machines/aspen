@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use aspen_auth::{LimitsConfig, PolicyConfig};
 use aspen_blob::UploadOptions;
-use aspen_compact::WorkerOptions;
+use aspen_compact::{CompactConfig, WorkerOptions};
 use aspen_pack::locate::LocateOptions;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
-use aspen_server::access::ClientAddr;
+use aspen_server::ServerConfig;
+use aspen_server::access::{AccessCaches, ClientAddr};
 use aspen_server::admission::InstanceLimits;
 use aspen_server::receive::ReceiveConfig;
 
@@ -53,6 +54,8 @@ pub(crate) const DEFAULT_MERGE_QUEUE_BATCH: u64 = 64;
 pub(crate) const MAX_MERGE_QUEUE_BATCH: u64 = 1024;
 /// Seconds a merge-queue outcome ref is kept.
 pub(crate) const DEFAULT_MERGE_QUEUE_OUTCOME_TTL_SECS: u64 = 3600;
+pub(crate) const DEFAULT_MERGE_QUEUE_INTERVAL_MS: u64 = 50;
+pub(crate) const MAX_MERGE_QUEUE_INTERVAL_MS: u64 = 10_000;
 /// Shortest secret accepted for local-store URL signing, in bytes.
 pub(crate) const MIN_URL_SECRET_BYTES: usize = 32;
 /// Longest wait `ASPEN_ADMISSION_QUEUE_WAIT_SECS` and
@@ -79,6 +82,26 @@ pub(crate) const MAX_UPLOAD_CONCURRENCY: u64 = 64;
 /// and a window past a second only delays every push.
 pub(crate) const MAX_GROUP_COMMIT_BATCH: u64 = 1024;
 pub(crate) const MAX_GROUP_COMMIT_WINDOW_MS: u64 = 1000;
+/// Connections in garbage collection's own metadata pool on PostgreSQL
+/// (`ASPEN_GC_DB_MAX_CONNECTIONS`), by default and at most. A pass runs one
+/// statement at a time.
+pub(crate) const DEFAULT_GC_DB_MAX_CONNECTIONS: u64 = 1;
+pub(crate) const MAX_GC_DB_MAX_CONNECTIONS: u64 = 16;
+/// `ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS` by default: a sweep batch is a few
+/// bounded index range scans, so seconds mean something is wrong.
+pub(crate) const DEFAULT_GC_DB_STATEMENT_TIMEOUT_SECS: u64 = 10;
+/// Bounds on `ASPEN_GC_EVERY_SECS` and `ASPEN_GC_LEASE_SECS` (a day at
+/// most), and on `ASPEN_GC_SWEEP_BATCH`.
+pub(crate) const MIN_GC_EVERY_SECS: u64 = 10;
+pub(crate) const MAX_GC_SECS: u64 = 86_400;
+pub(crate) const MAX_GC_SWEEP_BATCH: u64 = 100_000;
+/// Longest `ASPEN_REPO_CACHE_TTL_MS` and `ASPEN_TOKEN_CACHE_TTL_MS`: a
+/// minute. The TTL is how long a change made elsewhere (a revoked token
+/// above all) can go unseen, and past a few seconds a longer one saves the
+/// database next to nothing.
+pub(crate) const MAX_ACCESS_CACHE_TTL_MS: u64 = 60_000;
+/// Most refs `ASPEN_LS_REFS_CACHE_REFS` holds in memory (about 16 GB).
+pub(crate) const MAX_LS_REFS_CACHE_REFS: u64 = 100_000_000;
 
 /// Throughput tuning beyond the limits in [`ServeConfig`]: settings that
 /// were fixed in code before (site/src/configuration.md, "Throughput
@@ -135,6 +158,25 @@ pub(crate) struct Tuning {
     /// `ASPEN_GROUP_COMMIT_MAX_BATCH`: most pushes one group commit
     /// transaction takes (`GroupCommit::max_batch`).
     pub(crate) group_commit_max_batch: Option<usize>,
+    /// `ASPEN_GC_EVERY_SECS`: time between garbage-collection passes
+    /// (`WorkerOptions::gc_every`).
+    pub(crate) gc_every: Option<Duration>,
+    /// `ASPEN_GC_SWEEP_BATCH`: registrations one sweep transaction reads
+    /// (`CompactConfig::gc_sweep_batch`).
+    pub(crate) gc_sweep_batch: Option<u32>,
+    /// `ASPEN_GC_LEASE_SECS`: how long the garbage-collection lease lasts
+    /// after its holder last extended it (`CompactConfig::gc_lease`).
+    pub(crate) gc_lease: Option<Duration>,
+    /// `ASPEN_REPO_CACHE_TTL_MS`: how long a repository row is kept in
+    /// memory (`AccessCaches::repo_ttl`).
+    pub(crate) repo_cache_ttl: Option<Duration>,
+    /// `ASPEN_TOKEN_CACHE_TTL_MS`: how long a token row is kept in memory
+    /// (`AccessCaches::token_ttl`).
+    pub(crate) token_cache_ttl: Option<Duration>,
+    /// `ASPEN_LS_REFS_CACHE_REFS`: refs `ls-refs` keeps in memory across
+    /// repositories (`ServerConfig::ls_refs_cache_refs`); `0` lists every
+    /// ref from the database on every request.
+    pub(crate) ls_refs_cache_refs: Option<usize>,
 }
 
 /// A setting that cannot be used. The message names the variable.
@@ -231,6 +273,12 @@ pub(crate) struct ServeConfig {
     /// connections may go without the pool making progress (issue #150);
     /// `ASPEN_DB_LOCK_TIMEOUT_SECS` and `ASPEN_DB_STATEMENT_TIMEOUT_SECS`.
     pub(crate) store: aspen_meta::StoreOptions,
+    /// Garbage collection's own pool on PostgreSQL, so its statements never
+    /// queue for, or hold, the connections pushes use: `store` with
+    /// `ASPEN_GC_DB_MAX_CONNECTIONS` connections and
+    /// `ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS`. SQLite has one writer anyway,
+    /// so it uses `store`.
+    pub(crate) gc_store: aspen_meta::StoreOptions,
     /// `ASPEN_BLOB_URL`.
     pub(crate) blob_url: String,
     /// `ASPEN_BLOB_URL_SECRET`: signs `/-/blobs` URLs for a `file://` store.
@@ -248,7 +296,8 @@ pub(crate) struct ServeConfig {
     /// `ASPEN_MAX_CONCURRENT_FETCHES`, `ASPEN_MAX_CONCURRENT_PUSHES`,
     /// `ASPEN_MAX_CONCURRENT_STITCHES`, `ASPEN_ADMISSION_QUEUE` and
     /// `ASPEN_ADMISSION_QUEUE_WAIT_SECS`: the work this instance runs at
-    /// once (issue #118).
+    /// once (issue #118); `ASPEN_MEMORY_HIGH_WATER_BYTES`: the resident
+    /// memory over which it refuses new work.
     pub(crate) instance: InstanceLimits,
     /// `ASPEN_SPOOL_DIR`.
     pub(crate) spool_dir: PathBuf,
@@ -309,6 +358,9 @@ pub(crate) struct ServeConfig {
     /// `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS`: how long outcome refs are
     /// kept; `None` (0) keeps them for ever.
     pub(crate) merge_queue_outcome_ttl: Option<std::time::Duration>,
+    /// `ASPEN_MERGE_QUEUE_INTERVAL_MS`: how long a batch that is not full
+    /// waits to gather entries after its oldest was queued.
+    pub(crate) merge_queue_interval: std::time::Duration,
     /// Git over SSH, when `ASPEN_SSH_LISTEN` is set.
     pub(crate) ssh: Option<SshSettings>,
     /// The credentials named in `ASPEN_MIRROR_CREDENTIALS` (node C4).
@@ -462,6 +514,25 @@ impl ServeConfig {
             )?,
         };
 
+        let gc_store = aspen_meta::StoreOptions {
+            max_connections: u32::try_from(
+                optional_in(
+                    &var,
+                    "ASPEN_GC_DB_MAX_CONNECTIONS",
+                    1,
+                    MAX_GC_DB_MAX_CONNECTIONS,
+                )?
+                .unwrap_or(DEFAULT_GC_DB_MAX_CONNECTIONS),
+            )
+            .expect("bounded"),
+            statement_timeout: db_timeout(
+                &var,
+                "ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS",
+                Duration::from_secs(DEFAULT_GC_DB_STATEMENT_TIMEOUT_SECS),
+            )?,
+            ..store.clone()
+        };
+
         let defaults = InstanceLimits::default();
         let slots = |name: &'static str, default: usize| -> Result<usize, ConfigError> {
             usize::try_from(positive(&var, name, default as u64)?)
@@ -483,6 +554,16 @@ impl ServeConfig {
                 defaults.queue_wait.as_secs(),
                 MAX_WAIT_SECS,
             )?),
+            memory_high_water: match optional_in(
+                &var,
+                "ASPEN_MEMORY_HIGH_WATER_BYTES",
+                0,
+                u64::MAX,
+            )? {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => default_memory_high_water(),
+            },
         };
 
         let spool_dir = PathBuf::from(var("ASPEN_SPOOL_DIR").unwrap_or_else(|| "spool".into()));
@@ -575,6 +656,18 @@ impl ServeConfig {
             0 => None,
             s => Some(std::time::Duration::from_secs(s)),
         };
+        let interval_ms = number(
+            &var,
+            "ASPEN_MERGE_QUEUE_INTERVAL_MS",
+            DEFAULT_MERGE_QUEUE_INTERVAL_MS,
+        )?;
+        if interval_ms > MAX_MERGE_QUEUE_INTERVAL_MS {
+            return Err(invalid(
+                "ASPEN_MERGE_QUEUE_INTERVAL_MS",
+                format!("must be at most {MAX_MERGE_QUEUE_INTERVAL_MS}"),
+            ));
+        }
+        let merge_queue_interval = std::time::Duration::from_millis(interval_ms);
 
         let packfile_uris = switch(&var, "ASPEN_PACKFILE_URIS")?;
         let express_serve = match switch(&var, "ASPEN_EXPRESS_SERVE")? {
@@ -669,6 +762,7 @@ impl ServeConfig {
             public_url,
             database_url,
             store,
+            gc_store,
             blob_url,
             blob_url_secret,
             policy,
@@ -697,6 +791,7 @@ impl ServeConfig {
             merge_queue_batch,
             group_commit,
             merge_queue_outcome_ttl,
+            merge_queue_interval,
             ssh,
             mirror_credentials,
             mirror,
@@ -760,13 +855,47 @@ impl ServeConfig {
         r
     }
 
+    /// The fetch path's settings from [`Tuning`], over `server`'s defaults.
+    pub(crate) fn tune_server(&self, server: &mut ServerConfig) {
+        if let Some(n) = self.tuning.ls_refs_cache_refs {
+            server.ls_refs_cache_refs = n;
+        }
+    }
+
     /// One background worker's pacing, named `owner` in job leases.
     pub(crate) fn worker_options(&self, owner: String) -> WorkerOptions {
         let mut o = WorkerOptions::new(owner);
         if let Some(p) = self.tuning.compact_idle_poll {
             o.idle_poll = p;
         }
+        if let Some(e) = self.tuning.gc_every {
+            o.gc_every = e;
+        }
         o
+    }
+
+    /// The garbage-collection settings in [`Tuning`], over
+    /// [`CompactConfig::new`]'s defaults.
+    pub(crate) fn apply_gc(&self, c: &mut CompactConfig) {
+        let t = &self.tuning;
+        if let Some(n) = t.gc_sweep_batch {
+            c.gc_sweep_batch = n;
+        }
+        if let Some(l) = t.gc_lease {
+            c.gc_lease = l;
+        }
+    }
+
+    /// How long the access layer keeps repository and token rows.
+    pub(crate) fn access_caches(&self) -> AccessCaches {
+        let mut c = AccessCaches::default();
+        if let Some(t) = self.tuning.repo_cache_ttl {
+            c.repo_ttl = t;
+        }
+        if let Some(t) = self.tuning.token_cache_ttl {
+            c.token_ttl = t;
+        }
+        c
     }
 
     /// How an S3 store uploads packs (a `file://` store ignores it).
@@ -891,6 +1020,25 @@ fn tuning(
                 MAX_GROUP_COMMIT_BATCH,
             )?,
         )?,
+        gc_every: optional_in(var, "ASPEN_GC_EVERY_SECS", MIN_GC_EVERY_SECS, MAX_GC_SECS)?
+            .map(Duration::from_secs),
+        gc_sweep_batch: optional_in(var, "ASPEN_GC_SWEEP_BATCH", 1, MAX_GC_SWEEP_BATCH)?
+            .map(|n| u32::try_from(n).expect("bounded")),
+        gc_lease: optional_in(
+            var,
+            "ASPEN_GC_LEASE_SECS",
+            aspen_compact::MIN_GC_LEASE.as_secs(),
+            MAX_GC_SECS,
+        )?
+        .map(Duration::from_secs),
+        repo_cache_ttl: optional_in(var, "ASPEN_REPO_CACHE_TTL_MS", 0, MAX_ACCESS_CACHE_TTL_MS)?
+            .map(Duration::from_millis),
+        token_cache_ttl: optional_in(var, "ASPEN_TOKEN_CACHE_TTL_MS", 0, MAX_ACCESS_CACHE_TTL_MS)?
+            .map(Duration::from_millis),
+        ls_refs_cache_refs: usize_of(
+            "ASPEN_LS_REFS_CACHE_REFS",
+            optional_in(var, "ASPEN_LS_REFS_CACHE_REFS", 0, MAX_LS_REFS_CACHE_REFS)?,
+        )?,
     })
 }
 
@@ -986,6 +1134,14 @@ fn check_http_url(var: &'static str, url: &str) -> Result<String, ConfigError> {
         return Err(invalid(var, "must not have a query or fragment"));
     }
     Ok(url.trim_end_matches('/').to_owned())
+}
+
+/// `ASPEN_MEMORY_HIGH_WATER_BYTES` when unset: 80% of the memory this
+/// process may use (its cgroup limit, or the machine's memory), or none
+/// where that cannot be read.
+pub(crate) fn default_memory_high_water() -> Option<u64> {
+    use aspen_server::admission::{MEMORY_HIGH_WATER_PERCENT, memory_limit};
+    memory_limit().map(|limit| limit / 100 * MEMORY_HIGH_WATER_PERCENT)
 }
 
 fn number(
@@ -1159,6 +1315,20 @@ mod tests {
         };
         assert_eq!(ttl("60"), Some(std::time::Duration::from_secs(60)));
         assert_eq!(ttl("0"), None, "0 keeps outcomes for ever");
+        assert_eq!(
+            parse(BASE).unwrap().merge_queue_interval,
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(
+            parse(&with(&[("ASPEN_MERGE_QUEUE_INTERVAL_MS", "0")]))
+                .unwrap()
+                .merge_queue_interval,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            err(&with(&[("ASPEN_MERGE_QUEUE_INTERVAL_MS", "20000")])),
+            "ASPEN_MERGE_QUEUE_INTERVAL_MS: must be at most 10000"
+        );
         assert!(err(&with(&[("ASPEN_MERGE_QUEUE", "maybe")])).starts_with("ASPEN_MERGE_QUEUE"));
         assert_eq!(
             err(&with(&[("ASPEN_MERGE_QUEUE_BATCH", "2000")])),
@@ -1261,7 +1431,13 @@ mod tests {
 
     #[test]
     fn instance_limits_default_and_refuse_zero_slots() {
-        assert_eq!(parse(BASE).unwrap().instance, InstanceLimits::default());
+        assert_eq!(
+            parse(BASE).unwrap().instance,
+            InstanceLimits {
+                memory_high_water: default_memory_high_water(),
+                ..InstanceLimits::default()
+            }
+        );
         let c = parse(&with(&[
             ("ASPEN_MAX_CONCURRENT_FETCHES", "3"),
             ("ASPEN_MAX_CONCURRENT_PUSHES", "2"),
@@ -1706,8 +1882,9 @@ mod tests {
         ("ASPEN_PREFETCH_FLOOR_BYTES", Some("67108864"), "16777216", &["0", "4294967297"]),
         ("ASPEN_PREFETCH_PER_PUSH_BYTES", Some("2147483648"), "1073741824", &["1", "4294967297"]),
         ("ASPEN_PREFETCH_WAIT_SECS", Some("60"), "5", &["3601"]),
-        ("ASPEN_PREFETCH_PARALLEL_READS", Some("64"), "128", &["0", "1025"]),
-        ("ASPEN_IDX_CACHE_BYTES", Some("268435456"), "1073741824", &["0", "1GiB"]),
+        ("ASPEN_PREFETCH_PARALLEL_READS", Some("256"), "128", &["0", "1025"]),
+        ("ASPEN_MEMORY_HIGH_WATER_BYTES", None, "0", &["x", "-1", "12GiB"]),
+        ("ASPEN_IDX_CACHE_BYTES", Some("1073741824"), "268435456", &["0", "1GiB"]),
         ("ASPEN_OBJECT_CACHE_BYTES", Some("67108864"), "0", &["x", "-1"]),
         ("ASPEN_IDX_WHOLE_MAX_BYTES", Some("67108864"), "0", &["x", "-1"]),
         ("ASPEN_TRUNK_TREE_CACHE_BYTES", Some("67108864"), "0", &["64MiB", "-1"]),
@@ -1722,10 +1899,18 @@ mod tests {
         ("ASPEN_GROUP_COMMIT", None, "on", &["maybe"]),
         ("ASPEN_GROUP_COMMIT_WINDOW_MS", Some("2"), "20", &["1001", "x"]),
         ("ASPEN_GROUP_COMMIT_MAX_BATCH", Some("64"), "128", &["0", "1025"]),
+        ("ASPEN_LS_REFS_CACHE_REFS", Some("250000"), "0", &["x", "-1", "100000001"]),
         ("ASPEN_DB_MAX_CONNECTIONS", Some("10"), "32", &["0"]),
         ("ASPEN_DB_ACQUIRE_TIMEOUT_SECS", Some("30"), "5", &["31536001"]),
         ("ASPEN_DB_LOCK_TIMEOUT_SECS", Some("10"), "2", &["86401", "1.5"]),
         ("ASPEN_DB_STATEMENT_TIMEOUT_SECS", Some("60"), "0", &["86401"]),
+        ("ASPEN_GC_EVERY_SECS", Some("300"), "60", &["9", "86401"]),
+        ("ASPEN_GC_SWEEP_BATCH", Some("1000"), "100", &["0", "100001"]),
+        ("ASPEN_GC_LEASE_SECS", Some("300"), "60", &["9", "86401"]),
+        ("ASPEN_GC_DB_MAX_CONNECTIONS", Some("1"), "2", &["0", "17"]),
+        ("ASPEN_GC_DB_STATEMENT_TIMEOUT_SECS", Some("10"), "0", &["86401", "x"]),
+        ("ASPEN_REPO_CACHE_TTL_MS", Some("5000"), "0", &["60001", "5s"]),
+        ("ASPEN_TOKEN_CACHE_TTL_MS", Some("5000"), "1000", &["60001", "-1"]),
     ];
 
     /// What the server is built from: the structs `aspen serve` hands to
@@ -1735,16 +1920,36 @@ mod tests {
     fn effective(c: &ServeConfig) -> String {
         let max_object = MaxObjectBytes::new(c.max_object_bytes).unwrap();
         let max_inflated = MaxInflatedBytes::new(c.max_inflated_bytes).unwrap();
+        let mut server = ServerConfig::new(max_object);
+        c.tune_server(&mut server);
         format!(
-            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nworkers {}\nbatch {}\nrole {:?}",
+            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nworkers {}\nbatch {}\nrole {:?}\ngc {}\nls-refs cache {}",
             c.receive_config(max_object, max_inflated),
             c.worker_options("w".to_owned()),
             c.upload_options(),
             c.instance,
             c.store,
+            c.access_caches(),
             c.compact_workers,
             c.merge_queue_batch,
             c.role,
+            gc_effective(c, max_object, max_inflated),
+            server.ls_refs_cache_refs,
+        )
+    }
+
+    /// What garbage collection runs with: its own pool and the compactor's
+    /// sweep settings.
+    fn gc_effective(
+        c: &ServeConfig,
+        max_object: MaxObjectBytes,
+        max_inflated: MaxInflatedBytes,
+    ) -> String {
+        let mut compact = CompactConfig::new("spool", max_object, max_inflated);
+        c.apply_gc(&mut compact);
+        format!(
+            "{:?} sweep_batch {} lease {:?}",
+            c.gc_store, compact.gc_sweep_batch, compact.gc_lease
         )
     }
 
@@ -1830,7 +2035,8 @@ mod tests {
             ("ASPEN_PREFETCH_PER_PUSH_BYTES", "4294967296"),
             ("ASPEN_PREFETCH_WAIT_SECS", "5"),
             ("ASPEN_PREFETCH_PARALLEL_READS", "128"),
-            ("ASPEN_IDX_CACHE_BYTES", "1073741824"),
+            ("ASPEN_IDX_CACHE_BYTES", "268435456"),
+            ("ASPEN_MEMORY_HIGH_WATER_BYTES", "4294967296"),
             ("ASPEN_OBJECT_CACHE_BYTES", "0"),
             ("ASPEN_IDX_WHOLE_MAX_BYTES", "1048576"),
             ("ASPEN_TRUNK_TREE_CACHE_BYTES", "0"),
@@ -1855,7 +2061,8 @@ mod tests {
         assert_eq!(r.locate.max_prefetch_bytes, 4 << 30);
         assert_eq!(r.prefetch_wait, Duration::from_secs(5));
         assert_eq!(r.locate.max_parallel_reads, 128);
-        assert_eq!(r.locate.idx_cache_bytes, 1 << 30);
+        assert_eq!(r.locate.idx_cache_bytes, 256 << 20);
+        assert_eq!(c.instance.memory_high_water, Some(4 << 30));
         assert_eq!(r.locate.object_cache_bytes, 0);
         assert_eq!(r.locate.max_whole_idx_bytes, 1 << 20);
         assert_eq!(r.trunk_tree_cache_bytes, 0);
@@ -1880,14 +2087,23 @@ mod tests {
         assert_eq!(r.prefetch_floor_bytes, 64 << 20);
         assert_eq!(r.locate.max_prefetch_bytes, 2 << 30, "4 x 512 MiB");
         assert_eq!(r.prefetch_wait, Duration::from_secs(60));
-        assert_eq!(r.locate.max_parallel_reads, 64);
-        assert_eq!(r.locate.idx_cache_bytes, 256 << 20);
+        assert_eq!(r.locate.max_parallel_reads, 256);
+        assert_eq!(r.locate.idx_cache_bytes, 1 << 30);
+        assert_eq!(c.instance.memory_high_water, default_memory_high_water());
         assert_eq!(r.locate.object_cache_bytes, 64 << 20);
         assert_eq!(r.locate.max_whole_idx_bytes, 64 << 20);
         assert_eq!(r.trunk_tree_cache_bytes, 64 << 20);
         assert_eq!(r.thread_limit, None, "every core");
         assert_eq!(r.sync_commit_rows, 10_000);
         assert_eq!(c.upload_options(), UploadOptions::default());
+        assert_eq!(c.access_caches(), AccessCaches::default());
+        assert_eq!(
+            AccessCaches::default(),
+            AccessCaches {
+                repo_ttl: Duration::from_secs(5),
+                token_ttl: Duration::from_secs(5),
+            }
+        );
         assert_eq!(c.upload_options().part_size, 16 << 20);
         assert_eq!(
             c.worker_options("w".into()).idle_poll,

@@ -23,6 +23,11 @@ use aspen_server::receive::{ReceiveConfig, ReceivePack};
 
 use aspen_testkit::git::isolated_git;
 
+/// aspen-meta's throwaway PostgreSQL cluster, for servers whose metadata
+/// store is PostgreSQL ([`Server::start_postgres`]).
+#[path = "../../../aspen-meta/tests/common/mod.rs"]
+pub mod pg;
+
 pub const MIB: u64 = 1 << 20;
 
 pub fn config(dir: &Path) -> ReceiveConfig {
@@ -41,9 +46,15 @@ pub struct Server {
     pub blobs: LocalBlobStore,
     pub svc: Arc<ReceivePack<SqlStore, LocalBlobStore>>,
     pub repo: Repo,
+    /// The access layer in front of the server, which caches repository
+    /// rows ([`aspen_server::access::Access::forget_repo`]).
+    pub access: Arc<aspen_server::access::Access<SqlStore, aspen_auth::MemoryTokenStore>>,
     pub base: String,
     /// A working clone's home for `git`.
     pub home: PathBuf,
+    /// The PostgreSQL cluster the store runs on, kept running while the
+    /// server is ([`Server::start_postgres`]).
+    pub pg: Option<Arc<pg::PgCluster>>,
 }
 
 impl Server {
@@ -97,8 +108,46 @@ impl Server {
         tune_settings: impl FnOnce(RepoSettingsBuilder) -> RepoSettingsBuilder,
         limits: aspen_auth::LimitsConfig,
     ) -> Self {
+        Self::start_on(tune, force, policy, tune_settings, limits, None).await
+    }
+
+    /// A server with default settings (no per-caller concurrency cap) and
+    /// `tune` applied, whose metadata
+    /// store is PostgreSQL on a throwaway cluster; `None` (the test skips)
+    /// when the PostgreSQL binaries are not found outside CI.
+    pub async fn start_postgres(tune: impl FnOnce(&mut ReceiveConfig)) -> Option<Self> {
+        let bin = pg::pg_or_skip()?;
+        let cluster = Arc::new(pg::PgCluster::start(&bin));
+        Some(
+            Self::start_on(
+                tune,
+                ForcePolicy::Branches,
+                serde_json::json!({ "anonymous": ["write:demo"] }),
+                |b| b,
+                // Tests push from many clones at once, all from one address.
+                aspen_auth::LimitsConfig {
+                    concurrent: aspen_auth::ConcurrentLimits::UNLIMITED,
+                    ..aspen_auth::LimitsConfig::default()
+                },
+                Some(cluster),
+            )
+            .await,
+        )
+    }
+
+    async fn start_on(
+        tune: impl FnOnce(&mut ReceiveConfig),
+        force: ForcePolicy,
+        policy: serde_json::Value,
+        tune_settings: impl FnOnce(RepoSettingsBuilder) -> RepoSettingsBuilder,
+        limits: aspen_auth::LimitsConfig,
+        pg: Option<Arc<pg::PgCluster>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}?mode=rwc", dir.path().join("meta.db").display());
+        let url = match &pg {
+            Some(cluster) => cluster.url(),
+            None => format!("sqlite://{}?mode=rwc", dir.path().join("meta.db").display()),
+        };
         let meta = SqlStore::connect(&url).await.unwrap();
         meta.migrate().await.unwrap();
         let blobs = LocalBlobStore::open(dir.path().join("blobs")).unwrap();
@@ -135,7 +184,7 @@ impl Server {
             meta.clone(),
             aspen_server::access::ClientAddr::Peer,
         ));
-        let app = server.router(access);
+        let app = server.router(Arc::clone(&access));
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -144,9 +193,11 @@ impl Server {
             blobs,
             svc,
             repo,
+            access,
             base: format!("http://{addr}"),
             home,
             dir,
+            pg,
         }
     }
 

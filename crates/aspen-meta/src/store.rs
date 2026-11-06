@@ -8,19 +8,24 @@ use aspen_core::error::StoreError;
 use aspen_core::id::{CoverId, JobId, PackChecksum, PackId, RefVersionId, RepoId, Seq, UnixMicros};
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
-    CommitLookup, CommitOutcome, CommitRow, Cover, Job, JobEvent, JobTag, MetaStore, NewCover,
-    NewJob, PackTombstone, PushCommit, RefListQuery, ShallowDepth, ShallowRecorded,
+    CommitLookup, CommitOutcome, CommitRow, Cover, Job, JobEvent, JobTag, Lease, MetaStore,
+    NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery, ShallowDepth,
+    ShallowRecorded, Statements, SweepBatch,
 };
 use aspen_core::name::{RefName, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackRecord};
 use aspen_core::refs::RefVersion;
 use aspen_core::repo::{Repo, RepoSettings};
 use sqlx::any::{AnyPoolOptions, AnyRow};
-use sqlx::{AnyConnection, AnyPool, AssertSqlSafe, Connection as _, Executor as _};
+use sqlx::{AnyPool, AssertSqlSafe, Connection as _, Executor as _};
 
 use crate::admission::{Admission, Admitted};
+use crate::conn::Counter;
 use crate::error::{conflict, is_unique_violation, store_error};
-use crate::rows::{self, COMMIT_COLS, COVER_COLS, COVER_FROM, PACK_COLS, REPO_COLS, VERSION_COLS};
+use crate::rows::{
+    self, COMMIT_COLS, COVER_COLS, COVER_FROM, PACK_COLS, REPO_COLS, VERSION_COLS,
+    VERSION_RETURNING,
+};
 use crate::sql::{CHUNK, PrefixRange, RANGES_PER_QUERY, placeholders, prefix_ranges};
 
 /// The SQL dialect behind a [`SqlStore`], chosen from the URL scheme.
@@ -149,6 +154,7 @@ pub struct SqlStore {
     clock: Clock,
     /// Write transactions begun through this store (shared by clones).
     write_transactions: Arc<std::sync::atomic::AtomicU64>,
+    counter: Counter,
 }
 
 impl SqlStore {
@@ -244,6 +250,7 @@ impl SqlStore {
             dialect,
             clock: Clock::system(),
             write_transactions: Arc::default(),
+            counter: Counter::default(),
         })
     }
 
@@ -268,7 +275,7 @@ impl SqlStore {
                 let _ = conn.close().await;
                 result
             }
-            Dialect::Sqlite => migrator.run(&mut *self.admit().await?).await,
+            Dialect::Sqlite => migrator.run(self.admit().await?.for_migrations()).await,
         };
         result.map_err(|e| StoreError::Unavailable {
             reason: format!("migrations: {e}"),
@@ -297,6 +304,17 @@ impl SqlStore {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Statements this store (all its clones together) has sent to the
+    /// database since it connected, migrations and connection setup left
+    /// out (`src/conn.rs`).
+    pub fn statements(&self) -> Statements {
+        self.counter.totals()
+    }
+
+    pub(crate) fn counter(&self) -> &Counter {
+        &self.counter
+    }
+
     /// The dialect.
     pub fn dialect(&self) -> Dialect {
         self.dialect
@@ -317,7 +335,7 @@ impl SqlStore {
     pub(crate) async fn admit(&self) -> Result<Admitted, StoreError> {
         let permit = self.admission.admit().await?;
         let conn = self.admission.connect(|| self.pool.acquire()).await?;
-        Ok(Admitted::new(conn, permit))
+        Ok(Admitted::new(conn, permit, self.counter.clone()))
     }
 
     /// A turn without its connection, for a write transaction, which takes
@@ -451,7 +469,7 @@ where
 /// hold a key the other waits for: a deadlock (Postgres `40P01`), which
 /// fails one of the pushes. One global order makes that cycle impossible.
 pub(crate) async fn insert_commits(
-    conn: &mut sqlx::AnyConnection,
+    conn: &mut crate::conn::Conn,
     repo: RepoId,
     commits: &[CommitRow],
 ) -> Result<(), StoreError> {
@@ -485,7 +503,7 @@ pub(crate) async fn insert_commits(
 /// Runs `SELECT {cols} FROM {table} WHERE {key} IN (...)` in chunks, with
 /// `prefix` binds (for example `repo_id = $1`) before the list.
 async fn fetch_in(
-    conn: &mut AnyConnection,
+    conn: &mut crate::conn::Conn,
     sql_head: &str,
     prefix: &[i64],
     keys: Vec<KeyValue>,
@@ -606,6 +624,120 @@ impl MetaStore for SqlStore {
         current_version(&mut *self.admit().await?, repo, name).await
     }
 
+    async fn current_versions(
+        &self,
+        repo: RepoId,
+        names: &[RefName],
+    ) -> Result<Vec<Option<RefVersion>>, StoreError> {
+        let mut found: Vec<RefVersion> = Vec::new();
+        let mut conn = self.admit().await?;
+        for chunk in names.chunks(CHUNK) {
+            let sql = format!(
+                "SELECT {VERSION_COLS} FROM refs r JOIN ref_versions v ON v.id = r.version_id \
+                 WHERE r.repo_id = $1 AND r.ref_name IN ({})",
+                placeholders(2, chunk.len())
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql)).bind(repo.get());
+            for n in chunk {
+                q = q.bind(n.as_str().to_owned());
+            }
+            for row in q.fetch_all(&mut *conn).await.map_err(store_error)? {
+                found.push(rows::version(&row)?);
+            }
+        }
+        Ok(names
+            .iter()
+            .map(|n| found.iter().find(|v| &v.name == n).cloned())
+            .collect())
+    }
+
+    async fn current_and_recent(
+        &self,
+        repo: RepoId,
+        name: &RefName,
+        after: Option<Seq>,
+        window: u64,
+    ) -> Result<Option<Vec<RefVersion>>, StoreError> {
+        // `c` is the current version; the versions of the ref come by the
+        // `ref_versions_seq_unique` index, from `seq` past both bounds up
+        // to the current one.
+        let sql = format!(
+            "SELECT {VERSION_COLS} FROM refs r JOIN ref_versions c ON c.id = r.version_id \
+             JOIN ref_versions v ON v.repo_id = c.repo_id AND v.ref_name = c.ref_name \
+             AND v.seq <= c.seq AND (v.seq = c.seq OR (v.seq > $3 AND v.seq >= c.seq - $4)) \
+             WHERE r.repo_id = $1 AND r.ref_name = $2 ORDER BY v.seq DESC"
+        );
+        let window = i64::try_from(window).unwrap_or(i64::MAX);
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(repo.get())
+            .bind(name.as_str().to_owned())
+            .bind(after.map_or(0, Seq::to_db))
+            .bind(window)
+            .fetch_all(&mut *self.admit().await?)
+            .await
+            .map_err(store_error)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        rows.iter()
+            .map(rows::version)
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+
+    async fn reachable_versions(
+        &self,
+        from: &[RefVersionId],
+        stops: &[RefVersionId],
+        limit: u32,
+    ) -> Result<Vec<RefVersion>, StoreError> {
+        let mut out = Vec::new();
+        let mut conn = self.admit().await?;
+        let stops = &stops[..stops.len().min(CHUNK)];
+        for chunk in from.chunks(CHUNK) {
+            let seeds = placeholders(1, chunk.len());
+            let stop = if stops.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " WHERE w.id NOT IN ({})",
+                    placeholders(chunk.len() + 1, stops.len())
+                )
+            };
+            // `UNION` (not `UNION ALL`) ends the walk at versions already
+            // read, so it terminates on any dependency graph, and both
+            // engines produce the seeds before anything they reach, so the
+            // limit never cuts a seed.
+            let sql = format!(
+                "WITH RECURSIVE walk ({VERSION_RETURNING}) AS (\
+                 SELECT {VERSION_COLS} FROM ref_versions v WHERE v.id IN ({seeds}) \
+                 UNION \
+                 SELECT {VERSION_COLS} FROM walk w \
+                 JOIN ref_versions v ON v.id = w.trunk_dep_id OR v.id = w.scoped_dep_id{stop}) \
+                 SELECT {VERSION_RETURNING} FROM walk LIMIT ${}",
+                chunk.len() + stops.len() + 1
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql));
+            for id in chunk.iter().chain(stops) {
+                q = q.bind(id.get());
+            }
+            let n = i64::try_from(chunk.len()).expect("a chunk") + i64::from(limit);
+            for row in q.bind(n).fetch_all(&mut *conn).await.map_err(store_error)? {
+                out.push(rows::version(&row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn count_statements<F>(&self, work: F) -> (F::Output, Option<Statements>)
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        let (out, n) = crate::conn::count(work).await;
+        (out, Some(n))
+    }
+
     async fn ref_version(&self, id: RefVersionId) -> Result<Option<RefVersion>, StoreError> {
         let sql = format!("SELECT {VERSION_COLS} FROM ref_versions v WHERE v.id = $1");
         sqlx::query(AssertSqlSafe(sql))
@@ -691,6 +823,17 @@ impl MetaStore for SqlStore {
             }
         }
         Ok(out)
+    }
+
+    async fn ref_changes(
+        &self,
+        repo: RepoId,
+        since: Option<&RefCursor>,
+        limit: u32,
+    ) -> Result<Option<RefChanges>, StoreError> {
+        crate::ref_changes::ref_changes(self, repo, since, limit)
+            .await
+            .map(Some)
     }
 
     async fn register_pack(&self, pack: &NewPack) -> Result<PackRecord, StoreError> {
@@ -841,12 +984,22 @@ impl MetaStore for SqlStore {
             .transpose()
     }
 
+    async fn acquire_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Option<Lease>, StoreError> {
+        crate::lease::acquire_lease(self, name, owner, ttl).await
+    }
+
     async fn sweep_orphan_packs(
         &self,
+        lease: &Lease,
         grace: Duration,
         limit: u32,
-    ) -> Result<Vec<PackRecord>, StoreError> {
-        crate::gc::sweep_orphan_packs(self, grace, limit).await
+    ) -> Result<SweepBatch, StoreError> {
+        crate::gc::sweep_orphan_packs(self, lease, grace, limit).await
     }
 
     async fn pending_pack_deletes(&self, limit: u32) -> Result<Vec<PackTombstone>, StoreError> {

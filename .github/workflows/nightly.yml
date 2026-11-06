@@ -206,6 +206,31 @@ jobs:
           sudo mkdir -p /mnt/aspen-large && sudo chown "$(id -u)" /mnt/aspen-large
           ASPEN_LARGE_PACK_DIR=/mnt/aspen-large cargo test --release --locked -p aspen-pack --lib -- --ignored over_2_gib --nocapture
 
+  # Depth-1 clones of a moving trunk at monorepo scale (300,000 files, a
+  # 250 MB snapshot, 750 MB of history): 16 concurrent clones right after a
+  # trunk move are never sent the full history, never wait past the build
+  # wait for their packs, and keep the server's memory bounded
+  # (crates/aspen-server/tests/shallow_scale.rs; docs/PLAN.md decisions log,
+  # "Layered shallow answers"). About 5 minutes and 6 GB of disk, so it
+  # runs in release and writes to /mnt.
+  shallow-scale:
+    name: shallow clones at monorepo scale
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: git --version && nproc && free -m && df -h / /mnt
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo mkdir -p /mnt/aspen-shallow && sudo chown "$(id -u)" /mnt/aspen-shallow
+      - name: Depth-1 clone storms after trunk moves
+        env:
+          ASPEN_SHALLOW_SCALE: "1"
+          ASPEN_SHALLOW_SCALE_DIR: /mnt/aspen-shallow
+          # The test server's own stores go to the temporary directory.
+          TMPDIR: /mnt/aspen-shallow
+        run: cargo test --release --locked -p aspen-server --test shallow_scale -- --ignored --nocapture
+
   # A9: cargo deny does not see demo/place. Its shipped bundle has no runtime
   # dependencies, but its pinned dev tooling (Vite, TypeScript, Vitest, Biome,
   # yaml) runs in CI and on contributors' machines, so check it for advisories.

@@ -29,21 +29,21 @@
 use std::ops::{Deref, DerefMut};
 
 use aspen_core::error::StoreError;
-use sqlx::{Any, AnyConnection, Transaction};
 
 use crate::admission::Permit;
+use crate::conn::Conn;
 use crate::error::store_error;
 use crate::store::{Dialect, SqlStore};
 
-/// An open write transaction. Statements run through it as an
-/// `&mut AnyConnection` (it dereferences to one).
+/// An open write transaction. Statements run through it as on a [`Conn`]
+/// (it dereferences to one).
 ///
 /// Only [`SqlStore::write`] creates one, and only it ends one, by commit or
 /// rollback; if the guard is dropped while still open, its `Drop` spawns
 /// the rollback.
 pub(crate) struct WriteTx {
     /// `Some` until the transaction is committed or rolled back.
-    tx: Option<Transaction<'static, Any>>,
+    conn: Option<Conn>,
     /// This transaction's turn at the pool; released after the
     /// transaction ends (dropped with the guard, or moved into the spawned
     /// rollback).
@@ -51,14 +51,16 @@ pub(crate) struct WriteTx {
 }
 
 impl WriteTx {
-    fn open(&mut self) -> &mut Transaction<'static, Any> {
-        self.tx
-            .as_mut()
-            .expect("a WriteTx is open until it is ended")
+    fn take(&mut self) -> (sqlx::Transaction<'static, sqlx::Any>, crate::conn::Counter) {
+        self.conn
+            .take()
+            .and_then(Conn::into_tx)
+            .expect("a WriteTx is ended once, and holds a transaction")
     }
 
     async fn commit(mut self) -> Result<(), StoreError> {
-        let tx = self.tx.take().expect("a WriteTx is ended once");
+        let (tx, counter) = self.take();
+        counter.transaction_control();
         tx.commit().await.map_err(store_error)
     }
 
@@ -67,30 +69,33 @@ impl WriteTx {
     /// the connection when it is released, closing it if it is broken;
     /// closing a connection ends its transaction on the server.
     async fn rollback(mut self) {
-        let tx = self.tx.take().expect("a WriteTx is ended once");
+        let (tx, counter) = self.take();
+        counter.transaction_control();
         let _ = tx.rollback().await;
     }
 }
 
 impl Deref for WriteTx {
-    type Target = AnyConnection;
+    type Target = Conn;
 
-    fn deref(&self) -> &AnyConnection {
-        self.tx
+    fn deref(&self) -> &Conn {
+        self.conn
             .as_ref()
             .expect("a WriteTx is open until it is ended")
     }
 }
 
 impl DerefMut for WriteTx {
-    fn deref_mut(&mut self) -> &mut AnyConnection {
-        self.open()
+    fn deref_mut(&mut self) -> &mut Conn {
+        self.conn
+            .as_mut()
+            .expect("a WriteTx is open until it is ended")
     }
 }
 
 impl Drop for WriteTx {
     fn drop(&mut self) {
-        let Some(tx) = self.tx.take() else {
+        let Some((tx, counter)) = self.conn.take().and_then(Conn::into_tx) else {
             return;
         };
         // Still open: the write future was cancelled or its body panicked.
@@ -100,6 +105,7 @@ impl Drop for WriteTx {
         // sqlx always does.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let permit = self.permit.take();
+            counter.transaction_control();
             runtime.spawn(async move {
                 let _ = tx.rollback().await;
                 drop(permit);
@@ -137,8 +143,9 @@ impl SqlStore {
                 }
             })
             .await?;
+        self.counter().transaction_control();
         let mut tx = WriteTx {
-            tx: Some(tx),
+            conn: Some(Conn::tx(tx, self.counter().clone())),
             permit: Some(permit),
         };
         match crate::admission::in_turn(body(&mut tx)).await {
@@ -160,28 +167,23 @@ impl SqlStore {
 /// it succeeded or [`rollback_to`] if it did not. On Postgres an error
 /// aborts the whole transaction until the rollback to the savepoint. If
 /// either statement fails, the caller must fail the whole transaction.
-pub(crate) async fn savepoint(conn: &mut AnyConnection) -> Result<(), StoreError> {
-    sqlx::query("SAVEPOINT aspen_part")
-        .execute(conn)
+pub(crate) async fn savepoint(conn: &mut Conn) -> Result<(), StoreError> {
+    conn.control("SAVEPOINT aspen_part")
         .await
-        .map(drop)
         .map_err(store_error)
 }
 
 /// Ends the savepoint taken by [`savepoint`], keeping its writes.
-pub(crate) async fn release(conn: &mut AnyConnection) -> Result<(), StoreError> {
-    sqlx::query("RELEASE SAVEPOINT aspen_part")
-        .execute(conn)
+pub(crate) async fn release(conn: &mut Conn) -> Result<(), StoreError> {
+    conn.control("RELEASE SAVEPOINT aspen_part")
         .await
-        .map(drop)
         .map_err(store_error)
 }
 
 /// Undoes every write since [`savepoint`] (and frees the locks they
 /// took), then ends the savepoint.
-pub(crate) async fn rollback_to(conn: &mut AnyConnection) -> Result<(), StoreError> {
-    sqlx::query("ROLLBACK TO SAVEPOINT aspen_part")
-        .execute(&mut *conn)
+pub(crate) async fn rollback_to(conn: &mut Conn) -> Result<(), StoreError> {
+    conn.control("ROLLBACK TO SAVEPOINT aspen_part")
         .await
         .map_err(store_error)?;
     release(conn).await

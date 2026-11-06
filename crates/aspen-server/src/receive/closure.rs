@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 use aspen_core::error::StoreError;
 use aspen_core::id::{PackId, RefVersionId, RepoId, Seq};
 use aspen_core::ingest::SearchPacks;
-use aspen_core::meta::{CoverLayout, MetaStore};
+use aspen_core::meta::{CoverLayout, MetaStore, SeqRange};
 use aspen_core::name::RefName;
 use aspen_core::pack::{CoverLevel, MAX_LEVEL};
 use aspen_core::refs::RefVersion;
@@ -90,6 +90,13 @@ use aspen_core::refs::RefVersion;
 /// Entries each cache holds, about: versions, version packs, cover blocks,
 /// and closure ranges (summed over closures).
 const CACHE_LIMIT: usize = 200_000;
+
+/// Versions one batched read of a closure returns besides the ones asked
+/// for ([`MetaStore::reachable_versions`]).
+const WALK_BATCH: u32 = 512;
+
+/// Remembered roots per repository that a batched read stops at.
+const STOPS: usize = 64;
 
 /// The first wait before a block found without a compacted cover is asked
 /// about again.
@@ -270,6 +277,14 @@ enum Block {
 #[derive(Debug)]
 struct State {
     versions: Recent<RefVersionId, RefVersion>,
+    /// Each version's ID, by repository, ref and `seq`.
+    by_seq: Recent<(RepoId, RefName, u64), RefVersionId>,
+    /// Per advertised ref, the newest `seq` read with its recent versions
+    /// ([`Closures::recent`]).
+    latest: HashMap<(RepoId, RefName), u64>,
+    /// Per repository, the newest roots whose summaries were remembered,
+    /// newest last: where a batched walk may stop ([`STOPS`]).
+    roots: HashMap<RepoId, std::collections::VecDeque<RefVersionId>>,
     /// Each version's pack, by repository, ref and `seq`.
     packs: Recent<(RepoId, RefName, u64), Option<PackId>>,
     summaries: Recent<RefVersionId, Arc<Summary>>,
@@ -280,6 +295,9 @@ impl State {
     fn new(limit: usize) -> Self {
         Self {
             versions: Recent::new(limit, |_| 1),
+            by_seq: Recent::new(limit, |_| 1),
+            roots: HashMap::new(),
+            latest: HashMap::new(),
             packs: Recent::new(limit, |_| 1),
             summaries: Recent::new(limit, |s| s.weight().max(1)),
             blocks: Recent::new(limit, |_| 1),
@@ -288,7 +306,35 @@ impl State {
 
     fn put_version(&mut self, v: &RefVersion) {
         self.versions.insert(v.id, v.clone());
+        self.by_seq
+            .insert((v.repo, v.name.clone(), v.seq.get()), v.id);
         self.put_pack_of(v);
+    }
+
+    fn put_summary(&mut self, root: RefVersionId, summary: Arc<Summary>) {
+        let roots = self.roots.entry(summary.repo).or_default();
+        roots.push_back(root);
+        if roots.len() > STOPS {
+            roots.pop_front();
+        }
+        if self.roots.len() > CACHE_LIMIT / STOPS {
+            // Many repositories: forget the stops (walks read further), not
+            // the summaries.
+            self.roots.clear();
+        }
+        self.summaries.insert(root, summary);
+    }
+
+    /// The remembered roots of `repo` whose summaries are still cached.
+    fn stops(&mut self, repo: RepoId) -> Vec<RefVersionId> {
+        let Some(roots) = self.roots.get(&repo) else {
+            return Vec::new();
+        };
+        let roots: Vec<RefVersionId> = roots.iter().copied().collect();
+        roots
+            .into_iter()
+            .filter(|r| self.summaries.get(r).is_some())
+            .collect()
     }
 
     fn put_pack_of(&mut self, v: &RefVersion) {
@@ -327,22 +373,126 @@ impl Closures {
         self.state.lock().expect("not poisoned")
     }
 
+    /// Version `id`, from the cache, or read together with the versions
+    /// it reaches down to the remembered roots of `repo` (one statement
+    /// for a whole chain that other instances wrote, where one read per
+    /// version cost a push about 15 statements behind three servers).
     async fn version<M: MetaStore>(
         &self,
         meta: &M,
+        repo: RepoId,
         id: RefVersionId,
     ) -> Result<RefVersion, StoreError> {
         if let Some(v) = self.lock().versions.get(&id) {
             return Ok(v);
         }
-        let v = meta
-            .ref_version(id)
-            .await?
-            .ok_or_else(|| StoreError::Corrupt {
-                what: format!("ref version {id} is a dependency but has no row"),
-            })?;
-        self.lock().put_version(&v);
-        Ok(v)
+        let stops = self.lock().stops(repo);
+        let got = meta.reachable_versions(&[id], &stops, WALK_BATCH).await?;
+        let mut st = self.lock();
+        let mut found = None;
+        for v in &got {
+            st.put_version(v);
+            if v.id == id {
+                found = Some(v.clone());
+            }
+        }
+        found.ok_or_else(|| StoreError::Corrupt {
+            what: format!("ref version {id} is a dependency but has no row"),
+        })
+    }
+
+    /// Remembers versions just read from the store (versions never
+    /// change), so a closure walk that reaches them reads nothing.
+    pub(crate) fn remember<'v>(&self, versions: impl IntoIterator<Item = &'v RefVersion>) {
+        let mut st = self.lock();
+        for v in versions {
+            st.put_version(v);
+        }
+    }
+
+    /// Remembers the versions a push just committed, and the closure of
+    /// each whose dependencies' closures are remembered (the ones the push
+    /// searched, as a rule): the next push that builds on one of them, on
+    /// this instance, reads no version to compute its search set.
+    pub(crate) fn committed(&self, created: &[RefVersion]) {
+        let mut st = self.lock();
+        for v in created {
+            st.put_version(v);
+            if v.value.tip().is_none() {
+                continue;
+            }
+            let mut acc = Summary::new(v.repo);
+            let mut whole = true;
+            for dep in v.deps.iter() {
+                match st.summaries.get(&dep) {
+                    Some(s) if s.repo == v.repo => acc.union(&s),
+                    _ => whole = false,
+                }
+            }
+            if whole {
+                acc.insert(&v.name, v.seq);
+                st.put_summary(v.id, Arc::new(acc));
+            }
+        }
+    }
+
+    /// The current version of `name` and its versions up to `window`
+    /// below it, newest first, stopping at the first one the store lacks;
+    /// `None` if `name` has no `refs` row. One statement, which reads only
+    /// the versions written since this instance last asked about `name`
+    /// (the receive-pack advertisement asks on every push), unless the
+    /// remembered ones were dropped from the cache meanwhile.
+    pub(crate) async fn recent<M: MetaStore>(
+        &self,
+        meta: &M,
+        repo: RepoId,
+        name: &RefName,
+        window: u64,
+    ) -> Result<Option<Vec<RefVersion>>, StoreError> {
+        let key = (repo, name.clone());
+        let mut after = self.lock().latest.get(&key).copied();
+        loop {
+            let Some(got) = meta
+                .current_and_recent(repo, name, after.and_then(|a| Seq::new(a).ok()), window)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let current = got[0].clone();
+            let mut st = self.lock();
+            for v in &got {
+                st.put_version(v);
+            }
+            let mut out = vec![current.clone()];
+            let mut complete = true;
+            for back in 1..=window {
+                let Some(seq) = current.seq.back(back) else {
+                    break;
+                };
+                match st
+                    .by_seq
+                    .get(&(repo, name.clone(), seq.get()))
+                    .and_then(|id| st.versions.get(&id))
+                {
+                    Some(v) => out.push(v),
+                    // Read now and absent: the store has no such version.
+                    None if after.is_none_or(|a| seq.get() > a) => break,
+                    // Remembered once, dropped since: read them all.
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                if st.latest.len() >= CACHE_LIMIT {
+                    st.latest.clear();
+                }
+                st.latest.insert(key, current.seq.get());
+                return Ok(Some(out));
+            }
+            after = None;
+        }
     }
 
     fn summary_of(
@@ -379,7 +529,7 @@ impl Closures {
                 acc.union(&s);
                 continue;
             }
-            let v = self.version(meta, id).await?;
+            let v = self.version(meta, repo, id).await?;
             if v.repo != repo {
                 return Err(other_repo(id));
             }
@@ -387,7 +537,7 @@ impl Closures {
             queue.extend(v.deps.iter());
         }
         let acc = Arc::new(acc);
-        self.lock().summaries.insert(root, Arc::clone(&acc));
+        self.lock().put_summary(root, Arc::clone(&acc));
         Ok(acc)
     }
 
@@ -616,6 +766,83 @@ impl Closures {
             }
         }
         Ok(out)
+    }
+}
+
+impl Closures {
+    /// The `seq` ranges of `name`'s versions in the closure of `root`, its
+    /// own included, ascending: the versions of `name` a push built on
+    /// `root` searches. The same summary a push's search set starts from,
+    /// so the push advertisement and the push that follows it share one
+    /// walk (and, on the same instance, the cached result).
+    pub(crate) async fn held_seqs<M: MetaStore>(
+        &self,
+        meta: &M,
+        repo: RepoId,
+        root: RefVersionId,
+        name: &RefName,
+    ) -> Result<Vec<SeqRange>, StoreError> {
+        let summary = self.summary(meta, repo, root).await?;
+        Ok(summary
+            .refs
+            .get(name)
+            .map(|s| {
+                s.0.iter()
+                    .map(|(&f, &l)| {
+                        SeqRange::new(
+                            Seq::new(f).expect("a version's seq"),
+                            Seq::new(l).expect("a version's seq"),
+                        )
+                        .expect("first <= last")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// `name`'s versions at `seqs`, in the order asked, from the cache or
+    /// (for those it lacks) the store; a seq with no version is left out.
+    /// The receive-pack advertisement's `.have` versions: between two
+    /// pushes on one instance, all but the newest are remembered, so this
+    /// reads nothing.
+    pub(crate) async fn versions_at<M: MetaStore>(
+        &self,
+        meta: &M,
+        repo: RepoId,
+        name: &RefName,
+        seqs: &[Seq],
+    ) -> Result<Vec<RefVersion>, StoreError> {
+        let mut found: HashMap<u64, RefVersion> = HashMap::new();
+        let mut missing = Vec::new();
+        {
+            let mut st = self.lock();
+            for &s in seqs {
+                match st
+                    .by_seq
+                    .get(&(repo, name.clone(), s.get()))
+                    .and_then(|id| st.versions.get(&id))
+                {
+                    Some(v) => {
+                        found.insert(s.get(), v);
+                    }
+                    None => missing.push(s),
+                }
+            }
+        }
+        // `versions_by_seq` keeps the order asked, which costs it the
+        // square of the batch: keep batches short.
+        for chunk in missing.chunks(256) {
+            let got = meta.versions_by_seq(repo, name, chunk).await?;
+            let mut st = self.lock();
+            for v in got {
+                if v.repo != repo || &v.name != name {
+                    return Err(other_repo(v.id));
+                }
+                st.put_version(&v);
+                found.insert(v.seq.get(), v);
+            }
+        }
+        Ok(seqs.iter().filter_map(|s| found.remove(&s.get())).collect())
     }
 }
 

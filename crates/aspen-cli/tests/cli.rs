@@ -543,6 +543,61 @@ fn serve_and_compact_roles_split_git_from_compaction() {
     assert_eq!(git_server.terminate().code(), Some(0));
 }
 
+/// Throughput item 7: garbage collection runs in one process at a time.
+/// Two `aspen serve` processes share a database; the first takes the
+/// garbage-collection lease and collects, the second's passes find it held
+/// and do nothing. When the holder stops, its lease runs out
+/// (`ASPEN_GC_LEASE_SECS` after its last extension) and the other takes
+/// over. The `aspen_gc_*` metrics show which process collects.
+#[test]
+fn one_instance_at_a_time_collects_garbage() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    admin_ok(d, &["repo", "create", "acme/app"]);
+    let start = || {
+        let mut cmd = aspen();
+        serve_env(&mut cmd, d);
+        cmd.arg("serve")
+            .env("ASPEN_GC_EVERY_SECS", "10")
+            .env("ASPEN_GC_LEASE_SECS", "10");
+        Running::start(cmd)
+    };
+    let wait_for = |addr: &str, name: &str, want: u64| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while metric(addr, name) < want {
+            assert!(
+                Instant::now() < deadline,
+                "{name} on {addr} stayed below {want}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let ran = "aspen_gc_passes_total{result=\"ran\"}";
+    let elsewhere = "aspen_gc_passes_total{result=\"lease_held_elsewhere\"}";
+
+    let first = start();
+    let first_metrics = first.logged_after("metrics on http://");
+    wait_for(&first_metrics, ran, 1);
+    assert_eq!(metric(&first_metrics, "aspen_gc_lease_held"), 1);
+    assert!(metric(&first_metrics, "aspen_gc_sweep_batches_total") >= 1);
+
+    let second = start();
+    let second_metrics = second.logged_after("metrics on http://");
+    wait_for(&second_metrics, elsewhere, 1);
+    assert_eq!(metric(&second_metrics, ran), 0, "the second never collects");
+    assert_eq!(metric(&second_metrics, "aspen_gc_lease_held"), 0);
+    assert_eq!(metric(&second_metrics, "aspen_gc_sweep_batches_total"), 0);
+    // The holder keeps it from pass to pass.
+    wait_for(&first_metrics, ran, 2);
+    assert_eq!(metric(&second_metrics, ran), 0, "the second never collects");
+
+    // The holder stops; its lease expires and the second takes over.
+    assert_eq!(first.terminate().code(), Some(0));
+    wait_for(&second_metrics, ran, 1);
+    assert_eq!(metric(&second_metrics, "aspen_gc_lease_held"), 1);
+    assert_eq!(second.terminate().code(), Some(0));
+}
+
 /// `aspen dev --no-background-worker` (for benchmarks, D2): the same 16
 /// pushes enqueue the `compact` job, but nothing runs it, so no cover pack
 /// is stored and the job stays queued; fetches still work.
@@ -609,6 +664,9 @@ fn dev_without_the_background_worker_leaves_jobs_queued() {
     assert_eq!(server.terminate().code(), Some(0));
 }
 
+/// The server's token cache TTL in [`serve_enforces_tokens_end_to_end`].
+const TOKEN_TTL_MS: u64 = 250;
+
 /// `aspen serve`: repositories and tokens come from the operator commands,
 /// pushes need a write token, a revoked token stops working, the health
 /// endpoints answer, and SIGTERM stops the server cleanly.
@@ -654,7 +712,10 @@ fn serve_enforces_tokens_end_to_end() {
 
     let mut cmd = aspen();
     serve_env(&mut cmd, d);
-    cmd.arg("serve");
+    // `aspen token revoke` is another process, so the server learns of the
+    // revocation when its cached row ages out; a short TTL keeps this quick.
+    cmd.env("ASPEN_TOKEN_CACHE_TTL_MS", TOKEN_TTL_MS.to_string())
+        .arg("serve");
     let server = Running::start(cmd);
     let check = |path: &str| {
         aspen()
@@ -717,6 +778,8 @@ fn serve_enforces_tokens_end_to_end() {
 
     let id = writer.split('_').nth(1).unwrap();
     admin_ok(d, &["token", "revoke", id]);
+    // Revoked out of process, the token stops working within the TTL at most.
+    std::thread::sleep(Duration::from_millis(2 * TOKEN_TTL_MS));
     std::fs::write(work.join("late.txt"), "late\n").unwrap();
     git_ok(&work, &["add", "."]);
     git_ok(&work, &["commit", "-q", "-m", "late"]);
@@ -724,7 +787,10 @@ fn serve_enforces_tokens_end_to_end() {
         &work,
         &["push", &authed(&server, &writer, "acme/app"), "main"],
     );
-    assert!(!revoked.status.success(), "a revoked token stops working");
+    assert!(
+        !revoked.status.success(),
+        "a revoked token stops working within the token cache TTL"
+    );
 
     let addr = server.addr.clone();
     assert_eq!(
@@ -1473,6 +1539,45 @@ fn serve_with(dir: &Path, grant: &str, extra: &[(&str, &str)]) -> Running {
         cmd.env(k, v);
     }
     Running::start(cmd)
+}
+
+/// Monorepo benchmark, item 8: over `ASPEN_MEMORY_HIGH_WATER_BYTES` the
+/// server refuses new fetches and pushes with a retryable `503` that says
+/// why, and stays up, instead of taking more work until the kernel kills
+/// it. The mark here is 1 byte, so every request is over it.
+#[test]
+fn serve_refuses_new_work_under_memory_pressure_and_stays_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    admin_ok(d, &["repo", "create", "acme/app"]);
+    let server = serve_with(d, "write:*", &[("ASPEN_MEMORY_HIGH_WATER_BYTES", "1")]);
+    let url = server.url("/acme/app.git");
+    let work = work_repo(d, 1);
+    let push = git(&work, &["push", "-q", &url, "main"]);
+    assert!(!push.status.success(), "a push under memory pressure");
+    let err = String::from_utf8_lossy(&push.stderr);
+    assert!(err.contains("503"), "{err}");
+    let (status, head, body) = post(
+        &server.addr,
+        "/acme/app.git/git-upload-pack",
+        None,
+        &ls_refs_body(),
+    );
+    assert_eq!(status, 503);
+    assert!(head.to_ascii_lowercase().contains("retry-after:"), "{head}");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("memory pressure") && text.contains("retry"),
+        "{text}"
+    );
+    // Still serving: health and metrics answer, and count the refusals.
+    assert_eq!(http_get(&server.addr, "/healthz").0, 200);
+    let metrics = server.logged_after("metrics on http://");
+    assert!(metric(&metrics, "aspen_admission_memory_refusals_total ") >= 2);
+    assert_eq!(
+        metric(&metrics, "aspen_admission_memory_high_water_bytes "),
+        1
+    );
 }
 
 /// Per instance (issue #118): with one fetch and one push allowed to run

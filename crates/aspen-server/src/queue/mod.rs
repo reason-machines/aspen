@@ -12,7 +12,28 @@
 //! of its own, `refs/queue/main/<anything>` for trunk `refs/heads/main`.
 //! Receive-pack treats it as an ordinary write (the namespace is writable
 //! while the queue is on, [`with_queue_writable`]); the commit wakes this
-//! worker.
+//! worker. `git push -o land origin HEAD:refs/heads/<branch>` does the
+//! same for a branch: receive-pack writes `refs/queue/<trunk>/<branch>` at
+//! the branch's new version in the branch's own transaction, so the
+//! outcome refs are `refs/queue-done/<trunk>/<branch>` and
+//! `refs/queue-rejected/<trunk>/<branch>`. With the queue off the option is
+//! refused.
+//!
+//! **One builder per repository.** A worker builds a repository's batches
+//! only while it holds the repository's merger lease (`queue:<repo id>`,
+//! [`aspen_core::meta::MetaStore::acquire_lease`]), renewed before every
+//! batch and lapsing [`QueueConfig::lease_ttl`] after its last renewal, so
+//! other instances do not build the same batches only to lose the
+//! compare-and-swap. The holder polls the repository every
+//! [`QueueConfig::interval`] (a change queued through another instance
+//! wakes only that one), and the others poll to take over a lease that
+//! lapsed. Exactly-once does not depend on the lease: a holder that
+//! stalled past its expiry still lands through the compare-and-swap, or
+//! not at all.
+//!
+//! **Batch interval.** A batch that is not full waits until its oldest
+//! entry is [`QueueConfig::interval`] old, so changes queued close
+//! together land together.
 //!
 //! **A batch.** The worker reads trunk's tip T and the pending entries,
 //! oldest first, at most [`QueueConfig::batch`]. For an entry with commit
@@ -36,6 +57,20 @@
 //! other pushes. An entry's base is the first commit of its own
 //! first-parent line in that set, found by reading only the entry's own
 //! commits; the ancestry walk down trunk is the fallback.
+//!
+//! **Reading a change once.** Each queued change's own pack (its commits,
+//! new trees and blobs) is read whole, in one read per change, all at
+//! once; trees the worker read or wrote stay cached between batches, and
+//! so do the root trees of the trunk commits it wrote, so a batch based on
+//! the worker's previous one reads no trunk object at all.
+//!
+//! **Pipelining.** While one batch's atomic push is in flight, the worker
+//! builds the next batch on top of it (its tip, tree and the commits it
+//! writes), from the entries it does not hold; if the push is refused, the
+//! batch built on it is dropped and the next one is built from what is
+//! stored. A batch then costs the longer of building and landing, not
+//! their sum. Pushes themselves stay one at a time: each needs the one
+//! before it on trunk.
 //!
 //! **Building a batch fast.** Everything an entry needs that does not
 //! depend on the rest of the batch (its commit, base, own changes and the
@@ -91,7 +126,7 @@ use aspen_core::id::{ObjectId, RepoId, UnixMicros};
 use aspen_core::ingest::{ObjectKind, SearchPacks};
 use aspen_core::meta::{MetaStore, RefListQuery};
 use aspen_core::name::{RefName, RefPattern};
-use aspen_core::refs::{Ancestry, RefVersion};
+use aspen_core::refs::{Ancestry, RefValue, RefVersion};
 use aspen_core::repo::{ForcePolicy, Repo};
 
 use crate::receive::{AnyRef, ReceivePack, ServiceError};
@@ -130,6 +165,36 @@ pub struct QueueConfig {
     pub outcome_ttl: Option<Duration>,
     /// Time between expiry passes over one repository's outcome refs.
     pub expire_every: Duration,
+    /// How long a batch waits to gather entries after its oldest entry was
+    /// queued, unless it is full ([`QueueConfig::batch`]). Longer means
+    /// bigger batches (fewer trunk updates and uploads) at the cost of
+    /// latency; zero builds a batch as soon as anything is queued.
+    pub interval: Duration,
+    /// The per-repository merger lease: one worker at a time builds a
+    /// repository's batches, renewing the lease before each batch. A
+    /// holder that dies loses it this long after its last renewal.
+    pub lease_ttl: Duration,
+    /// This worker's name in merger leases; unique per worker. The default
+    /// is made from the host, the process and a counter.
+    pub owner: String,
+    /// Build the next batch while the previous one's push is in flight.
+    pub pipeline: bool,
+}
+
+/// Leases of merger workers, by repository (`MetaStore::acquire_lease`).
+fn lease_name(repo: RepoId) -> String {
+    format!("queue:{}", repo.get())
+}
+
+fn default_owner() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into());
+    format!(
+        "queue:{host}:{}:{}:{}",
+        std::process::id(),
+        UnixMicros::now().0,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl Default for QueueConfig {
@@ -140,6 +205,10 @@ impl Default for QueueConfig {
             scan_every: Duration::from_secs(30),
             outcome_ttl: Some(Duration::from_secs(3600)),
             expire_every: Duration::from_secs(60),
+            interval: Duration::from_millis(50),
+            lease_ttl: Duration::from_secs(10),
+            owner: default_owner(),
+            pipeline: true,
         }
     }
 }
@@ -190,6 +259,79 @@ pub(crate) struct QueueMetrics {
     wait_micros: AtomicU64,
     walked: AtomicU64,
     expired: AtomicU64,
+    /// Microseconds spent in each [`Stage`] of building and landing
+    /// batches.
+    stages: [AtomicU64; Stage::ALL.len()],
+}
+
+/// The parts of one batch attempt, timed for `/-/metrics`.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    /// Listing pending entries, reading trunk.
+    List,
+    /// Trunk's closure, chain and tree.
+    Trunk,
+    /// Preparing the entries (their commits, bases, changes and blobs).
+    Prepare,
+    /// Reading the trunk trees the batch edits.
+    TrunkTrees,
+    /// Placing the entries: conflicts, new trees and commits.
+    Place,
+    /// Looking up outcome refs a client reuses.
+    Outcomes,
+    /// Building the batch's pack.
+    Pack,
+    /// The atomic in-process push.
+    Push,
+}
+
+impl Stage {
+    const ALL: [Stage; 8] = [
+        Stage::List,
+        Stage::Trunk,
+        Stage::Prepare,
+        Stage::TrunkTrees,
+        Stage::Place,
+        Stage::Outcomes,
+        Stage::Pack,
+        Stage::Push,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Stage::List => "list",
+            Stage::Trunk => "trunk",
+            Stage::Prepare => "prepare",
+            Stage::TrunkTrees => "trunk_trees",
+            Stage::Place => "place",
+            Stage::Outcomes => "outcomes",
+            Stage::Pack => "pack",
+            Stage::Push => "push",
+        }
+    }
+}
+
+/// Times the stages of one attempt into [`QueueMetrics`].
+struct Clock<'a> {
+    metrics: &'a QueueMetrics,
+    at: std::time::Instant,
+}
+
+impl<'a> Clock<'a> {
+    fn new(metrics: &'a QueueMetrics) -> Self {
+        Self {
+            metrics,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// Charges the time since the last lap to `stage`.
+    fn lap(&mut self, stage: Stage) {
+        let now = std::time::Instant::now();
+        let us = (now - self.at).as_micros() as u64;
+        self.metrics.stages[stage as usize].fetch_add(us, Ordering::Relaxed);
+        self.at = now;
+    }
 }
 
 impl QueueMetrics {
@@ -243,6 +385,18 @@ impl QueueMetrics {
             "Merge-queue outcome refs deleted after ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS.",
             get(&self.expired),
         );
+        expo::family(
+            out,
+            "aspen_queue_stage_seconds_total",
+            "Time the merge queue spent in each stage of building and landing batches (list, trunk, prepare, trunk_trees, place, outcomes, pack, push), summed over attempts.",
+            expo::Kind::Counter,
+            Stage::ALL.iter().map(|s| {
+                (
+                    vec![("stage", s.label())],
+                    get(&self.stages[*s as usize]) as f64 / 1e6,
+                )
+            }),
+        );
     }
 }
 
@@ -279,8 +433,8 @@ impl std::ops::AddAssign for QueueReport {
 pub struct MergeQueue<M, B> {
     svc: Arc<ReceivePack<M, B>>,
     config: QueueConfig,
-    /// Each repository's trunk first-parent chain, as last seen.
-    chains: Mutex<HashMap<RepoId, TrunkChain>>,
+    /// What the worker keeps about each repository between batches.
+    state: Mutex<HashMap<RepoId, RepoState>>,
     /// When each repository's outcome refs were last expired.
     expired_at: Mutex<HashMap<RepoId, std::time::Instant>>,
 }
@@ -311,7 +465,25 @@ struct TrunkChain {
     set: HashSet<ObjectId>,
     /// Oldest first.
     order: std::collections::VecDeque<ObjectId>,
+    /// The root trees of the chain's commits the worker wrote itself, so
+    /// neither a batch's start nor an entry based on one reads the commit.
+    trees: HashMap<ObjectId, ObjectId>,
 }
+
+/// What a worker keeps in memory about one repository between batches.
+#[derive(Debug, Default)]
+struct RepoState {
+    chain: TrunkChain,
+    /// Trees read or written, by ID (immutable, so never stale), shared by
+    /// every batch; cleared when it holds more than [`TREES_KEPT`].
+    trees: Arc<Mutex<HashMap<ObjectId, Tree>>>,
+}
+
+/// Trees a worker keeps per repository between batches.
+const TREES_KEPT: usize = 100_000;
+
+/// The largest queued change's pack read whole in one read.
+const WHOLE_PACK_BYTES: u64 = 8 << 20;
 
 impl TrunkChain {
     /// Adds `id` as the chain's new tip, dropping the oldest commits past
@@ -323,6 +495,7 @@ impl TrunkChain {
         while self.order.len() > CHAIN_LEN {
             if let Some(old) = self.order.pop_front() {
                 self.set.remove(&old);
+                self.trees.remove(&old);
             }
         }
         self.tip = Some(id);
@@ -336,6 +509,7 @@ impl TrunkChain {
             }
             self.order.pop_back();
             self.set.remove(&last);
+            self.trees.remove(&last);
         }
         self.tip = Some(id);
     }
@@ -385,7 +559,7 @@ where
         Self {
             svc,
             config,
-            chains: Mutex::new(HashMap::new()),
+            state: Mutex::new(HashMap::new()),
             expired_at: Mutex::new(HashMap::new()),
         }
     }
@@ -473,13 +647,13 @@ where
         reader: &Reader<'_, M, B>,
         repo: RepoId,
         t: ObjectId,
-    ) -> Result<Arc<HashSet<ObjectId>>, StoreError> {
+    ) -> Result<(Arc<HashSet<ObjectId>>, Arc<HashMap<ObjectId, ObjectId>>), StoreError> {
         let mut chain = self
-            .chains
+            .state
             .lock()
             .expect("not poisoned")
             .get(&repo)
-            .cloned()
+            .map(|r| r.chain.clone())
             .unwrap_or_default();
         if chain.tip != Some(t) {
             let mut walked = Vec::new();
@@ -507,23 +681,41 @@ where
             }
         }
         let set = Arc::new(chain.set.clone());
-        self.chains
+        let trees = Arc::new(chain.trees.clone());
+        self.state
             .lock()
             .expect("not poisoned")
-            .insert(repo, chain);
-        Ok(set)
+            .entry(repo)
+            .or_default()
+            .chain = chain;
+        Ok((set, trees))
     }
 
     /// Records a landed batch: trunk moved from `from` through `written`.
-    fn extend_chain(&self, repo: RepoId, from: ObjectId, written: &[ObjectId]) {
-        let mut chains = self.chains.lock().expect("not poisoned");
-        if let Some(chain) = chains.get_mut(&repo)
-            && chain.tip == Some(from)
+    fn extend_chain(&self, repo: RepoId, from: ObjectId, written: &[(ObjectId, ObjectId)]) {
+        let mut state = self.state.lock().expect("not poisoned");
+        if let Some(r) = state.get_mut(&repo)
+            && r.chain.tip == Some(from)
         {
-            for id in written {
-                chain.push(*id);
+            for (id, tree) in written {
+                r.chain.push(*id);
+                r.chain.trees.insert(*id, *tree);
             }
         }
+    }
+
+    /// The repository's tree cache, emptied first if it grew past
+    /// [`TREES_KEPT`].
+    fn tree_cache(&self, repo: RepoId) -> Arc<Mutex<HashMap<ObjectId, Tree>>> {
+        let mut state = self.state.lock().expect("not poisoned");
+        let trees = state.entry(repo).or_default().trees.clone();
+        {
+            let mut t = trees.lock().expect("not poisoned");
+            if t.len() > TREES_KEPT {
+                t.clear();
+            }
+        }
+        trees
     }
 
     /// Runs passes until `shutdown`: woken repositories at once, every
@@ -535,6 +727,13 @@ where
     ) {
         tokio::pin!(shutdown);
         let mut last_scan: Option<std::time::Instant> = None;
+        // Repositories polled every interval: those whose lease this worker
+        // holds (entries queued through another instance wake only that
+        // instance, so the holder polls) and those whose lease another
+        // worker holds (to take over when it lapses). A repository leaves
+        // once it has been idle for a lease length; the holder then gives
+        // its lease up.
+        let mut watch: BTreeMap<RepoId, std::time::Instant> = BTreeMap::new();
         loop {
             let mut repos = self.svc.queue_signal.take();
             if last_scan.is_none_or(|t| t.elapsed() >= self.config.scan_every) {
@@ -546,15 +745,38 @@ where
                     Err(e) => on_error(&e),
                 }
             }
-            for repo in repos {
-                if let Err(e) = self.drain(repo, false).await {
-                    on_error(&e);
+            let woken: BTreeSet<RepoId> = repos.into_iter().collect();
+            let polled: BTreeSet<RepoId> =
+                watch.keys().copied().chain(woken.iter().copied()).collect();
+            for repo in polled {
+                match self.drain_leased(repo, false).await {
+                    Ok(Leased::Elsewhere) => {
+                        watch.insert(repo, std::time::Instant::now());
+                    }
+                    Ok(Leased::Held(r)) if r.merged + r.rejected > 0 || woken.contains(&repo) => {
+                        watch.insert(repo, std::time::Instant::now());
+                    }
+                    Ok(Leased::Held(_)) => {
+                        let idle = watch
+                            .get(&repo)
+                            .is_none_or(|t| t.elapsed() >= self.config.lease_ttl);
+                        if idle {
+                            watch.remove(&repo);
+                            self.give_up(repo).await;
+                        }
+                    }
+                    Err(e) => on_error(&e),
                 }
             }
+            let pause = if watch.is_empty() {
+                self.config.idle_poll
+            } else {
+                self.config.interval.max(Duration::from_millis(5))
+            };
             tokio::select! {
                 _ = &mut shutdown => return,
                 _ = self.svc.queue_signal.notify.notified() => {}
-                _ = tokio::time::sleep(self.config.idle_poll) => {}
+                _ = tokio::time::sleep(pause) => {}
             }
         }
     }
@@ -566,10 +788,36 @@ where
         let before = walked();
         let mut report = QueueReport::default();
         for repo in self.all_repos().await? {
-            report += self.drain(repo, true).await?;
+            if let Leased::Held(r) = self.drain_leased(repo, true).await? {
+                report += r;
+            }
         }
         report.ancestry_commits = walked() - before;
         Ok(report)
+    }
+
+    /// [`Self::drain`] under `repo`'s merger lease; [`Leased::Elsewhere`]
+    /// (nothing done) while another worker holds it.
+    async fn drain_leased(&self, repo: RepoId, expire_now: bool) -> Result<Leased, StoreError> {
+        let lease = self
+            .svc
+            .meta()
+            .acquire_lease(&lease_name(repo), &self.config.owner, self.config.lease_ttl)
+            .await?;
+        if lease.is_none() {
+            return Ok(Leased::Elsewhere);
+        }
+        Ok(Leased::Held(self.drain(repo, expire_now).await?))
+    }
+
+    /// Lets `repo`'s merger lease lapse now (renewing it for zero time), so
+    /// another instance's worker takes it at once. Best effort.
+    async fn give_up(&self, repo: RepoId) {
+        let _ = self
+            .svc
+            .meta()
+            .acquire_lease(&lease_name(repo), &self.config.owner, Duration::ZERO)
+            .await;
     }
 
     async fn all_repos(&self) -> Result<Vec<RepoId>, StoreError> {
@@ -584,6 +832,73 @@ where
         Ok(out)
     }
 
+    /// Lands batches until nothing is pending: while one batch's push is in
+    /// flight, the next is built on top of it (its tip, tree and chain),
+    /// so a batch costs the longer of building and landing, not their sum.
+    /// A refused push (trunk or a queue ref moved) drops the batch built on
+    /// it and rebuilds from what is stored, at most [`MAX_ATTEMPTS`] times
+    /// in a row.
+    async fn land_all(&self, repo: &Repo, short: &str) -> Result<QueueReport, StoreError> {
+        let mut report = QueueReport::default();
+        let mut refused = 0;
+        let mut current = self.build(repo, short, None).await?;
+        while let Some(b) = current.take() {
+            // Renew the merger lease before landing and building the next
+            // batch; stop if another worker took it over (we stalled past
+            // its expiry). Landing stays correct either way: it is a
+            // compare-and-swap.
+            if !self.renew(repo).await? {
+                break;
+            }
+            let (landed, next) = if self.config.pipeline {
+                tokio::join!(
+                    self.land(repo, short, &b),
+                    self.build(repo, short, Some(&b))
+                )
+            } else {
+                (self.land(repo, short, &b).await, Ok(None))
+            };
+            if landed? {
+                refused = 0;
+                report.batches += 1;
+                report.merged += b.merged;
+                report.rejected += b.rejected;
+                current = match next? {
+                    Some(n) => Some(n),
+                    // Nothing was pending when the next batch was listed;
+                    // look again, on what is stored now.
+                    None => self.build(repo, short, None).await?,
+                };
+            } else {
+                report.refused += 1;
+                self.svc
+                    .queue_metrics
+                    .refused
+                    .fetch_add(1, Ordering::Relaxed);
+                refused += 1;
+                if refused >= MAX_ATTEMPTS {
+                    break;
+                }
+                current = self.build(repo, short, None).await?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Renews `repo`'s merger lease; `false` if another worker holds it.
+    async fn renew(&self, repo: &Repo) -> Result<bool, StoreError> {
+        Ok(self
+            .svc
+            .meta()
+            .acquire_lease(
+                &lease_name(repo.id),
+                &self.config.owner,
+                self.config.lease_ttl,
+            )
+            .await?
+            .is_some())
+    }
+
     /// Lands `repo`'s pending entries, batch after batch, then expires
     /// its old outcome refs (every time when `expire_now`, otherwise at
     /// most every [`QueueConfig::expire_every`]).
@@ -592,100 +907,125 @@ where
         let Some(repo) = self.svc.meta().repo_by_id(repo).await? else {
             return Ok(report);
         };
-        loop {
-            let r = self.batch(&repo).await?;
-            let progress = r.merged + r.rejected > 0;
-            report += r;
-            if !progress {
-                break;
-            }
+        if let Some(short) = branch(&repo) {
+            report += self.land_all(&repo, short).await?;
         }
         report.expired += self.maybe_expire(&repo, expire_now).await?;
         Ok(report)
     }
 
-    /// Builds and lands one batch, rebuilding it after a refused push.
-    async fn batch(&self, repo: &Repo) -> Result<QueueReport, StoreError> {
-        let mut report = QueueReport::default();
-        let Some(short) = branch(repo) else {
-            return Ok(report);
-        };
-        for _ in 0..MAX_ATTEMPTS {
-            match self.attempt(repo, short).await? {
-                Attempt::Nothing => return Ok(report),
-                Attempt::Landed { merged, rejected } => {
-                    report.batches += 1;
-                    report.merged += merged;
-                    report.rejected += rejected;
-                    let m = &self.svc.queue_metrics;
-                    m.batches.fetch_add(1, Ordering::Relaxed);
-                    m.merged.fetch_add(merged, Ordering::Relaxed);
-                    m.rejected.fetch_add(rejected, Ordering::Relaxed);
-                    return Ok(report);
-                }
-                Attempt::Refused(why) => {
-                    tracing::debug!(repo = %repo.name, "merge queue: batch refused, rebuilding: {why}");
-                    report.refused += 1;
-                    self.svc
-                        .queue_metrics
-                        .refused
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    async fn attempt(&self, repo: &Repo, short: &str) -> Result<Attempt, StoreError> {
+    /// Builds one batch: on what is stored (`on` is `None`), or on top of
+    /// a batch whose push is still in flight (`on`, whose entries are left
+    /// out), so building the next batch overlaps landing this one.
+    async fn build(
+        &self,
+        repo: &Repo,
+        short: &str,
+        on: Option<&Built>,
+    ) -> Result<Option<Built>, StoreError> {
         let meta = self.svc.meta();
+        let mut clock = Clock::new(&self.svc.queue_metrics);
         let prefix = format!("{QUEUE_PREFIX}{short}/");
-        let mut entries: Vec<RefVersion> = Vec::new();
-        let mut after: Option<RefName> = None;
-        // Every pending entry is listed, so the oldest ones are taken first
-        // whatever their names.
-        loop {
-            let page = meta
-                .list_refs(
-                    repo.id,
-                    &RefListQuery {
-                        prefixes: vec![prefix.clone()],
-                        after: after.clone(),
-                        limit: 1000,
-                    },
-                )
-                .await?;
-            let Some(last) = page.last() else { break };
-            after = Some(last.name.clone());
-            entries.extend(page.into_iter().filter(|v| v.value.tip().is_some()));
-        }
-        if entries.is_empty() {
-            return Ok(Attempt::Nothing);
-        }
-        entries.sort_by_key(|v| (v.created_at.0, v.id.get()));
+        // A batch that is not full waits, once, until its oldest entry is
+        // the batch interval old, so changes queued close together land
+        // together.
+        let mut waited = false;
+        let mut entries = loop {
+            let mut entries: Vec<RefVersion> = Vec::new();
+            let mut after: Option<RefName> = None;
+            // Every pending entry is listed, so the oldest ones are taken first
+            // whatever their names.
+            loop {
+                let page = meta
+                    .list_refs(
+                        repo.id,
+                        &RefListQuery {
+                            prefixes: vec![prefix.clone()],
+                            after: after.clone(),
+                            limit: 1000,
+                        },
+                    )
+                    .await?;
+                let Some(last) = page.last() else { break };
+                after = Some(last.name.clone());
+                entries.extend(page.into_iter().filter(|v| {
+                    v.value.tip().is_some() && !on.is_some_and(|b| b.names.contains(&v.name))
+                }));
+            }
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            entries.sort_by_key(|v| (v.created_at.0, v.id.get()));
+            if waited || entries.len() >= self.config.batch || self.config.interval.is_zero() {
+                break entries;
+            }
+            let age = UnixMicros::now()
+                .0
+                .saturating_sub(entries[0].created_at.0)
+                .max(0);
+            let interval = i64::try_from(self.config.interval.as_micros()).unwrap_or(i64::MAX);
+            if age >= interval {
+                break entries;
+            }
+            waited = true;
+            tokio::time::sleep(Duration::from_micros((interval - age) as u64)).await;
+        };
         entries.truncate(self.config.batch.max(1));
         let trunk_name = repo.settings.trunk().clone();
-        let Some(trunk) = meta
+        let Some(mut trunk) = meta
             .current_version(repo.id, &trunk_name)
             .await?
             .filter(|v| v.value.tip().is_some())
         else {
             // Nothing to land on: entries wait until trunk exists.
-            return Ok(Attempt::Nothing);
+            return Ok(None);
         };
-        let t = trunk.value.tip().expect("live");
+        clock.lap(Stage::List);
         let mut reader = Reader {
             svc: &self.svc,
             repo: repo.id,
-            trunk_packs: self.svc.closure_of(repo.id, &[trunk.id]).await?,
-            trees: Mutex::new(HashMap::new()),
+            trunk_packs: SearchPacks::default(),
+            trees: self.tree_cache(repo.id),
             chain: Arc::default(),
+            chain_trees: Arc::default(),
+            local: Mutex::new(HashMap::new()),
         };
-        reader.chain = self.trunk_chain(&reader, repo.id, t).await?;
-        let t_tree = reader.commit_tree(&reader.trunk_packs, t).await?;
+        let (t, t_tree) = match on {
+            // On top of the batch in flight: its tip, tree and chain. Trunk
+            // objects older than it come from the trunk it was built on;
+            // the trees it wrote are cached.
+            Some(prev) => {
+                reader.trunk_packs = prev.trunk_packs.clone();
+                let mut chain = (*prev.chain).clone();
+                let mut trees = (*prev.chain_trees).clone();
+                for (id, tree) in &prev.written {
+                    chain.insert(*id);
+                    trees.insert(*id, *tree);
+                }
+                (reader.chain, reader.chain_trees) = (Arc::new(chain), Arc::new(trees));
+                if let RefValue::Live { tip, .. } = &mut trunk.value {
+                    *tip = prev.tip;
+                }
+                (prev.tip, prev.root)
+            }
+            None => {
+                let t = trunk.value.tip().expect("live");
+                reader.trunk_packs = self.svc.closure_of(repo.id, &[trunk.id]).await?;
+                (reader.chain, reader.chain_trees) = self.trunk_chain(&reader, repo.id, t).await?;
+                let t_tree = match reader.chain_trees.get(&t) {
+                    Some(tree) => *tree,
+                    None => reader.commit_tree(&reader.trunk_packs, t).await?,
+                };
+                (t, t_tree)
+            }
+        };
+        clock.lap(Stage::Trunk);
         // Every entry is prepared at once (its commit, base, own changes and
         // the objects it brings), then the batch is assembled in order.
         let prepared = reader.prepare_all(&trunk, t_tree, &entries).await?;
+        clock.lap(Stage::Prepare);
         reader.prepare_trunk(t_tree, &prepared).await?;
+        clock.lap(Stage::TrunkTrees);
         let mut b = Batch {
             reader: &reader,
             trunk_name: &trunk_name,
@@ -700,8 +1040,9 @@ where
         for p in prepared {
             fates.push(b.entry(p).await?);
         }
+        clock.lap(Stage::Place);
         if fates.iter().all(|f| matches!(f, Fate::Later)) {
-            return Ok(Attempt::Nothing);
+            return Ok(None);
         }
         // Outcome refs a client reuses are cleared first (on their own: a
         // refused clear only means the batch push below is refused too and
@@ -763,13 +1104,7 @@ where
                 new,
             });
         }
-        let target = worker_repo(repo, short);
-        if !clears.is_empty() {
-            let body = objects::atomic_request(&clears, None);
-            if let Err(why) = self.push(&target, body).await? {
-                return Ok(Attempt::Refused(why));
-            }
-        }
+        clock.lap(Stage::Outcomes);
         // Compressing and hashing the batch's objects is CPU work: off the
         // async workers that serve every request.
         let pack = if b.pack.is_empty() {
@@ -785,25 +1120,56 @@ where
             )
         };
         let body = objects::atomic_request(&commands, pack);
-        let written = std::mem::take(&mut b.written);
-        match self.push(&target, body).await? {
-            Ok(()) => {
-                self.extend_chain(repo.id, t, &written);
-                let now = UnixMicros::now().0;
-                let waited: i64 = entries
-                    .iter()
-                    .zip(&fates)
-                    .filter(|(_, f)| !matches!(f, Fate::Later))
-                    .map(|(e, _)| (now - e.created_at.0).max(0))
-                    .sum();
-                self.svc
-                    .queue_metrics
-                    .wait_micros
-                    .fetch_add(waited as u64, Ordering::Relaxed);
-                Ok(Attempt::Landed { merged, rejected })
-            }
-            Err(why) => Ok(Attempt::Refused(why)),
+        clock.lap(Stage::Pack);
+        let landed: Vec<(RefName, i64)> = entries
+            .iter()
+            .zip(&fates)
+            .filter(|(_, f)| !matches!(f, Fate::Later))
+            .map(|(e, _)| (e.name.clone(), e.created_at.0))
+            .collect();
+        Ok(Some(Built {
+            names: landed.iter().map(|(n, _)| n.clone()).collect(),
+            created: landed.into_iter().map(|(_, c)| c).collect(),
+            merged,
+            rejected,
+            clears: (!clears.is_empty()).then(|| objects::atomic_request(&clears, None)),
+            body,
+            from: t,
+            tip: b.tip,
+            root: b.root.expect("set"),
+            written: std::mem::take(&mut b.written),
+            trunk_packs: reader.trunk_packs.clone(),
+            chain: reader.chain.clone(),
+            chain_trees: reader.chain_trees.clone(),
+        }))
+    }
+
+    /// Lands a built batch: clears reused outcome refs, then the atomic
+    /// push; `Ok(false)` when either was refused (something moved).
+    async fn land(&self, repo: &Repo, short: &str, b: &Built) -> Result<bool, StoreError> {
+        let mut clock = Clock::new(&self.svc.queue_metrics);
+        let target = worker_repo(repo, short);
+        if let Some(clears) = &b.clears
+            && let Err(why) = self.push(&target, clears.clone()).await?
+        {
+            tracing::debug!(repo = %repo.name, "merge queue: clearing outcomes refused: {why}");
+            return Ok(false);
         }
+        let pushed = self.push(&target, b.body.clone()).await?;
+        clock.lap(Stage::Push);
+        if let Err(why) = pushed {
+            tracing::debug!(repo = %repo.name, "merge queue: batch refused, rebuilding: {why}");
+            return Ok(false);
+        }
+        self.extend_chain(repo.id, b.from, &b.written);
+        let now = UnixMicros::now().0;
+        let waited: i64 = b.created.iter().map(|c| (now - c).max(0)).sum();
+        let m = &self.svc.queue_metrics;
+        m.wait_micros.fetch_add(waited as u64, Ordering::Relaxed);
+        m.batches.fetch_add(1, Ordering::Relaxed);
+        m.merged.fetch_add(b.merged, Ordering::Relaxed);
+        m.rejected.fetch_add(b.rejected, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Pushes `body` in process; `Ok(Err(reason))` when it was refused.
@@ -817,14 +1183,38 @@ where
     }
 }
 
-enum Attempt {
-    Nothing,
-    Landed { merged: u64, rejected: u64 },
-    Refused(String),
+/// A batch ready to land.
+struct Built {
+    /// The entries it lands or rejects, and when each was enqueued.
+    names: HashSet<RefName>,
+    created: Vec<i64>,
+    merged: u64,
+    rejected: u64,
+    /// Deletes of outcome refs clients reuse, pushed first.
+    clears: Option<Vec<u8>>,
+    /// The atomic push.
+    body: Vec<u8>,
+    /// Trunk's tip it builds on, and the tip and tree it lands.
+    from: ObjectId,
+    tip: ObjectId,
+    root: ObjectId,
+    /// Its trunk commits, in order, with their trees.
+    written: Vec<(ObjectId, ObjectId)>,
+    /// What a batch built on top of it starts from.
+    trunk_packs: SearchPacks,
+    chain: Arc<HashSet<ObjectId>>,
+    chain_trees: Arc<HashMap<ObjectId, ObjectId>>,
+}
+
+/// Whether a worker held a repository's merger lease for a pass.
+enum Leased {
+    Held(QueueReport),
+    /// Another worker holds it; nothing was done.
+    Elsewhere,
 }
 
 /// How many entries of a batch are prepared at once.
-const PREPARE_AT_ONCE: usize = 16;
+const PREPARE_AT_ONCE: usize = 256;
 
 /// What one entry needs before it can be placed in the batch, found
 /// independently of the other entries (and so for all of them at once).
@@ -862,10 +1252,15 @@ struct Reader<'a, M, B> {
     svc: &'a ReceivePack<M, B>,
     repo: RepoId,
     trunk_packs: SearchPacks,
-    /// Trees read or written so far.
-    trees: Mutex<HashMap<ObjectId, Tree>>,
-    /// Trunk's recent first-parent chain ([`TrunkChain`]).
+    /// Trees read or written so far (the worker's, kept between batches).
+    trees: Arc<Mutex<HashMap<ObjectId, Tree>>>,
+    /// Trunk's recent first-parent chain ([`TrunkChain`]), and the root
+    /// trees of its commits the worker wrote.
     chain: Arc<HashSet<ObjectId>>,
+    chain_trees: Arc<HashMap<ObjectId, ObjectId>>,
+    /// Every object of the batch's entries' own packs, each pack read whole
+    /// in one read ([`Reader::load_entry_packs`]).
+    local: Mutex<HashMap<ObjectId, (ObjectKind, Vec<u8>)>>,
 }
 
 impl<M, B> Reader<'_, M, B>
@@ -883,7 +1278,21 @@ where
     ) -> Result<HashMap<ObjectId, (ObjectKind, Vec<u8>)>, StoreError> {
         ids.sort_unstable();
         ids.dedup();
-        let mut out = self.svc.read_many(packs, ids.clone()).await?;
+        let mut out = HashMap::with_capacity(ids.len());
+        {
+            let local = self.local.lock().expect("not poisoned");
+            ids.retain(|id| match local.get(id) {
+                Some(o) => {
+                    out.insert(*id, o.clone());
+                    false
+                }
+                None => true,
+            });
+        }
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        out.extend(self.svc.read_many(packs, ids.clone()).await?);
         let missing: Vec<ObjectId> = ids.into_iter().filter(|i| !out.contains_key(i)).collect();
         if !missing.is_empty() && packs != &self.trunk_packs {
             out.extend(
@@ -1096,6 +1505,62 @@ where
         Ok(out)
     }
 
+    /// Reads each entry's own pack whole, all at once (one read each), and
+    /// keeps every object in [`Reader::local`]: a queued change's pack
+    /// holds its commits, new trees and blobs, so preparing it then reads
+    /// nothing else from the blob store except trunk trees not yet cached.
+    /// A pack over [`WHOLE_PACK_BYTES`], or one that does not read or
+    /// parse, is skipped: its objects are read one at a time as before.
+    async fn load_entry_packs(&self, entries: &[RefVersion]) -> Result<(), StoreError> {
+        use aspen_core::blob::ByteRange;
+        use futures_util::stream::{self, StreamExt};
+        let mut ids: Vec<_> = entries.iter().filter_map(|e| e.value.pack()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let rows = self.svc.meta().packs(&ids).await?;
+        let blobs = self.svc.blobs();
+        let mut reads = Vec::new();
+        for row in rows.iter().filter(|r| r.pack.size <= WHOLE_PACK_BYTES) {
+            let Some(range) = ByteRange::new(0, row.pack.size) else {
+                continue;
+            };
+            let key = row.keys().pack;
+            reads.push(async move { blobs.read_exact_range(&key, range).await });
+        }
+        let packs: Vec<Vec<u8>> = stream::iter(reads)
+            .buffer_unordered(PREPARE_AT_ONCE)
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await;
+        let max = self.svc.max_object_bytes();
+        let parsed = tokio::task::spawn_blocking(move || {
+            packs
+                .iter()
+                .filter_map(|p| objects::parse_pack(p, max).ok())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| StoreError::Unavailable {
+            reason: format!("merge queue: reading queued packs: {e}"),
+        })?;
+        let mut local = self.local.lock().expect("not poisoned");
+        let mut trees = self.trees.lock().expect("not poisoned");
+        for objs in parsed {
+            for (id, (kind, data)) in objs {
+                if kind == ObjectKind::Tree
+                    && let Ok(t) = objects::parse_tree(&data)
+                {
+                    trees.insert(id, t);
+                }
+                local.insert(id, (kind, data));
+            }
+        }
+        Ok(())
+    }
+
     /// Prepares every entry, [`PREPARE_AT_ONCE`] at a time, in the
     /// entries' order. Trunk's changes since a base are computed once per
     /// base and shared.
@@ -1106,6 +1571,7 @@ where
         entries: &[RefVersion],
     ) -> Result<Vec<Prepared>, StoreError> {
         use futures_util::stream::{self, StreamExt, TryStreamExt};
+        self.load_entry_packs(entries).await?;
         let mut jobs = Vec::with_capacity(entries.len());
         for e in entries {
             jobs.push(self.prepare(trunk, e));
@@ -1164,6 +1630,7 @@ where
         // reported): never a wrong tree.
         let mut base = None;
         let mut at = (c, commit.clone());
+        let mut known_tree = None;
         for _ in 0..LINE_DEPTH {
             if self.chain.contains(&at.0) {
                 base = Some(at.0);
@@ -1172,6 +1639,14 @@ where
             let Some(&p) = at.1.parents.first() else {
                 break;
             };
+            // A parent the worker landed: its tree is known, no read.
+            if self.chain.contains(&p)
+                && let Some(tree) = self.chain_trees.get(&p)
+            {
+                base = Some(p);
+                known_tree = Some(*tree);
+                break;
+            }
             match self.commit(&packs, p).await? {
                 Some(pc) => at = (p, pc),
                 None => return Err(corrupt(p)("a parent that is not a commit".into())),
@@ -1209,8 +1684,9 @@ where
         if m == c {
             return Ok(Prepared::Nothing);
         }
-        // The loop stopped at the base: `at` is its commit.
-        let m_tree = at.1.tree;
+        // The loop stopped at the base: `at` is its commit, unless the
+        // base's tree was known without reading it.
+        let m_tree = known_tree.unwrap_or(at.1.tree);
         let mine = self.diff(&packs, Some(m_tree), Some(commit.tree)).await?;
         if mine.is_empty() {
             return Ok(Prepared::Nothing);
@@ -1294,8 +1770,8 @@ struct Batch<'a, 'r, M, B> {
     root: Option<ObjectId>,
     /// Paths changed by entries landed earlier in the batch.
     done: Changes,
-    /// The trunk commits the batch wrote, in order.
-    written: Vec<ObjectId>,
+    /// The trunk commits the batch wrote, in order, with their trees.
+    written: Vec<(ObjectId, ObjectId)>,
     now: i64,
 }
 
@@ -1351,7 +1827,7 @@ where
         };
         let data = objects::write_commit(&commit, new_root, &[self.tip], self.now);
         self.tip = self.pack.add(ObjectKind::Commit, data);
-        self.written.push(self.tip);
+        self.written.push((self.tip, new_root));
         self.root = Some(new_root);
         self.done.extend(mine);
         Ok(Fate::Landed(self.tip))

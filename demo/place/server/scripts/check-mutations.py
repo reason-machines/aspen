@@ -21,6 +21,7 @@ API = 'demo/place/server/src/api.rs'
 
 SRV = ["-p", "aspen-server", "--test", "push_hook"]
 E2E = ["-p", "aspen-place", "--test", "place"]
+HIST = ["-p", "aspen-place", "--test", "history"]
 
 muts = [
  # The generic push hook in receive-pack.
@@ -99,6 +100,13 @@ muts = [
   E2E + ["git_checks_that_never_commit_cannot_evict_a_pending_stroke"]),
  ("P22 expiry ignores a branch already gone", [(PLACE, "report.reason() != Some(RejectReason::NoSuchRef)", "report.reason() != Some(RejectReason::StaleOld)")],
   E2E + ["a_branch_deleted_behind_the_services_back_still_expires"]),
+ # main's history stays bounded (history resets).
+ ("P24 the hook does not stop at an earlier main's commits", [(HOOK, "                    boundary.push(*id);\n", "")],
+  HIST + ["clones_and_branches_from_before_a_reset"]),
+ ("P25 the merger never starts main's history again", [(PLACE, "        if max == 0 || self.with_state(|s| s.main.history.bytes) < max {", "        if true || self.with_state(|s| s.main.history.bytes) < max {")],
+  HIST + ["a_full_clone_stays_within_the_history_limit"]),
+ ("P26 a restart forgets the history's size", [(PLACE, "                    }, |h| h.grow(0)),", "                    }, |_| History::root(tip, 0)),")],
+  HIST + ["clones_and_branches_from_before_a_reset"]),
 ]
 
 only = sys.argv[1:]

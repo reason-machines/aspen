@@ -25,7 +25,7 @@ variable "environment" {
 }
 
 variable "account_budget_name" {
-  description = "Name of the account stack's budget (../account). Planning fails unless it exists and is a monthly cost budget of at most 300 USD over the whole account."
+  description = "Name of the account stack's budget (../account). Planning fails unless it exists and is a monthly cost budget over the whole account of at most what the owner approved (../account-budget, max_limit_usd)."
   type        = string
   default     = "aspen-account-monthly"
 }
@@ -116,6 +116,24 @@ variable "http_ingress_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
+variable "db_instance_class" {
+  description = "RDS instance class of the database Aspen and place share. null takes the environment's size from main.tf (demo db.m7g.2xlarge, staging db.t4g.micro). A change is applied at once and restarts the database."
+  type        = string
+  default     = null
+}
+
+variable "db_allocated_storage" {
+  description = "Database storage in GiB (gp3). null takes the environment's size from main.tf (demo 400, staging 20). RDS can grow storage but never shrink it."
+  type        = number
+  default     = null
+}
+
+variable "db_max_allocated_storage" {
+  description = "Upper bound for RDS storage autoscaling in GiB. null takes the environment's size from main.tf (demo 1000, staging 100)."
+  type        = number
+  default     = null
+}
+
 variable "db_deletion_protection" {
   description = "Protect the database from deletion. Turn off (and apply) before destroying the environment."
   type        = bool
@@ -177,15 +195,26 @@ variable "place_kill_switch" {
 }
 
 variable "place_cpu" {
-  description = "Fargate CPU units for the place task."
+  description = "Fargate CPU units for the place task (1024 = 1 vCPU). null takes the environment's size from main.tf (demo 16384, staging 512)."
   type        = number
-  default     = 512
+  default     = null
 }
 
 variable "place_memory" {
-  description = "Fargate memory for the place task in MiB."
+  description = "Fargate memory for the place task in MiB; it must be a size Fargate allows with place_cpu. null takes the environment's size from main.tf (demo 65536, staging 1024)."
   type        = number
-  default     = 1024
+  default     = null
+}
+
+variable "place_db_max_connections" {
+  description = "Connections in aspen-place's database pool (PLACE_DB_MAX_CONNECTIONS). null takes the environment's size from main.tf (demo 64, staging 10)."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.place_db_max_connections == null || try(var.place_db_max_connections >= 1 && floor(var.place_db_max_connections) == var.place_db_max_connections, false)
+    error_message = "place_db_max_connections must be a whole number of at least 1."
+  }
 }
 
 variable "place_port" {
@@ -225,7 +254,7 @@ variable "place_database_init_image" {
 }
 
 variable "place_canvas_mirror" {
-  description = "A GitHub repository (owner/name) that a sidecar of the place task keeps a read-only copy of the canvas's main in, pushing with a deploy key or a repository-scoped token, fast-forward only. null turns it off. The credential goes into the place_canvas_mirror_key output's secret by hand (../README.md, \"Mirror the canvas to GitHub\")."
+  description = "A GitHub repository (owner/name) that a sidecar of the place task keeps a read-only copy of the canvas's main in, pushing with a deploy key or a repository-scoped token, forced so it follows main when place starts main's history again. null turns it off. The credential goes into the place_canvas_mirror_key output's secret by hand (../README.md, \"Mirror the canvas to GitHub\")."
   type        = string
   default     = null
 
@@ -236,7 +265,7 @@ variable "place_canvas_mirror" {
 }
 
 variable "place_canvas_mirror_interval_seconds" {
-  description = "How often the mirror sidecar fetches main and, when it moved, pushes it (one fast-forward push per run; the first run is at start). 15 minutes keeps the public mirror's history to a commit or so per quarter hour."
+  description = "How often the mirror sidecar fetches main and, when it moved, pushes it (one forced push per run; the first run is at start). 15 minutes keeps the public mirror's history to a commit or so per quarter hour."
   type        = number
   default     = 900
 

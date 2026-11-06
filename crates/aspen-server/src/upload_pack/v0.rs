@@ -38,7 +38,6 @@ use aspen_core::fetch::{FetchRequest, PlanMode, ShallowInfo};
 use aspen_core::id::{ObjectId, PackId};
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{CommitLookup, MetaStore};
-use aspen_core::pack::PackRecord;
 use aspen_core::repo::Repo;
 use aspen_proto::pkt;
 use aspen_proto::service::V0Version;
@@ -50,7 +49,7 @@ use axum::body::Body;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::deliver::{self, PackWriter};
-use super::fetch::{plan_rows, resolve_haves, shallow_plan};
+use super::fetch::{ShallowRows, plan_rows, resolve_haves, shallow_plan};
 use super::{Failure, resolve, shallow};
 use crate::Server;
 use crate::access::{Authorized, GitRoute};
@@ -140,7 +139,7 @@ struct Prepared {
     mode: PlanMode,
     wants: Vec<resolve::Want>,
     /// For a shallow request: its planned packs, computed at the header.
-    shallow_rows: Option<Vec<PackRecord>>,
+    shallow_rows: Option<ShallowRows>,
     shallow: Option<ShallowInfo>,
 }
 
@@ -381,7 +380,13 @@ where
                     let (haves, graph, dropped) =
                         resolve_haves(server.meta(), repo, mode, &[]).await?;
                     let rows = plan_rows(server, repo, mode, &wants, haves, graph, dropped).await?;
-                    (Some(rows), None)
+                    (
+                        Some(ShallowRows {
+                            rows,
+                            leave_out: Vec::new(),
+                        }),
+                        None,
+                    )
                 }
             }
         }
@@ -447,25 +452,28 @@ where
     B: BlobStore + Clone + 'static,
 {
     let planned = async {
-        let rows = match prepared.shallow_rows {
+        let ShallowRows { rows, leave_out } = match prepared.shallow_rows {
             Some(rows) => rows,
-            None => {
-                let (haves, graph, dropped) =
-                    resolve_haves(server.meta(), repo, prepared.mode, &request.haves).await?;
-                plan_rows(
-                    server,
-                    repo,
-                    prepared.mode,
-                    &prepared.wants,
-                    haves,
-                    graph,
-                    dropped,
-                )
-                .await?
-            }
+            None => ShallowRows {
+                leave_out: Vec::new(),
+                rows: {
+                    let (haves, graph, dropped) =
+                        resolve_haves(server.meta(), repo, prepared.mode, &request.haves).await?;
+                    plan_rows(
+                        server,
+                        repo,
+                        prepared.mode,
+                        &prepared.wants,
+                        haves,
+                        graph,
+                        dropped,
+                    )
+                    .await?
+                },
+            },
         };
         let slot = deliver::stitch_slot(caller, &rows).await?;
-        let plan = deliver::stitch_plan(server.blobs(), &rows).await?;
+        let plan = deliver::stitch_plan(server.blobs(), &rows, &leave_out).await?;
         Ok::<_, Failure>((rows, plan, slot))
     };
     match planned.await {

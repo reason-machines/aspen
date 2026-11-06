@@ -27,13 +27,29 @@ variable "zone_name" {
 variable "budget_limit_usd" {
   description = "Monthly cost budget for the whole account, in USD. Alerts at 50%, 80% and 100% of actual spend and at 100% of forecast spend."
   type        = number
-  default     = 300
+  # The public share: the owner approved up to about $650/day for a week
+  # from 2026-11-06 (docs/PLAN.md section 6 and decisions log), about
+  # $20,000 over a month. Bring it back to 300 when that week is over.
+  default = 20000
 
-  # Spending beyond $300/month is the owner's decision (docs/PLAN.md section
-  # 6): raising this limit is a reviewed code change, not a variable.
+  # Spending beyond what the owner approved is the owner's decision
+  # (docs/PLAN.md section 6): raising this ceiling is a reviewed code change,
+  # not a variable.
   validation {
-    condition     = var.budget_limit_usd > 0 && var.budget_limit_usd <= 300
-    error_message = "budget_limit_usd must be between 0 and 300; a larger budget needs the owner's approval and a change to this validation."
+    condition     = var.budget_limit_usd > 0 && var.budget_limit_usd <= 20000
+    error_message = "budget_limit_usd must be between 0 and 20000; a larger budget needs the owner's approval and a change to this validation."
+  }
+}
+
+variable "daily_budget_limit_usd" {
+  description = "Daily cost budget for the whole account, in USD. Alerts (notify only) at 50%, 80% and 100% of a day's actual spend."
+  type        = number
+  # The owner's approved ceiling for the public share: about $650/day.
+  default = 650
+
+  validation {
+    condition     = var.daily_budget_limit_usd > 0 && var.daily_budget_limit_usd <= var.budget_limit_usd
+    error_message = "daily_budget_limit_usd must be positive and at most budget_limit_usd."
   }
 }
 

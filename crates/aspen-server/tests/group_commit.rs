@@ -185,12 +185,21 @@ impl MetaStore for Checked {
     ) -> Result<Option<PackRecord>, StoreError> {
         self.inner.pack_by_checksum(repo, checksum).await
     }
+    async fn acquire_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Option<aspen_core::meta::Lease>, StoreError> {
+        self.inner.acquire_lease(name, owner, ttl).await
+    }
     async fn sweep_orphan_packs(
         &self,
+        lease: &aspen_core::meta::Lease,
         grace: Duration,
         limit: u32,
-    ) -> Result<Vec<PackRecord>, StoreError> {
-        self.inner.sweep_orphan_packs(grace, limit).await
+    ) -> Result<aspen_core::meta::SweepBatch, StoreError> {
+        self.inner.sweep_orphan_packs(lease, grace, limit).await
     }
     async fn pending_pack_deletes(&self, limit: u32) -> Result<Vec<PackTombstone>, StoreError> {
         self.inner.pending_pack_deletes(limit).await

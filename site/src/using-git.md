@@ -63,6 +63,44 @@ git push origin my-branch          # creates or fast-forwards my-branch
 git push --atomic origin main v1.2 # all or nothing
 ```
 
+### Pushing a branch again and again: `push.negotiate`
+
+Set this in every clone that pushes to Aspen, or once for your user:
+
+```bash
+git config --global push.negotiate true
+```
+
+A push sees only trunk, so without it Git assumes Aspen lacks every commit
+of your branch that is not on trunk, and sends all of them on every push.
+The 40th push of a 40-commit branch sends 40 commits, and each push gets a
+little slower than the last. With `push.negotiate`, `git push` first runs a
+short negotiation (`git fetch --negotiate-only`): it lists commits of the
+branch being pushed, Aspen says which ones it already has, and Git leaves
+those and everything they reach out of the pack. Each push then sends only
+its new commits, however long the branch is. In Aspen's tests
+(`crates/aspen-server/tests/push_negotiate.rs`) 40 pushes to one branch
+sent about 500 bytes each with the setting, and from 750 bytes growing to
+15 KB without it.
+
+The cost is one extra request per push. It needs protocol version 2, Git's
+default since 2.26, and was tested with Git 2.39. If the negotiation fails
+for any reason, Git prints `push negotiation failed; proceeding anyway with
+push` and pushes everything, as without the setting.
+
+Aspen acknowledges any commit it has, on any branch, because Git does not
+say which branch it is about to push. So a push can build on commits it
+left out that belong to another branch: a branch created from another
+branch, a merge of a branch into trunk, a tag of a branch commit, a forced
+push of an amended commit. Aspen then copies the objects the new branch
+version needs from where they are stored, so the push works as it would
+without the setting. That copy counts against the push's size limit; a
+push over it is refused with `push it with git -c push.negotiate=false
+push`, which sends the objects instead.
+
+Without the setting nothing breaks: Aspen still stores each resent commit
+only once. The setting saves the upload and the server's work reading it.
+
 ### Force pushes
 
 A non-fast-forward update is refused unless the push carries the push
@@ -139,6 +177,7 @@ are safe to retry as they are. Typical refusals:
 | `force is not allowed for this ref by the repository's allow_force policy` | Trunk, or a repository whose policy forbids force |
 | `deleting a ref this client has not seen needs -o force, ...` | Use the branch-scoped URL or `-o force` |
 | `permission denied` | Your token or key cannot write this ref |
+| `this push builds on commits of other refs whose objects take more than ... bytes to copy; ...` | With `push.negotiate`, the push left out more of another branch's history than one push may bring; push it with `git -c push.negotiate=false push` |
 
 ## Fetching
 
