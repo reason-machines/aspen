@@ -147,6 +147,8 @@ pub struct SqlStore {
     admission: Admission,
     dialect: Dialect,
     clock: Clock,
+    /// Write transactions begun through this store (shared by clones).
+    write_transactions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SqlStore {
@@ -241,6 +243,7 @@ impl SqlStore {
             admission,
             dialect,
             clock: Clock::system(),
+            write_transactions: Arc::default(),
         })
     }
 
@@ -276,6 +279,22 @@ impl SqlStore {
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// How many write transactions this store (and its clones) has begun
+    /// since it connected, of every kind: one per
+    /// [`MetaStore::commit_push`] or [`MetaStore::register_pack`], one per
+    /// batch of [`MetaStore::commit_pushes`] or
+    /// [`MetaStore::register_packs`], and one per job, cover or garbage
+    /// collection write. For tests that measure group commit.
+    pub fn write_transactions(&self) -> u64 {
+        self.write_transactions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_write_transaction(&self) {
+        self.write_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The dialect.
@@ -566,6 +585,19 @@ impl MetaStore for SqlStore {
         self.fetch_repo("id", RepoKey::Id(id)).await
     }
 
+    async fn list_repos(&self, after: Option<RepoId>, limit: u32) -> Result<Vec<Repo>, StoreError> {
+        let sql = format!("SELECT {REPO_COLS} FROM repos WHERE id > $1 ORDER BY id LIMIT $2");
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(after.map_or(0, |a| a.get()))
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.admit().await?)
+            .await
+            .map_err(store_error)?
+            .iter()
+            .map(rows::repo)
+            .collect()
+    }
+
     async fn current_version(
         &self,
         repo: RepoId,
@@ -684,6 +716,20 @@ impl MetaStore for SqlStore {
 
     async fn commit_push(&self, push: &PushCommit) -> Result<CommitOutcome, StoreError> {
         crate::push::commit_push(self, push).await
+    }
+
+    async fn commit_pushes(
+        &self,
+        pushes: &[PushCommit],
+    ) -> Result<Vec<Result<CommitOutcome, StoreError>>, StoreError> {
+        crate::push::commit_pushes(self, pushes).await
+    }
+
+    async fn register_packs(
+        &self,
+        packs: &[NewPack],
+    ) -> Result<Vec<Result<PackRecord, StoreError>>, StoreError> {
+        crate::gc::register_packs(self, packs).await
     }
 
     async fn lookup_commits(
@@ -879,6 +925,13 @@ impl MetaStore for SqlStore {
         reason: &str,
     ) -> Result<u64, StoreError> {
         crate::jobs::release(self, tags, owner, reason).await
+    }
+
+    async fn add_compaction_heat(
+        &self,
+        heat: &[aspen_core::meta::CompactionHeat],
+    ) -> Result<u64, StoreError> {
+        crate::jobs::add_heat(self, heat).await
     }
 
     async fn update_job(&self, id: JobId, event: JobEvent) -> Result<Job, StoreError> {

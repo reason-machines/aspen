@@ -5,15 +5,21 @@
  */
 import { ApiError, createPlaceClient, type PlaceClient, type StreamState } from './client/api.ts';
 import { type FeedItem, FeedModel } from './client/feed.ts';
-import { cellAt, formatDuration, lineCells, RateMeter, shellQuote, shortSha } from './client/geometry.ts';
+import { cellAt, formatDuration, RateMeter, shellQuote, shortSha } from './client/geometry.ts';
+import { agentPrompt } from './client/prompt.ts';
 import { CanvasRenderer, type Theme } from './client/render.ts';
 import { CanvasStore } from './client/store.ts';
-import type { Config, PlaceEvent, Quota, Session, SwarmStatus } from './shared/contract.ts';
+import type { Config, PlaceEvent, Quota, Session } from './shared/contract.ts';
 import { serializeTile, type Tile, tilePath } from './shared/tiles.ts';
 
 const API_BASE = (import.meta.env.VITE_PLACE_API as string | undefined) ?? '/api/v1';
 const SESSION_KEY = 'place.session.v1';
 const FEED_FLUSH_MS = 250;
+
+/** Clicks a visitor may have waiting at once; more are refused with a "slow down". */
+const MAX_QUEUED_CLICKS = 8;
+/** The server allows one push a second per visitor. */
+const MIN_PUSH_GAP_MS = 1000;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => {
   const el = document.getElementById(id);
@@ -73,15 +79,14 @@ class App {
   private hover: { x: number; y: number } | null = null;
   private kbd: { x: number; y: number } | null = null;
   private staged = new Map<number, string>();
-  private painting: { pointerId: number; last: { x: number; y: number } | null } | null = null;
+  /** The coding-agent prompt; it goes to the clipboard and is never shown on the page. */
+  private promptText = '';
   private panning: { pointerId: number; sx: number; sy: number; left: number; top: number } | null = null;
   private needsDraw = true;
   private readoutKey = '';
   private feedDirty = false;
   private pushSeqsSinceMerge: number[] = [];
   private lastMergeAt: number | null = null;
-  private swarm: SwarmStatus | null = null;
-  private swarmNote: { text: string; until: number } | null = null;
 
   private readonly client: PlaceClient;
   private readonly config: Config;
@@ -102,7 +107,6 @@ class App {
     this.renderRulers();
     this.bindView();
     this.bindPainting();
-    this.bindSwarm();
     this.layout();
     new ResizeObserver(() => this.layout()).observe($('plat'));
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
@@ -121,10 +125,6 @@ class App {
     setInterval(() => this.flushFeed(), FEED_FLUSH_MS);
 
     void this.ensureSession();
-    void this.client
-      .swarm()
-      .then((s) => this.setSwarm(s))
-      .catch(() => this.setSwarmText('The load test is unavailable right now.'));
     void this.client.events({
       after: snap.seq,
       signal: new AbortController().signal,
@@ -153,8 +153,6 @@ class App {
       merged = this.pushSeqsSinceMerge.length - keep.length;
       this.pushSeqsSinceMerge = keep;
       this.lastMergeAt = Date.now();
-    } else if (e.type === 'swarm') {
-      this.setSwarm(e.status);
     }
     this.store.apply(e);
     this.feed.add(e, merged);
@@ -220,8 +218,7 @@ class App {
     $('quota').dataset.blocked = String(blocked);
     $('quota-text').textContent = blocked
       ? `Out of pushes for now. The next one frees up in ${formatDuration(resetIn)}.`
-      : `${q.remaining} of ${q.pushesPerMinute} pushes left this minute, up to ${q.tilesPerPush} tiles each.`;
-    this.updatePushButton();
+      : `${q.remaining} of ${q.pushesPerMinute} pushes left this minute.`;
   }
 
   // Painting ------------------------------------------------------------
@@ -245,10 +242,10 @@ class App {
         return;
       }
       e.preventDefault();
-      c.setPointerCapture(e.pointerId);
-      this.painting = { pointerId: e.pointerId, last: null };
       this.kbd = null;
-      this.extendStroke(this.cellFromEvent(e));
+      // One click paints one tile: one commit, one push. No dragging.
+      const cell = this.cellFromEvent(e);
+      if (cell) this.paintTile(cell);
     });
     c.addEventListener('pointermove', (e) => {
       if (this.panning && e.pointerId === this.panning.pointerId) {
@@ -257,27 +254,19 @@ class App {
         plat.scrollTop = this.panning.top - (e.clientY - this.panning.sy);
         return;
       }
-      const cell = this.cellFromEvent(e);
-      if (this.painting && e.pointerId === this.painting.pointerId) {
-        for (const ev of e.getCoalescedEvents?.() ?? [e]) this.extendStroke(this.cellFromEvent(ev));
-      }
-      if (e.pointerType === 'mouse') this.setHover(cell);
+      if (e.pointerType === 'mouse') this.setHover(this.cellFromEvent(e));
     });
     const end = (e: PointerEvent) => {
       if (this.panning && e.pointerId === this.panning.pointerId) this.panning = null;
-      if (this.painting && e.pointerId === this.painting.pointerId) {
-        this.painting = null;
-        if (e.type === 'pointerup') void this.pushStroke();
-      }
     };
     c.addEventListener('pointerup', end);
     c.addEventListener('pointercancel', end);
     c.addEventListener('pointerleave', (e) => {
-      if (e.pointerType === 'mouse' && !this.painting) this.setHover(null);
+      if (e.pointerType === 'mouse') this.setHover(null);
     });
     c.addEventListener('keydown', (e) => this.onCanvasKey(e));
     c.addEventListener('focus', () => {
-      if (!this.painting && !this.kbd) {
+      if (!this.kbd) {
         this.kbd = this.hover ?? { x: Math.floor(this.store.width / 2), y: Math.floor(this.store.height / 2) };
         this.setHover(this.kbd);
       }
@@ -285,7 +274,6 @@ class App {
     c.addEventListener('blur', () => {
       this.kbd = null;
     });
-    $('push-btn').addEventListener('click', () => void this.pushStroke());
   }
 
   private onCanvasKey(e: KeyboardEvent): void {
@@ -312,19 +300,9 @@ class App {
       case 'ArrowDown':
         move(0, step);
         break;
-      case ' ': {
-        const i = this.store.index(k);
-        if (this.staged.has(i)) this.staged.delete(i);
-        else if (this.staged.size < this.config.limits.tilesPerPush) this.staged.set(i, this.color);
-        this.onStagedChanged();
-        break;
-      }
+      case ' ':
       case 'Enter':
-        void this.pushStroke();
-        break;
-      case 'Escape':
-        this.staged.clear();
-        this.onStagedChanged();
+        this.paintTile(k);
         break;
       default:
         return;
@@ -332,86 +310,88 @@ class App {
     e.preventDefault();
   }
 
-  private extendStroke(cell: { x: number; y: number } | null): void {
-    if (!this.painting || !cell) return;
-    const from = this.painting.last ?? cell;
-    for (const [x, y] of lineCells(from.x, from.y, cell.x, cell.y)) {
-      if (this.staged.size >= this.config.limits.tilesPerPush) break;
-      this.staged.set(this.store.index({ x, y }), this.color);
+  /** Clicks waiting to be pushed, oldest first. Each becomes its own commit and push. */
+  private queue: { i: number; color: string }[] = [];
+  private pushing = false;
+  private lastPushAt = 0;
+
+  private paintTile(cell: { x: number; y: number }): void {
+    if (this.queue.length >= MAX_QUEUED_CLICKS) {
+      this.setPaintStatus('Slow down: a few clicks are still being pushed.', 'error');
+      return;
     }
-    this.painting.last = cell;
+    const i = this.store.index(cell);
+    this.queue.push({ i, color: this.color });
+    this.staged.set(i, this.color);
     this.setHover(cell);
     this.onStagedChanged();
+    void this.drain();
   }
 
   private onStagedChanged(): void {
-    const n = this.staged.size;
-    const max = this.config.limits.tilesPerPush;
+    const n = this.queue.length;
     $('stroke-count').textContent =
-      n === 0
-        ? 'Draw on the canvas. Each stroke is pushed when you lift the brush.'
-        : n >= max
-          ? `${n} tiles staged, the most one push can carry.`
-          : `${n} ${n === 1 ? 'tile' : 'tiles'} staged.`;
-    this.updatePushButton();
+      n <= 1 ? 'Click a tile. Each click is one commit and one push.' : `${n} clicks waiting to be pushed.`;
     this.needsDraw = true;
   }
 
-  private updatePushButton(): void {
-    const btn = $<HTMLButtonElement>('push-btn');
-    btn.disabled = this.staged.size === 0 || !this.session;
+  /** Pushes queued clicks one at a time, at most one push a second (the server's per-visitor limit). */
+  private async drain(): Promise<void> {
+    if (this.pushing) return;
+    this.pushing = true;
+    try {
+      while (this.queue.length > 0) {
+        const wait = this.lastPushAt + MIN_PUSH_GAP_MS - Date.now();
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        if (this.quota && (this.quota.remaining <= 0 || Date.now() < this.quotaBlockedUntil)) {
+          this.setPaintStatus(
+            'You are out of pushes for this minute. Your clicks will push when it frees up.',
+            'error',
+          );
+          await new Promise((r) => setTimeout(r, Math.max(1000, this.quotaBlockedUntil - Date.now())));
+          continue;
+        }
+        const next = this.queue[0];
+        if (!next) break;
+        this.lastPushAt = Date.now();
+        const ok = await this.pushOne(next);
+        if (ok !== 'retry') this.queue.shift();
+        if (!this.queue.some((q) => q.i === next.i)) this.staged.delete(next.i);
+        this.onStagedChanged();
+      }
+    } finally {
+      this.pushing = false;
+    }
   }
 
-  private async pushStroke(retried = false): Promise<void> {
-    if (this.staged.size === 0) return;
+  private async pushOne(tile: { i: number; color: string }, retried = false): Promise<'ok' | 'dropped' | 'retry'> {
     const session = await this.ensureSession();
-    if (!session) return;
-    if (this.quota && (this.quota.remaining <= 0 || Date.now() < this.quotaBlockedUntil)) {
-      this.setPaintStatus(
-        'You are out of pushes for this minute. Your stroke is still staged; push it when the quota frees up.',
-        'error',
-      );
-      return;
-    }
-    const staged = this.staged;
-    const tiles: Tile[] = [...staged].map(([i, color]) => ({
-      x: i % this.store.width,
-      y: Math.floor(i / this.store.width),
-      color,
-    }));
-    this.staged = new Map();
-    this.onStagedChanged();
-    this.setPaintStatus(
-      `Pushing ${tiles.length} ${tiles.length === 1 ? 'tile' : 'tiles'} to ${session.branch}…`,
-      'busy',
-    );
+    if (!session) return 'retry';
+    const tiles: Tile[] = [
+      { x: tile.i % this.store.width, y: Math.floor(tile.i / this.store.width), color: tile.color },
+    ];
+    this.setPaintStatus(`Pushing 1 tile to ${session.branch}…`, 'busy');
     try {
       const r = await this.client.push(session.token, { branch: session.branch, tiles });
       this.store.applyOwnPush(session.branch, { kind: 'visitor', label: session.branch }, r.commit, r.seq, r.tiles);
       this.setQuota(r.quota);
       this.needsDraw = true;
-      this.setPaintStatus(
-        `Pushed ${shortSha(r.commit)} with ${r.tiles.length} ${r.tiles.length === 1 ? 'tile' : 'tiles'}. It joins main at the next merge.`,
-        'ok',
-      );
+      this.setPaintStatus(`Pushed ${shortSha(r.commit)}. It joins main at the next merge.`, 'ok');
+      return 'ok';
     } catch (err) {
       if (err instanceof ApiError && err.status === 401 && !retried) {
         this.session = null;
         sessionStorage.removeItem(SESSION_KEY);
-        this.staged = staged;
-        await this.pushStroke(true);
-        return;
+        return this.pushOne(tile, true);
       }
       if (err instanceof ApiError && err.status === 429) {
         this.quotaBlockedUntil = Date.now() + (err.retryAfterSeconds ?? 10) * 1000;
         this.renderQuota();
-      }
-      // Keep the stroke so the visitor can retry after fixing the problem.
-      if (!(err instanceof ApiError && err.status === 422)) {
-        for (const [i, c] of staged) if (!this.staged.has(i)) this.staged.set(i, c);
-        this.onStagedChanged();
+        this.setPaintStatus(errorText(err, 'Too many pushes'), 'error');
+        return 'retry';
       }
       this.setPaintStatus(errorText(err, 'The push failed'), 'error');
+      return 'dropped';
     }
   }
 
@@ -471,14 +451,8 @@ class App {
 
   private renderStaticText(): void {
     const { config } = this;
-    $('dashboard-slot').replaceChildren(
-      config.dashboardUrl
-        ? h('a', { class: 'dash-link', href: config.dashboardUrl }, 'Live dashboard')
-        : h('span', { class: 'dash-none' }, 'Dashboard not connected yet'),
-    );
+    this.renderPrompt();
     $('merge-every').textContent = String(Math.round(config.mergeIntervalMs / 100) / 10);
-    $('rule-range').textContent = `x from 0 to ${config.canvas.width - 1} and y from 0 to ${config.canvas.height - 1}`;
-    $('rule-tiles').textContent = String(config.limits.tilesPerPush);
     document.documentElement.style.setProperty('--cols', String(config.canvas.width));
     document.documentElement.style.setProperty('--rows', String(config.canvas.height));
   }
@@ -570,7 +544,12 @@ class App {
     const gutter = 26;
     const { width: cols, height: rows } = this.config.canvas;
     const wide = matchMedia('(min-width: 900px)').matches;
-    const availW = plat.clientWidth - gutter;
+    // Size the canvas from the window, not from its column, so the column can
+    // shrink to fit it and the right-hand rail sits beside the canvas.
+    const pad = Math.min(36, Math.max(16, window.innerWidth * 0.03));
+    const railW = wide ? ($('rail').getBoundingClientRect().width || 400) + 40 : 0;
+    const paletteW = wide ? ($('palette').getBoundingClientRect().width || 76) + 12 : 0;
+    const availW = (wide ? window.innerWidth - 2 * pad - railW - paletteW : plat.clientWidth) - gutter;
     const availH = wide ? window.innerHeight - 230 : Number.POSITIVE_INFINITY;
     const fitTile = Math.max(2, Math.min(availW / cols, availH / rows));
     const tile = fitTile * this.zoom;
@@ -595,118 +574,89 @@ class App {
     const c = this.hover ?? { x: Math.floor(this.store.width / 2), y: Math.floor(this.store.height / 2) };
     const path = tilePath(c.x, c.y);
     const content = serializeTile(this.color).replace('\n', '\\n');
-    const steps: [string, string][] = [
-      ['Clone the canvas', `git clone ${shellQuote(url)}\ncd ${shellQuote(dir)}`],
-      ['Start a branch of your own', 'git switch -c paint/your-name'],
-      ['Paint a tile with the color you picked', `printf '${content}' > ${path}`],
-      [
-        'Commit and push it',
-        `git add ${path}\ngit commit -m ${shellQuote(`Paint ${c.x},${c.y}`)}\ngit push origin HEAD`,
-      ],
-    ];
+    const branch = 'paint/your-name';
+    // Plain git, one command per line, the way GitHub shows a new
+    // repository's setup: clone, branch, add, commit, push. Then the same
+    // push for a repository already cloned, through \`git remote add\`.
+    const clone = [
+      `git clone ${url}`,
+      `cd ${dir}`,
+      `git switch -c ${branch}`,
+      `printf '${content}' > ${path}`,
+      `git add ${path}`,
+      `git commit -m ${shellQuote(`Paint ${c.x},${c.y}`)}`,
+      `git push origin ${branch}`,
+    ].join('\n');
+    const remote = [`git remote add place ${url}`, `git push place ${branch}`].join('\n');
     const list = $('git-steps');
-    const existing = list.querySelectorAll('code');
-    if (existing.length === steps.length) {
-      steps.forEach(([, cmd], i) => {
-        if (existing[i].textContent !== cmd) existing[i].textContent = cmd;
-      });
+    const codes = list.querySelectorAll('code');
+    if (codes.length === 2) {
+      if (codes[0].textContent !== clone) codes[0].textContent = clone;
+      if (codes[1].textContent !== remote) codes[1].textContent = remote;
       return;
     }
     list.replaceChildren(
-      ...steps.map(([label, cmd]) => {
-        const code = h('code', {}, cmd);
-        const copy = h('button', { type: 'button', class: 'copy', 'aria-label': `Copy: ${label}` }, 'Copy');
-        copy.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(code.textContent ?? '');
-            copy.textContent = 'Copied';
-          } catch {
-            copy.textContent = 'Select and copy';
-          }
-          setTimeout(() => {
-            copy.textContent = 'Copy';
-          }, 1500);
-        });
-        return h(
-          'li',
-          {},
-          h('p', { class: 'step-label' }, label),
-          h('div', { class: 'cmd' }, h('pre', {}, code), copy),
-        );
-      }),
+      h(
+        'li',
+        {},
+        h('p', { class: 'step-label' }, 'Clone it, paint a tile, push your branch'),
+        h('pre', { class: 'cmd-plain' }, h('code', {}, clone)),
+      ),
+      h(
+        'li',
+        {},
+        h('p', { class: 'step-label' }, 'Or push from a copy you already have'),
+        h('pre', { class: 'cmd-plain' }, h('code', {}, remote)),
+      ),
     );
   }
 
-  // Swarm ---------------------------------------------------------------
+  // Agent prompt --------------------------------------------------------
 
-  private bindSwarm(): void {
-    $('swarm-btn').addEventListener('click', async () => {
-      const btn = $<HTMLButtonElement>('swarm-btn');
-      btn.disabled = true;
+  private renderPrompt(): void {
+    const { config } = this;
+    const api = new URL(API_BASE, window.location.href);
+    const text = agentPrompt({
+      pageUrl: window.location.origin,
+      cloneUrl: config.cloneUrl,
+      apiUrl: api.href.replace(/\/+$/, ''),
+      width: config.canvas.width,
+      height: config.canvas.height,
+      tilesPerPush: config.limits.tilesPerPush,
+    });
+    this.promptText = text;
+    const btn = $<HTMLButtonElement>('prompt-copy');
+    const status = $('prompt-copy-status');
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', async () => {
       try {
-        this.setSwarm(await this.client.startSwarm());
-      } catch (err) {
-        if (
-          err instanceof ApiError &&
-          (err.code === 'rate-limited' || err.code === 'cooldown' || err.code === 'kill-switch')
-        ) {
-          this.swarmNote = { text: err.message, until: Date.now() + (err.retryAfterSeconds ?? 30) * 1000 };
-          void this.client.swarm().then((s) => this.setSwarm(s));
-        } else {
-          this.swarmNote = { text: errorText(err, 'Could not start the swarm'), until: Date.now() + 10_000 };
-        }
-        this.renderSwarm();
+        if (!navigator.clipboard?.writeText) throw new Error('no clipboard API');
+        await navigator.clipboard.writeText(this.promptText);
+        btn.textContent = 'Copied';
+        status.textContent = '';
+        setTimeout(() => {
+          btn.textContent = 'Copy prompt';
+        }, 2000);
+      } catch {
+        // No clipboard API (or no permission): copy through an off-screen
+        // textarea instead. The prompt itself is never shown on the page.
+        const tmp = document.createElement('textarea');
+        tmp.value = this.promptText;
+        tmp.setAttribute('readonly', '');
+        tmp.style.position = 'fixed';
+        tmp.style.left = '-9999px';
+        document.body.append(tmp);
+        tmp.select();
+        const ok = document.execCommand('copy');
+        tmp.remove();
+        btn.textContent = ok ? 'Copied' : 'Copy failed';
+        status.textContent = '';
+        setTimeout(() => {
+          btn.textContent = 'Copy prompt';
+        }, 2000);
       }
     });
-  }
-
-  private setSwarm(s: SwarmStatus): void {
-    this.swarm = s;
-    this.renderSwarm();
-  }
-
-  private setSwarmText(t: string): void {
-    $('swarm-state').textContent = t;
-  }
-
-  private renderSwarm(): void {
-    const s = this.swarm;
-    if (!s) return;
-    const now = Date.now();
-    const panel = $('swarm-panel');
-    const btn = $<HTMLButtonElement>('swarm-btn');
-    const n = (v: number) => v.toLocaleString('en-US');
-    const noted = this.swarmNote && now < this.swarmNote.until ? this.swarmNote : null;
-    panel.dataset.state = s.state;
-    btn.textContent = s.state === 'running' ? 'Swarm running' : `Unleash ${n(s.maxAgents)} agents`;
-    btn.disabled = s.state !== 'idle' || noted !== null;
-    let text: string;
-    switch (s.state) {
-      case 'running':
-        text = `${n(s.agents)} of ${n(s.maxAgents)} agents pushing. ${n(s.pushes)} pushes so far, ending in ${formatDuration(Date.parse(s.endsAt ?? '') - now)}.`;
-        break;
-      case 'cooldown':
-        text = `The last run made ${n(s.pushes)} pushes. The next run can start in ${formatDuration(Date.parse(s.cooldownUntil ?? '') - now)}.`;
-        break;
-      case 'disabled':
-        text = `Paused by the operators${s.killSwitch.reason ? `: ${s.killSwitch.reason}` : '.'}`;
-        break;
-      default:
-        text = `Each agent pushes to its own branch for ${s.runSeconds} s. Watch the merge keep up.`;
-    }
-    if (noted && s.state !== 'disabled') text = noted.text;
-    this.setSwarmText(text);
-    $('swarm-limits').replaceChildren(
-      `Capped at ${n(s.pushesPerSecondCap)} pushes/s in total. Kill switch `,
-      h('b', { class: s.killSwitch.engaged ? 'ks-on' : 'ks-off' }, s.killSwitch.engaged ? 'engaged' : 'off'),
-      '.',
-    );
-    panel.style.setProperty(
-      '--progress',
-      s.state === 'running' && s.startedAt && s.endsAt
-        ? String(Math.min(1, (now - Date.parse(s.startedAt)) / (Date.parse(s.endsAt) - Date.parse(s.startedAt))))
-        : '0',
-    );
   }
 
   // Feed and stats ------------------------------------------------------
@@ -795,7 +745,6 @@ class App {
         ? 'waiting'
         : `${formatDuration(now - this.lastMergeAt)} ago`.replace('now ago', 'just now');
     this.renderQuota();
-    this.renderSwarm();
     this.feedDirty = true;
   }
 

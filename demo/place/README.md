@@ -2,8 +2,12 @@
 
 A shared pixel canvas where every brush stroke is a `git push`. Each visitor
 paints on their own branch, so pushes run in parallel without contending; a
-merger bot folds every branch into `main` every few seconds. The page shows
+merger bot folds every branch into `main`. The page shows
 `main` plus each branch's unmerged tiles (hatched), live.
+
+The live canvas's `main` is mirrored, read-only, to
+<https://github.com/reason-machines/place-canvas>; push to the demo, not there.
+Its README shows the live canvas through `GET /api/v1/canvas.svg`.
 
 This directory holds the web front end, the API contract it consumes, a
 mock server that implements the contract with simulated agents, and the real

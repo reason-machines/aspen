@@ -364,6 +364,11 @@ creates the work.
 | `run_after_us` | Not before this time (backoff after a failure) |
 | `lease_owner`, `lease_expires_us` | Set exactly while `running`. An expired lease may be claimed by another worker, so job work is idempotent. A worker that did not get a claim's answer gives back the jobs leased under its name (`release_jobs`, issues #131 and #188), and only those of the kinds it runs, instead of waiting for the lease to expire |
 | `last_error` | Error of the last failed attempt |
+| `priority` | Migration 0008. Fetch heat: the fetch path adds, per ref, the versions it had to send as their own push packs because their covers were not built yet (`add_compaction_heat`, queued `compact` jobs of that ref at or after the earliest such version only; at most 2^40). A claim takes the due job with the highest `priority` first, then the earliest due, then the lowest ID. `0` for every job no fetch asked for, which keeps them oldest first |
+
+`jobs_queued_priority` (`priority DESC, run_after_us, id` over queued jobs,
+migration 0008) serves the claim; `jobs_queued` still serves the
+oldest-due reads of the queue-lag gauge.
 
 The state machine is `aspen_core::meta::Job::apply`; stores implement the
 same rules in SQL. Enqueueing is idempotent: the partial unique indexes

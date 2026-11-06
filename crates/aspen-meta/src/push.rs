@@ -60,6 +60,118 @@ pub(crate) async fn commit_push(
     }
 }
 
+/// What one push of a batch ended in, inside the batch's transaction.
+enum Part {
+    Wrote(Vec<RefVersion>),
+    /// The named ref was not at its expected version; its writes were
+    /// undone.
+    Lost(RefName),
+    /// Refused or failed; its writes were undone.
+    Failed(StoreError),
+}
+
+/// [`MetaStore::commit_pushes`]: every push in one transaction, each behind
+/// its own savepoint, so a push that loses its compare-and-swap (or fails)
+/// is undone alone and the others still commit.
+///
+/// Pushes run in the order of their first ref name (repository, then
+/// name), and each takes its own refs in name order, so two batches of
+/// single-ref pushes running at once take ref rows in one global order and
+/// cannot deadlock (a batch that waits on another waits for its commit).
+/// Two pushes of one batch that expect the same version of a ref race as
+/// two transactions would: the first in that order wins, and the second
+/// violates `ref_versions_seq_unique` inside its savepoint, a lost
+/// compare-and-swap.
+///
+/// If a savepoint statement or the `COMMIT` fails, the batch fails as a
+/// whole (the outer `Err`), and no push in it is reported committed.
+///
+/// [`MetaStore::commit_pushes`]: aspen_core::meta::MetaStore::commit_pushes
+pub(crate) async fn commit_pushes(
+    store: &SqlStore,
+    pushes: &[PushCommit],
+) -> Result<Vec<Result<CommitOutcome, StoreError>>, StoreError> {
+    let mut out: Vec<Option<Result<CommitOutcome, StoreError>>> = vec![None; pushes.len()];
+    let mut valid = Vec::with_capacity(pushes.len());
+    for (i, push) in pushes.iter().enumerate() {
+        match push.validate() {
+            Ok(()) => {
+                let mut order: Vec<usize> = (0..push.writes.len()).collect();
+                order.sort_by(|&a, &b| push.writes[a].name.cmp(&push.writes[b].name));
+                valid.push((i, order));
+            }
+            Err(e) => out[i] = Some(Err(conflict(format!("malformed push commit: {e}")))),
+        }
+    }
+    if valid.is_empty() {
+        return Ok(out.into_iter().map(|o| o.expect("set")).collect());
+    }
+    valid.sort_by(|(a, oa), (b, ob)| {
+        let first = |p: &PushCommit, o: &[usize]| (p.repo, p.writes[o[0]].name.clone());
+        first(&pushes[*a], oa)
+            .cmp(&first(&pushes[*b], ob))
+            .then(a.cmp(b))
+    });
+
+    let key_share = crate::gc::key_share(store);
+    let parts = store
+        .write(async |tx| {
+            let mut parts = Vec::with_capacity(valid.len());
+            for (i, order) in &valid {
+                let push = &pushes[*i];
+                crate::tx::savepoint(tx).await?;
+                let result = async {
+                    lock_packs(tx, push, key_share).await?;
+                    write_all(tx, push, order).await
+                }
+                .await;
+                let part = match result {
+                    Ok(created) => {
+                        crate::tx::release(tx).await?;
+                        Part::Wrote(created)
+                    }
+                    Err(Abort::Lost(name)) => {
+                        crate::tx::rollback_to(tx).await?;
+                        Part::Lost(name.clone())
+                    }
+                    Err(Abort::Store(e)) => {
+                        crate::tx::rollback_to(tx).await?;
+                        Part::Failed(e)
+                    }
+                };
+                parts.push((*i, part));
+            }
+            Ok::<_, StoreError>(parts)
+        })
+        .await?;
+
+    // Committed. A loser's current version is read now, so it sees the
+    // winner whether that was another push of this batch or of another
+    // transaction (which the loser's insert waited for).
+    for (i, part) in parts {
+        out[i] = Some(match part {
+            Part::Wrote(created) => Ok(CommitOutcome::Committed(created)),
+            Part::Failed(e) => Err(e),
+            Part::Lost(name) => {
+                let repo = pushes[i].repo;
+                match store.admit().await {
+                    Ok(mut conn) => current_version(&mut *conn, repo, &name).await.map(|v| {
+                        CommitOutcome::CasLost {
+                            name,
+                            current: v.map(|v| v.id),
+                        }
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
+        });
+    }
+    Ok(out
+        .into_iter()
+        .map(|o| o.expect("every push has an outcome"))
+        .collect())
+}
+
 /// Why a push transaction rolled back.
 enum Abort<'p> {
     /// The named ref was not at the expected version.

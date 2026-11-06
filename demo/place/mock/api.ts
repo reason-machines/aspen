@@ -60,6 +60,18 @@ export function createMockApi(options: Partial<MockOptions> & { clock?: boolean;
         return sendJson(res, 200, sim.config());
       case 'GET /canvas':
         return sendJson(res, 200, sim.snapshot());
+      case 'GET /canvas.svg': {
+        const { etag, svg } = sim.canvasSvg();
+        const headers = { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache, max-age=0', ETag: etag };
+        if (req.headers['if-none-match'] === etag) {
+          res.writeHead(304, headers);
+          res.end();
+          return;
+        }
+        res.writeHead(200, headers);
+        res.end(svg);
+        return;
+      }
       case 'GET /branches':
         return sendJson(res, 200, { branches: sim.branchList() });
       case 'POST /sessions': {

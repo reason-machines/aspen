@@ -18,6 +18,7 @@ Hostnames, with the account's subdomain `aspen.example.com` as the example:
 | | Staging | Demo |
 |---|---|---|
 | `place` page, API and `canvas.git` | `place.staging.aspen.example.com` | `place.aspen.example.com` |
+| Live canvas image for embedding (CloudFront, `/api/v1/canvas.svg` only, 2 s cache) | `live.place.staging.aspen.example.com` | `live.place.aspen.example.com` |
 | Aspen, Git over HTTPS | `git.staging.aspen.example.com` | `git.aspen.example.com` |
 | Pack CDN (CloudFront over `/-/express`) | `cdn.git.staging.aspen.example.com` | `cdn.git.aspen.example.com` |
 | Git over SSH (off unless `enable_ssh`) | `ssh.git.staging.aspen.example.com` | `ssh.git.aspen.example.com` |
@@ -282,6 +283,22 @@ two do not idle at $230 together.
   every deploy starts `place` with the kill switch engaged: release it with
   the operator token (`{"engaged": false}` to `/api/v1/admin/kill-switch`)
   once the new task is up.
+- **Mirror the canvas to GitHub.** Set `place_canvas_mirror = "owner/name"`
+  (an existing, empty repository) and apply. Put a credential with write
+  access to that repository only into the secret the
+  `place_canvas_mirror_key` output names: an ed25519 deploy key's private
+  half (OpenSSH format; its public half added to the repository as a deploy
+  key with write access), or, where the organization disables deploy keys,
+  a fine-grained token with Contents read/write on that repository alone.
+  `aws secretsmanager put-secret-value --secret-id <arn> --secret-string file://cred`,
+  delete the local copy, and force a new deployment of the place service.
+  The `canvas-mirror` sidecar fetches `main` from aspen-place at start and
+  every `place_canvas_mirror_interval_seconds` (900) and pushes it when it
+  moved, never forced; its
+  log stream (`canvas-mirror/...` in the place log group) says when a push
+  fails. After a history reset (`/api/v1/admin/reset-history`), `main` no
+  longer fast-forwards: delete and recreate the GitHub repository's `main`
+  by hand.
 - **Stop the demo** without tearing it down: engage the kill switch (API),
   or set `place_running = false` and apply, which stops the task.
 - **When a budget alert fires:** look at Cost Explorer by service first.
@@ -365,6 +382,7 @@ From `deploy/terraform`:
 (cd aws/public-demo/environment && terraform init -backend=false && terraform test)
 (cd aws && cp examples/isolated/.terraform.lock.hcl . && terraform init -backend=false && terraform test)
 node aws/cdn/viewer-request.test.mjs
+node aws/public-demo/environment/tests/place-live-viewer-request.test.mjs
 (cd .. && deploy/scripts/check-terraform-write-only.sh)
 PG_BIN=/usr/lib/postgresql/17/bin sh aws/public-demo/environment/tests/create-database.test.sh
 ```

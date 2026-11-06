@@ -11,8 +11,10 @@
 //! | Module | What |
 //! |---|---|
 //! | [`rules`] | The tile format and push rules (the Rust twin of `src/shared/tiles.ts`) |
+//! | [`image`] | The canvas as an SVG for READMEs, rendered once per `main` commit |
 //! | [`hook`] | The pre-receive check over each update's exact commit range, and the post-receive step |
 //! | [`place`] | Writes: web and agent strokes, the merger bot, branch expiry, the swarm and the kill switch |
+//! | [`sprites`] | The pixel sprites ambient agents paint |
 //! | [`state`] | The canvas, branch overlays, the merge queue and the event log the page reads |
 //! | [`api`] | `demo/place/api/openapi.yaml` over HTTP, server-sent events included |
 //! | [`git`] | The Git objects the server writes, and in-process push requests |
@@ -26,9 +28,11 @@
 pub mod api;
 pub mod git;
 pub mod hook;
+pub mod image;
 pub mod limits;
 pub mod place;
 pub mod rules;
+pub mod sprites;
 pub mod state;
 
 use std::path::PathBuf;

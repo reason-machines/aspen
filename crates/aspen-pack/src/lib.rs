@@ -27,6 +27,7 @@
 #![deny(missing_docs)]
 
 mod base_cache;
+pub mod changed;
 mod declared;
 pub mod entries;
 pub mod graph;
@@ -35,6 +36,7 @@ pub mod idx;
 pub mod ingest;
 pub mod locate;
 pub mod repack;
+pub mod sampled;
 pub mod scan;
 pub mod shallow;
 pub mod stitch;

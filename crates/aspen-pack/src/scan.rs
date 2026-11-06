@@ -108,7 +108,7 @@ pub fn parse_commit(data: &[u8]) -> Result<(Vec<ObjectId>, i64), String> {
 
 /// A commit's root tree, parsed as [`parse_commit`] parses the rest of its
 /// header. Pure.
-pub(crate) fn commit_tree(data: &[u8]) -> Result<ObjectId, String> {
+pub fn commit_tree(data: &[u8]) -> Result<ObjectId, String> {
     Ok(CommitHeader::parse(data)?.tree)
 }
 

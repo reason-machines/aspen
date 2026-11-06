@@ -65,6 +65,7 @@ that the dashboard and alert rules use only these names.
 |---|---|---|
 | `aspen_jobs{kind,state}` | gauge | Jobs that are not done, for every kind (`index_commits`, `compact`, `mirror_push`, `rewrite_pack`) and state (`queued`, `running`, `dead`), zeros included |
 | `aspen_jobs_queued_lag_seconds{kind}` | gauge | How long the oldest due queued job of the kind has waited; 0 when none is due |
+| `aspen_compaction_backlog` | gauge | `compact` jobs not done: queued (due or backing off) plus running. See [Compaction backlog](#compaction-backlog) |
 | `aspen_trunk_repos{closure}` | gauge | Repositories by the closure of their current trunk version, `exact` or `wider`. See [Wider trunk versions](#wider-trunk-versions) |
 | `aspen_meta_stats_up` | gauge | 1 if the last read of these gauges succeeded. While it is 0 they keep their last values |
 | `aspen_meta_stats_failures_total` | counter | Reads that failed or timed out |
@@ -82,7 +83,19 @@ that the dashboard and alert rules use only these names.
 | `aspen_push_branch_versions_total{closure}` | counter | Versions of every other ref committed, `exact` or `wider`. A `wider` one makes incremental fetches of that ref send more than they need; a write that depends on a `wider` version is `wider` too, so after a lost compare-and-swap across a forced update makes a branch version `wider`, later plain-URL fast-forwards of that branch stay `wider` until a forced update or a scoped-URL push that does not depend on it (issue #203) |
 | `aspen_push_grace_exceeded_total` | counter | Pushes refused because garbage collection deleted their pack before they committed: registering to committing took longer than `gc_grace` (2 hours). Logged as a `warn`; the client retries and the push registers its pack again |
 | `aspen_push_stage_seconds_total{stage}` | counter | Time in each push stage (`search`, `receive`, `gate_wait`, `prefetch`, `complete`, `graph`, `check`, `hook`, `upload`, `commit`; `search` is computing the packs a push searches, `hook` the push hook's checks with their range walks), summed over pushes |
-| `aspen_push_prefetch_slots` | gauge | Pushes the prefetch gate admits at once |
+| `aspen_push_prefetch_slots` | gauge | Pushes the prefetch gate admits at once while each holds its 64 MiB floor (`ASPEN_PREFETCH_MEMORY_BYTES` / floor) |
+| `aspen_push_prefetch_escalations_total` | counter | Reads of stored packs whose bases needed more than the floor, so their slot grew to the full per-push budget. A high rate relative to pushes means the floor admits fewer pushes than `aspen_push_prefetch_slots` suggests |
+| `aspen_push_ancestry_commits_total` | counter | Commits the push path's ancestry walks expanded (fast-forward checks and closure exactness), summed over pushes. Each is a `commit_index` read (one round trip) or a pack read unless an earlier walk of the same push cached it. Divide by `aspen_push_duration_seconds_count`: a per-push figure that grows means walks over long histories (issue #284) |
+| `aspen_push_base_cache_hits_total`, `aspen_push_base_cache_misses_total` | counter | Delta bases and other objects read from stored packs, answered by the in-memory base-object cache or read from the blob store. The cache holds trees each push stored (the next push to the same ref deltas against them) and objects earlier prefetches resolved. A falling hit share means the cache (64 MiB) turns over faster than pushes reuse it |
+| `aspen_push_group_commit_batches_total`, `aspen_push_group_commit_pushes_total` | counter | Group commit (`ASPEN_GROUP_COMMIT=on` only): commit transactions run, and the push commits they took; pushes per transaction is their ratio. Near 1 means pushes rarely arrive within `ASPEN_GROUP_COMMIT_WINDOW_MS` of each other, so the window only adds latency |
+| `aspen_push_group_register_batches_total`, `aspen_push_group_registrations_total` | counter | Group commit: pack registration transactions run, and the registrations they took |
+| `aspen_push_group_failed_batches_total` | counter | Group commit: batches whose transaction failed as a whole (a savepoint statement or the `COMMIT` failed). Every push in such a batch is refused, never acknowledged; any rate above zero needs the database's logs |
+| `aspen_queue_merged_total`, `aspen_queue_rejected_total` | counter | Merge-queue entries landed on trunk, and rejected (a conflict, or no history in common with trunk). Only with `ASPEN_MERGE_QUEUE=on` |
+| `aspen_queue_batches_total` | counter | Merge-queue batches landed, one atomic trunk update each; entries per batch is (merged + rejected) / batches |
+| `aspen_queue_refused_total` | counter | Batch pushes refused because trunk or a queue ref moved meanwhile; the batch is rebuilt. A steady rate means direct trunk pushes or several instances racing |
+| `aspen_queue_wait_seconds_total` | counter | Seconds from enqueue to the outcome landing, summed over entries; divide by merged + rejected for the mean wait |
+| `aspen_queue_ancestry_commits_total` | counter | Commits the merge queue's ancestry walks expanded: base searches that trunk's recent first-parent chain (kept per repository by each worker) did not answer, each a commit-index or pack read. Near zero in steady state; a steady rate means entries based on commits off trunk's first-parent line, or a trunk moved by direct pushes |
+| `aspen_queue_outcomes_expired_total` | counter | Merge-queue outcome refs deleted after `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS` |
 | `aspen_push_prefetch_slots_in_use` | gauge | Slots held now |
 | `aspen_push_prefetch_slots_peak` | gauge | Most slots held at once since the process started |
 | `aspen_push_prefetch_slots_acquired_total` | counter | Slots granted |
@@ -107,6 +120,8 @@ introduced, unchanged.
 | `aspen_fetch_haves_used_total` | counter | Client haves that stood for a ref version |
 | `aspen_fetch_haves_dropped_total` | counter | Client haves dropped (unknown, not a tip, or a wider version) |
 | `aspen_job_enqueue_failures_total` | counter | `rewrite_pack` jobs the fetch path could not enqueue; the next fetch that hits the pack tries again |
+| `aspen_fetch_uncompacted_versions_total` | counter | Versions served fetches sent as their own push pack, where a cover's pack would stand in once compaction builds it. This is compaction heat: it raises the claim priority of those refs' queued `compact` jobs (see [Compaction backlog](#compaction-backlog)). Divide by `aspen_fetches_total` for the per-fetch cost of compaction lag |
+| `aspen_compaction_heat_write_failures_total` | counter | Writes of compaction heat to the job queue that failed (logged as a `warn`). Heat is advisory: a failure changes only the order jobs run in |
 
 **Exact shallow packs** (node C8, on when `ASPEN_SHALLOW_PACKS` is on). A
 `git fetch --depth=N` of a ref version's tip is served the pack that holds
@@ -135,6 +150,35 @@ address cannot be read is limited by its TCP peer instead.
 **Express and CDN** (`aspen_express_*`): on servers that sign express URLs
 or mount the express route, and on standalone `aspen express` nodes. See
 [EXPRESS.md](EXPRESS.md#metrics).
+
+### Compaction backlog
+
+Every push stores a level-0 pack, and every 16th version of a ref
+(`CoverLayout` fanout) enqueues a `compact` job that builds the covers
+ending there. Until it runs, fetches of those versions send one pack per
+version instead of one per cover. `aspen_compaction_backlog` counts the
+`compact` jobs not yet done (queued plus running). It is a database
+gauge, the same on every instance: aggregate it with `max`.
+
+- **Flat** (it rises and falls by a few jobs) under a steady push rate:
+  compaction keeps up. A job's metadata work does not grow with the ref's
+  history (`crates/aspen-compact/tests/backlog.rs` holds it flat over
+  5,120 versions), so a rate that keeps up today keeps up as the
+  repository grows.
+- **Growing** while pushes keep their rate: compaction is behind. Add
+  capacity: raise `ASPEN_COMPACT_WORKERS` (jobs one process runs at once)
+  or run more `ASPEN_ROLE=compact` processes, which share the queue and
+  scale apart from the Git servers (deploy/README.md, "Process roles").
+  `aspen_jobs_queued_lag_seconds{kind="compact"}` says how far behind.
+
+While there is a backlog, workers claim the jobs fetches are waiting for
+first. A served fetch counts, per ref, the versions it sent as their own
+push packs (`aspen_fetch_uncompacted_versions_total`); each process sums
+those counts and writes them to the queue at most once a second, raising
+the priority of that ref's queued `compact` jobs. A claim takes the
+highest priority first, then the oldest. If hot refs alone need more than
+the workers can do, jobs of refs nobody fetches wait until the backlog
+drains; the lag gauge shows it.
 
 ### Dead jobs
 

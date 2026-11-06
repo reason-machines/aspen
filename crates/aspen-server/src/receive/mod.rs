@@ -28,6 +28,7 @@
 mod ancestry;
 mod closure;
 mod gate;
+mod group;
 pub mod hook;
 pub(crate) mod http;
 mod push;
@@ -55,6 +56,7 @@ use aspen_proto::receive::{
 };
 use aspen_proto::service::{ProtocolVersion, ReceiveVersion, Service, write_info_refs_header};
 
+pub use group::{GroupCommit, GroupCommitStats};
 pub use push::{PushOutcome, Timings};
 
 /// Limits and tuning of the receive-pack service. Every memory and size
@@ -80,9 +82,15 @@ pub struct ReceiveConfig {
     /// a non-retryable `unpack` error.
     pub locate: LocateOptions,
     /// Memory all concurrent pushes may hold for prefetched bases together.
-    /// The service admits at most `max(1, this / locate.max_prefetch_bytes)`
-    /// pushes into prefetch and completion at once; the rest wait.
+    /// Each push reserves `prefetch_floor_bytes` of it, and grows to
+    /// `locate.max_prefetch_bytes` only when its reads need more, so this
+    /// admits `this / prefetch_floor_bytes` small pushes at once and
+    /// `this / locate.max_prefetch_bytes` (at least 1) large ones; the rest
+    /// wait (`gate.rs`).
     pub prefetch_memory_bytes: u64,
+    /// What each push reserves of `prefetch_memory_bytes` before its first
+    /// read of stored packs (default 64 MiB).
+    pub prefetch_floor_bytes: u64,
     /// How long a push waits for a prefetch slot before it is answered with
     /// a retryable error.
     pub prefetch_wait: Duration,
@@ -107,13 +115,34 @@ pub struct ReceiveConfig {
     pub cover_layout: CoverLayout,
     /// Repository rules run on every update ([`hook`]); `None` runs none.
     pub hook: Option<Arc<dyn hook::PushHook>>,
+    /// The merge queue ([`crate::queue`]): clients may push to
+    /// `refs/queue/<trunk branch>/...` (added to every repository's
+    /// writable namespaces), and every committed queue push wakes the
+    /// queue worker. Off: those refs are refused like any ref outside the
+    /// writable namespaces, as before.
+    pub merge_queue: bool,
+    /// Group commit ([`GroupCommit`]): while `enabled`, concurrent pushes
+    /// register their packs in one transaction and commit their ref
+    /// updates in another, each push still durable before it is answered
+    /// and its compare-and-swap its own. Off by default: two transactions
+    /// per push.
+    pub group_commit: GroupCommit,
+    /// Bytes of trees kept in memory for the walk that diffs each pushed
+    /// commit against its parent (`aspen_pack::changed`): the trees trunk's
+    /// pushes bring and the ones the walk reads from stored packs, least
+    /// recently used evicted first. The next push to trunk then diffs
+    /// against trunk's newest trees without reading any, and needs no
+    /// lookup for anything it did not change. 0 keeps none (each walk reads
+    /// the old trees it needs from stored packs). Default 64 MiB.
+    pub trunk_tree_cache_bytes: u64,
 }
 
 impl ReceiveConfig {
     /// A configuration with the given spool directory and object limits:
     /// 10 M objects and 8 GiB per push, the default request limits, the
     /// default locator options (so a 1 GiB-or-more per-push prefetch
-    /// budget) and 4 GiB of prefetch memory shared by all pushes.
+    /// budget) and 4 GiB of prefetch memory shared by all pushes, of which
+    /// each push first reserves 64 MiB.
     pub fn new(
         spool_dir: impl Into<PathBuf>,
         max_object_bytes: MaxObjectBytes,
@@ -130,6 +159,7 @@ impl ReceiveConfig {
             max_inflated_bytes,
             locate: LocateOptions::new(max_object_bytes),
             prefetch_memory_bytes: 4 << 30,
+            prefetch_floor_bytes: 64 << 20,
             prefetch_wait: Duration::from_secs(60),
             thread_limit: None,
             max_ancestry_commits: 1_000_000,
@@ -138,6 +168,9 @@ impl ReceiveConfig {
             agent: Agent::aspen(),
             cover_layout: CoverLayout::DEFAULT,
             hook: None,
+            merge_queue: false,
+            group_commit: GroupCommit::default(),
+            trunk_tree_cache_bytes: 64 << 20,
         }
     }
 }
@@ -240,9 +273,15 @@ pub struct ReceivePack<M, B> {
     config: ReceiveConfig,
     gate: gate::PrefetchGate,
     closures: closure::Closures,
+    /// Trunk's newest trees ([`ReceiveConfig::trunk_tree_cache_bytes`]).
+    trees: aspen_pack::changed::TreeCache,
     totals: std::sync::Mutex<Timings>,
     metrics: crate::metrics::PushMetrics,
     push_through: OnceLock<Arc<dyn PushThrough>>,
+    group: Option<group::Group<M>>,
+    /// Repositories with merge-queue pushes the worker has not seen yet.
+    pub(crate) queue_signal: crate::queue::QueueSignal,
+    pub(crate) queue_metrics: crate::queue::QueueMetrics,
 }
 
 impl<M, B> ReceivePack<M, B>
@@ -254,17 +293,29 @@ where
     pub fn new(meta: M, blobs: B, config: ReceiveConfig) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&config.spool_dir)?;
         let packs = StoredPacks::new(meta.clone(), blobs.clone(), config.locate);
-        let slots = (config.prefetch_memory_bytes / config.locate.max_prefetch_bytes.max(1)).max(1);
+        let group = config
+            .group_commit
+            .enabled
+            .then(|| group::Group::new(meta.clone(), config.group_commit));
         Ok(Arc::new(Self {
-            gate: gate::PrefetchGate::new(slots as usize, config.prefetch_wait),
+            group,
+            gate: gate::PrefetchGate::new(
+                config.prefetch_memory_bytes,
+                config.prefetch_floor_bytes,
+                config.locate.max_prefetch_bytes,
+                config.prefetch_wait,
+            ),
             meta,
             blobs,
             packs,
             closures: closure::Closures::new(config.cover_layout),
+            trees: aspen_pack::changed::TreeCache::new(config.trunk_tree_cache_bytes),
             config,
             totals: std::sync::Mutex::new(Timings::default()),
             metrics: crate::metrics::PushMetrics::default(),
             push_through: OnceLock::new(),
+            queue_signal: crate::queue::QueueSignal::default(),
+            queue_metrics: crate::queue::QueueMetrics::default(),
         }))
     }
 
@@ -379,6 +430,18 @@ where
         self.gate.peak()
     }
 
+    /// Objects read from stored packs that the base-object cache answered,
+    /// and those read from the blob store, since the service started.
+    pub fn base_cache_counts(&self) -> (u64, u64) {
+        self.packs.object_cache_counts()
+    }
+
+    /// Reads of stored packs that needed more than the per-push floor, so
+    /// their slot grew to the full per-push budget.
+    pub fn prefetch_escalations(&self) -> u64 {
+        self.gate.escalations()
+    }
+
     /// Prefetch slots granted since the service started (each read of
     /// stored packs takes one).
     pub fn prefetch_slots_acquired(&self) -> u64 {
@@ -390,8 +453,44 @@ where
         *self.totals.lock().expect("not poisoned")
     }
 
+    /// What the stored-pack locator has read and looked up so far, over
+    /// every push and import.
+    pub fn locate_stats(&self) -> aspen_pack::locate::LocateStats {
+        self.packs.stats()
+    }
+
     fn record(&self, t: &Timings) {
         *self.totals.lock().expect("not poisoned") += t;
+    }
+
+    /// Group commit's counters; `None` when it is off.
+    pub fn group_commit_stats(&self) -> Option<GroupCommitStats> {
+        self.group.as_ref().map(group::Group::stats)
+    }
+
+    /// Registers a push's pack: in a group-commit batch when group commit
+    /// is on, in a transaction of its own otherwise.
+    pub(crate) async fn register_pack(
+        &self,
+        pack: &aspen_core::pack::NewPack,
+    ) -> Result<aspen_core::pack::PackRecord, StoreError> {
+        match &self.group {
+            Some(g) => g.register_pack(pack.clone()).await,
+            None => self.meta.register_pack(pack).await,
+        }
+    }
+
+    /// Commits a push's ref updates: in a group-commit batch when group
+    /// commit is on, in a transaction of its own otherwise. Called only
+    /// after every pack the writes name is uploaded.
+    pub(crate) async fn commit_push(
+        &self,
+        push: aspen_core::meta::PushCommit,
+    ) -> Result<aspen_core::meta::CommitOutcome, StoreError> {
+        match &self.group {
+            Some(g) => g.commit_push(push).await,
+            None => self.meta.commit_push(&push).await,
+        }
     }
 
     /// Push counters (node C5).
@@ -407,8 +506,138 @@ where
             peak: self.gate.peak(),
             acquired: self.gate.acquired(),
             timeouts: self.gate.timeouts(),
+            escalations: self.gate.escalations(),
         };
         self.metrics.render(out, &self.timings(), gate);
+        let (hits, misses) = self.packs.object_cache_counts();
+        crate::metrics::expo::counter(
+            out,
+            "aspen_push_base_cache_hits_total",
+            "Delta bases and other objects read from stored packs that the base-object cache answered.",
+            hits,
+        );
+        crate::metrics::expo::counter(
+            out,
+            "aspen_push_base_cache_misses_total",
+            "Delta bases and other objects read from stored packs that came from the blob store.",
+            misses,
+        );
+        if self.config.merge_queue {
+            self.queue_metrics.render(out);
+        }
+        if let Some(g) = self.group_commit_stats() {
+            use crate::metrics::expo;
+            for (name, help, v) in [
+                (
+                    "aspen_push_group_commit_batches_total",
+                    "Group commit: commit transactions run, each for one or more pushes.",
+                    g.commit_batches,
+                ),
+                (
+                    "aspen_push_group_commit_pushes_total",
+                    "Group commit: push commits those transactions took.",
+                    g.commits,
+                ),
+                (
+                    "aspen_push_group_register_batches_total",
+                    "Group commit: pack registration transactions run.",
+                    g.register_batches,
+                ),
+                (
+                    "aspen_push_group_registrations_total",
+                    "Group commit: pack registrations those transactions took.",
+                    g.registrations,
+                ),
+                (
+                    "aspen_push_group_failed_batches_total",
+                    "Group commit: batches that failed as a whole; every push in them was refused.",
+                    g.failed_batches,
+                ),
+            ] {
+                expo::counter(out, name, help, v);
+            }
+        }
+    }
+
+    /// The metadata store.
+    pub(crate) fn meta(&self) -> &M {
+        &self.meta
+    }
+
+    /// Whether `a` is an ancestor of (or equal to) `b`, answered exactly
+    /// from `commit_index` and the packs of `versions`' closures (which
+    /// must reach both commits), the way a push's commit check answers it.
+    pub async fn is_ancestor(
+        &self,
+        repo: aspen_core::id::RepoId,
+        a: aspen_core::id::ObjectId,
+        b: aspen_core::id::ObjectId,
+        versions: &[aspen_core::id::RefVersionId],
+    ) -> Result<aspen_core::refs::Ancestry, StoreError> {
+        let source = source::PushCommits {
+            meta: &self.meta,
+            repo,
+            packs: &self.packs,
+            gate: &self.gate,
+            closures: &self.closures,
+            fallback: Vec::new(),
+            lazy_roots: versions.to_vec(),
+            lazy: tokio::sync::OnceCell::new(),
+        };
+        let mut walker = ancestry::Walker::new(self.config.max_ancestry_commits);
+        let answer = walker.is_ancestor(&source, a, b).await;
+        self.queue_metrics.record_walk(walker.expanded());
+        answer
+    }
+
+    /// The packs of `versions`' closures, in probe order.
+    pub(crate) async fn closure_of(
+        &self,
+        repo: aspen_core::id::RepoId,
+        versions: &[aspen_core::id::RefVersionId],
+    ) -> Result<aspen_core::ingest::SearchPacks, StoreError> {
+        closure::closure_packs(&self.meta, &self.closures, repo, versions).await
+    }
+
+    /// The objects of `ids` that `packs` hold, read under one prefetch
+    /// slot.
+    pub(crate) async fn read_many(
+        &self,
+        packs: &aspen_core::ingest::SearchPacks,
+        ids: Vec<aspen_core::id::ObjectId>,
+    ) -> Result<
+        std::collections::HashMap<
+            aspen_core::id::ObjectId,
+            (aspen_core::ingest::ObjectKind, Vec<u8>),
+        >,
+        StoreError,
+    > {
+        use aspen_core::ingest::{BaseLookup, CandidateBases, SortedIds};
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let wanted = SortedIds::from_unsorted(ids);
+        let slot = self.gate.acquire().await?;
+        let fetched = match slot
+            .prefetch(&self.packs, packs, &CandidateBases(wanted.clone()))
+            .await
+        {
+            Ok((f, _)) => f.bases,
+            Err(aspen_pack::locate::PrefetchError::OverBudget { budget }) => {
+                return Err(StoreError::Unavailable {
+                    reason: format!("objects need more than {budget} bytes of bases"),
+                });
+            }
+            Err(aspen_pack::locate::PrefetchError::Store(e)) => return Err(e),
+        };
+        let mut buf = Vec::new();
+        for id in wanted.as_slice() {
+            if let Some(kind) = fetched.find_base(id, &mut buf)? {
+                out.insert(*id, (kind, std::mem::take(&mut buf)));
+            }
+        }
+        Ok(out)
     }
 
     /// One object from the closure of `version` (its pack and every pack

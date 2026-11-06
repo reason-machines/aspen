@@ -6,7 +6,7 @@
 //! snapshot's `seq`, the backlog and the live stream always line up.
 //! The lock is never held across an `await`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use aspen_core::id::ObjectId;
@@ -229,6 +229,14 @@ pub struct State {
     pub branches: BTreeMap<String, Branch>,
     /// Pushes waiting for the merger bot, in sequence order.
     pub pending: Vec<Pending>,
+    /// When people (not the server's agents) last painted each tile, in
+    /// ms, kept for [`HUMAN_MEMORY_MS`]: ambient agents place their
+    /// sprites where they cover none of these. In memory only, like the
+    /// rest of the canvas state.
+    pub human_tiles: HashMap<usize, u64>,
+    /// When ambient agents' sprites last landed on each tile (at merge), in
+    /// ms, kept for [`HUMAN_MEMORY_MS`]: a new sprite never covers one.
+    pub sprite_tiles: HashMap<usize, u64>,
     /// The kill switch.
     pub kill: KillSwitch,
     /// The swarm.
@@ -239,6 +247,9 @@ pub struct State {
     backlog: usize,
     tx: broadcast::Sender<Arc<Event>>,
 }
+
+/// How long ambient agents keep clear of tiles people painted.
+pub const HUMAN_MEMORY_MS: u64 = 6 * 3600 * 1000;
 
 /// How long a swarm agent's branch stays once idle with its tiles merged.
 pub const SWARM_BRANCH_TTL_MS: u64 = 30_000;
@@ -254,6 +265,10 @@ pub struct MergePlan {
     pub changed: Vec<Tile>,
     /// Branches with pushes in the merge.
     pub branches: Vec<String>,
+    /// Tiles people painted in the merged pushes (indexes, ascending).
+    pub people: Vec<usize>,
+    /// Tiles ambient agents' sprites painted in the merged pushes.
+    pub sprites: Vec<usize>,
 }
 
 impl State {
@@ -268,6 +283,8 @@ impl State {
             main,
             branches: BTreeMap::new(),
             pending: Vec::new(),
+            human_tiles: HashMap::new(),
+            sprite_tiles: HashMap::new(),
             kill: KillSwitch::default(),
             swarm: Swarm::default(),
             swarm_limits,
@@ -348,6 +365,11 @@ impl State {
         for t in &tiles {
             b.overlay.insert(rules.index(t.x, t.y), (t.color, seq));
         }
+        if !branch.starts_with("agent/") && !branch.starts_with("swarm/") {
+            for t in &tiles {
+                self.human_tiles.insert(rules.index(t.x, t.y), now);
+            }
+        }
         self.pending.push(Pending {
             seq,
             branch: branch.to_owned(),
@@ -373,9 +395,16 @@ impl State {
         let last = self.pending.last()?;
         let mut pixels = (*self.main.pixels).clone();
         let mut branches = Vec::new();
+        let (mut people, mut sprites) = (BTreeSet::new(), BTreeSet::new());
         for p in &self.pending {
             for t in &p.tiles {
-                pixels[self.rules.index(t.x, t.y)] = t.color;
+                let i = self.rules.index(t.x, t.y);
+                pixels[i] = t.color;
+                if p.branch.starts_with("agent/") {
+                    sprites.insert(i);
+                } else if !p.branch.starts_with("swarm/") {
+                    people.insert(i);
+                }
             }
             if !branches.contains(&p.branch) {
                 branches.push(p.branch.clone());
@@ -398,6 +427,8 @@ impl State {
             pixels,
             changed,
             branches,
+            people: people.into_iter().collect(),
+            sprites: sprites.into_iter().collect(),
         })
     }
 
@@ -405,6 +436,7 @@ impl State {
     /// and overlay tiles and emits a `merge` event.
     pub fn apply_merge(&mut self, commit: ObjectId, plan: MergePlan, now: u64) -> u64 {
         let through = plan.through;
+        self.remember(&plan.people, &plan.sprites, now);
         self.pending.retain(|p| p.seq > through);
         for b in self.branches.values_mut() {
             b.overlay.retain(|_, (_, seq)| *seq > through);
@@ -422,6 +454,46 @@ impl State {
                 "branches": plan.branches,
             })
         })
+    }
+
+    /// Records `people`'s and `sprites`' tiles as painted at `at` (ms),
+    /// keeping the later time per tile.
+    pub fn remember(&mut self, people: &[usize], sprites: &[usize], at: u64) {
+        for &i in people {
+            let e = self.human_tiles.entry(i).or_insert(at);
+            *e = (*e).max(at);
+        }
+        for &i in sprites {
+            let e = self.sprite_tiles.entry(i).or_insert(at);
+            *e = (*e).max(at);
+        }
+    }
+
+    /// Tiles a new sprite must not cover: people's and sprites' from the
+    /// last [`HUMAN_MEMORY_MS`] (older entries are dropped).
+    pub fn protected_tiles(&mut self, now: u64) -> Vec<usize> {
+        let fresh = |at: &mut u64| at.saturating_add(HUMAN_MEMORY_MS) > now;
+        self.human_tiles.retain(|_, at| fresh(at));
+        self.sprite_tiles.retain(|_, at| fresh(at));
+        let rules = self.rules.clone();
+        // Sprites pushed but not merged yet count too (ambient-only merges
+        // wait up to `ambient_merge_interval`).
+        let pending = self
+            .pending
+            .iter()
+            .filter(|p| p.branch.starts_with("agent/"))
+            .flat_map(|p| p.tiles.iter().map(|t| rules.index(t.x, t.y)))
+            .collect::<Vec<_>>();
+        let mut out: Vec<usize> = self
+            .human_tiles
+            .keys()
+            .chain(self.sprite_tiles.keys())
+            .copied()
+            .chain(pending)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// `branch` was deleted in Git. It leaves the page now if all its

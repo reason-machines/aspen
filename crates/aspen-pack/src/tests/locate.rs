@@ -399,6 +399,62 @@ fn candidates(ids: &[ObjectId]) -> aspen_core::ingest::CandidateBases {
 }
 
 #[test]
+fn a_repeated_base_comes_from_the_object_cache() {
+    // Consecutive pushes mostly need the same bases (trunk's root tree):
+    // the second prefetch of a resolved base reads no blobs, returns the
+    // same bytes, and still counts against the prefetch budget. A cached
+    // object is used only when the search packs hold it.
+    let dir = scratch();
+    let objs = big_chain(6, 4 << 10);
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let stored = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let (p, _) = push(
+        &build_pack(&chain_specs(&objs)),
+        &[],
+        &stored,
+        dir.path(),
+        1,
+    );
+    let id = store(&p, 1, &rows, &blobs);
+    let search = SearchPacks::new([id]);
+    let top = objs[6].id();
+    let (first, _) = ready(stored.prefetch_bases(&search, &candidates(&[top]))).unwrap();
+    let reads = blobs.reads.load(Ordering::Relaxed);
+    let (again, stats) = ready(stored.prefetch_bases(&search, &candidates(&[top]))).unwrap();
+    assert_eq!(blobs.reads.load(Ordering::Relaxed), reads, "no blob reads");
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    first.bases.find_base(&top, &mut a).unwrap().unwrap();
+    again.bases.find_base(&top, &mut b).unwrap().unwrap();
+    assert_eq!(
+        (a.as_slice(), b.as_slice()),
+        (objs[6].data.as_slice(), objs[6].data.as_slice())
+    );
+    assert_eq!(stats.output_bytes, objs[6].data.len() as u64);
+    assert!(
+        stats.peak_bytes >= objs[6].data.len() as u64,
+        "a hit is charged"
+    );
+    // Search packs that lack the object: not found, cache or not.
+    let (missing, _) =
+        ready(stored.prefetch_bases(&SearchPacks::new([]), &candidates(&[top]))).unwrap();
+    assert!(missing.bases.is_empty());
+    assert_eq!(missing.not_in_deps.as_slice(), &[top]);
+    // With the cache off, every prefetch reads again.
+    let off = StoredPacks::new(
+        &rows,
+        &blobs,
+        LocateOptions {
+            object_cache_bytes: 0,
+            ..LocateOptions::new(MAX_OBJECT)
+        },
+    );
+    ready(off.prefetch_bases(&search, &candidates(&[top]))).unwrap();
+    let reads = blobs.reads.load(Ordering::Relaxed);
+    ready(off.prefetch_bases(&search, &candidates(&[top]))).unwrap();
+    assert!(blobs.reads.load(Ordering::Relaxed) > reads);
+}
+
+#[test]
 fn a_deep_chain_prefetch_peaks_near_two_objects() {
     // Invariant: prefetch memory does not grow with chain depth. Only
     // intermediates another chain still needs are kept, and the last use
@@ -527,4 +583,100 @@ fn the_idx_cache_evicts_the_least_recently_used_pack() {
     assert_eq!(locate(c), 1, "loading c evicts b, the least recently used");
     assert_eq!(locate(a), 0, "a survived the eviction");
     assert_eq!(locate(b), 1, "b was evicted");
+}
+
+#[test]
+fn a_sampled_idx_answers_exactly_as_a_whole_one() {
+    // Invariant: a locator that keeps every `.idx` as a sample
+    // (`max_whole_idx_bytes: 0`) finds the same objects at the same places,
+    // and prefetches the same bases, as one that keeps them whole: for
+    // OFS_DELTA and REF_DELTA packs, for entries longer than its first read
+    // of an entry, and for IDs no pack holds. Once its samples are built, a
+    // lookup reads a few kilobytes of `.idx`, never a whole one.
+    let dir = scratch();
+    let src = history(dir.path(), 9);
+    // An incompressible blob, longer than the first read of an entry.
+    let mut noise = Vec::with_capacity(200_000);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    while noise.len() < 200_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        noise.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(src.join("noise.bin"), &noise).unwrap();
+    git_raw(&src, &["add", "-A"], None);
+    let commit = git_raw(&src, &["commit", "-q", "-m", "noise"], None);
+    assert!(commit.status.success());
+    let (rows, blobs) = (Rows::default(), Blobs::default());
+    let setup = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let ref_delta = {
+        let args = ["pack-objects", "-q", "--revs", "--stdout"];
+        let out = git_raw(&src, &args, Some(b"HEAD~5\n"));
+        assert!(out.status.success());
+        out.stdout
+    };
+    let (p1, _) = push(&ref_delta, &[], &setup, dir.path(), 1);
+    assert!(p1.new_pack(REPO).ref_delta_count > 0, "a REF_DELTA pack");
+    let a = store(&p1, 1, &rows, &blobs);
+    let (p2, _) = push(
+        &pack_objects(&src, "HEAD\n^HEAD~5\n", true),
+        &[a],
+        &setup,
+        dir.path(),
+        2,
+    );
+    let b = store(&p2, 2, &rows, &blobs);
+    let search = SearchPacks::new([b, a]);
+    let mut ids: Vec<ObjectId> =
+        String::from_utf8(git_raw(&src, &["rev-list", "--objects", "HEAD"], None).stdout)
+            .unwrap()
+            .lines()
+            .map(|l| ObjectId::parse_hex(&l[..40]).unwrap())
+            .collect();
+    for k in 0..64u8 {
+        ids.push(ObjectId::from_bytes([k.wrapping_mul(4); 20]));
+    }
+    let ids = SortedIds::from_unsorted(ids);
+    let whole = StoredPacks::new(&rows, &blobs, LocateOptions::new(MAX_OBJECT));
+    let sampled = StoredPacks::new(
+        &rows,
+        &blobs,
+        LocateOptions {
+            max_whole_idx_bytes: 0,
+            object_cache_bytes: 0,
+            ..LocateOptions::new(MAX_OBJECT)
+        },
+    );
+    let want = ready(whole.locate(&search, &ids)).unwrap();
+    let got = ready(sampled.locate(&search, &ids)).unwrap();
+    assert_eq!(got, want);
+    assert!(want.iter().filter(|w| w.is_some()).count() > 20);
+    assert_eq!(sampled.stats().sampled_idx_loads, 2);
+    assert_eq!(sampled.stats().whole_idx_loads, 0);
+    // Every object of the history as a candidate base: chains through
+    // REF_DELTA and OFS_DELTA entries, and the long blob.
+    let all = aspen_core::ingest::CandidateBases(ids.clone());
+    let (w, _) = ready(whole.prefetch_bases(&search, &all)).unwrap();
+    let (s, _) = ready(sampled.prefetch_bases(&search, &all)).unwrap();
+    assert_eq!(s.not_in_deps, w.not_in_deps);
+    assert_eq!(s.bases.len(), w.bases.len());
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    for id in ids.as_slice() {
+        let kx = w.bases.find_base(id, &mut x).unwrap();
+        let ky = s.bases.find_base(id, &mut y).unwrap();
+        assert_eq!((kx, &x), (ky, &y), "{id}");
+        if let Some(kind) = ky {
+            assert_eq!(object_id_of(kind, &y), *id);
+        }
+    }
+    // A warm lookup in a sample reads one stretch of IDs and an offset.
+    let before = sampled.stats().idx_bytes_read;
+    let head = SortedIds::from_unsorted(vec![ids.as_slice()[0]]);
+    ready(sampled.locate(&search, &head)).unwrap();
+    let read = sampled.stats().idx_bytes_read - before;
+    assert!(
+        read <= 2 * (256 * 20 + 8),
+        "a sampled lookup read {read} bytes of .idx"
+    );
 }

@@ -225,6 +225,23 @@ pub fn receive_request(name: &str, old: ObjectId, new: ObjectId, pack: Option<Ve
     out
 }
 
+/// Like [`receive_request`], with the `force` push option: the forced
+/// update of `name` from `old` to `new` with `pack`.
+pub fn forced_receive_request(name: &str, old: ObjectId, new: ObjectId, pack: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    pkt(
+        &mut out,
+        &format!(
+            "{old} {new} {name}\0report-status push-options object-format=sha1 agent=aspen-place\n"
+        ),
+    );
+    out.extend_from_slice(b"0000");
+    pkt(&mut out, "force\n");
+    out.extend_from_slice(b"0000");
+    out.extend_from_slice(&pack);
+    out
+}
+
 /// What receive-pack answered for the one ref of a [`receive_request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Report {

@@ -37,6 +37,7 @@ const PG_SQL: &str = concat!(
     include_str!("../migrations/postgres/0005_compaction.sql"),
     include_str!("../migrations/postgres/0006_shallow_packs.sql"),
     include_str!("../migrations/postgres/0007_shallow_pack_use.sql"),
+    include_str!("../migrations/postgres/0008_job_priority.sql"),
 );
 const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0001_schema_v1.sql"),
@@ -46,6 +47,7 @@ const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0005_compaction.sql"),
     include_str!("../migrations/sqlite/0006_shallow_packs.sql"),
     include_str!("../migrations/sqlite/0007_shallow_pack_use.sql"),
+    include_str!("../migrations/sqlite/0008_job_priority.sql"),
 );
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1529,6 +1531,14 @@ fn expected_indexes() -> BTreeSet<(String, String, bool, String, String)> {
             false,
             "repo_id,used_at_us",
             "",
+        ),
+        // Migration 0008.
+        (
+            "jobs",
+            "jobs_queued_priority",
+            false,
+            "priority,run_after_us,id",
+            "state='queued'",
         ),
     ]
     .into_iter()

@@ -320,6 +320,72 @@ run "real_image_gets_the_config_contract" {
   }
 }
 
+run "a_compaction_service_takes_the_background_worker" {
+  command = apply
+
+  variables {
+    container_image       = "registry.example.test/aspen:1.2.3"
+    compactor_count       = 2
+    compactor_environment = { ASPEN_COMPACT_WORKERS = "16" }
+  }
+
+  assert {
+    condition     = length(aws_ecs_service.compactor) == 1 && aws_ecs_service.compactor[0].desired_count == 2
+    error_message = "compactor_count tasks of a separate compaction service should run."
+  }
+  assert {
+    condition     = length(aws_ecs_service.compactor[0].load_balancer) == 0
+    error_message = "The compaction service serves no Git, so no load balancer may reach it."
+  }
+  assert {
+    condition = contains([
+      for e in jsondecode(aws_ecs_task_definition.aspen.container_definitions)[0].environment :
+      e.value if e.name == "ASPEN_ROLE"
+    ], "serve")
+    error_message = "With a compaction service, the Git tasks run ASPEN_ROLE=serve."
+  }
+  assert {
+    condition = (
+      { for e in jsondecode(aws_ecs_task_definition.compactor[0].container_definitions)[0].environment : e.name => e.value if contains(["ASPEN_ROLE", "ASPEN_COMPACT_WORKERS", "ASPEN_BLOB_URL"], e.name) } ==
+      { ASPEN_ROLE = "compact", ASPEN_COMPACT_WORKERS = "16", ASPEN_BLOB_URL = "s3://aspen-packs-example" }
+    )
+    error_message = "The compaction tasks run ASPEN_ROLE=compact on the same bucket, with their own environment."
+  }
+  assert {
+    condition = (
+      [for e in jsondecode(aws_ecs_task_definition.compactor[0].container_definitions)[0].environment : e.value if e.name == "DATABASE_URL"] ==
+      [for e in jsondecode(aws_ecs_task_definition.aspen.container_definitions)[0].environment : e.value if e.name == "DATABASE_URL"]
+    )
+    error_message = "The compaction tasks share the Git tasks' database."
+  }
+  assert {
+    condition = alltrue([
+      for e in jsondecode(aws_ecs_task_definition.compactor[0].container_definitions)[0].environment :
+      !contains(["ASPEN_SSH_LISTEN", "ASPEN_MERGE_QUEUE", "ASPEN_EXPRESS_URLS", "ASPEN_LIMITS", "PGPASSWORD"], e.name)
+    ])
+    error_message = "The compaction tasks get no Git-only settings and no plain credentials."
+  }
+  assert {
+    condition     = [for s in jsondecode(aws_ecs_task_definition.compactor[0].container_definitions)[0].secrets : s.name] == ["PGPASSWORD"]
+    error_message = "The compaction tasks need only the database password."
+  }
+}
+
+run "the_background_worker_runs_in_the_git_tasks_by_default" {
+  command = apply
+
+  variables {
+    container_image = "registry.example.test/aspen:1.2.3"
+  }
+
+  assert {
+    condition = length(aws_ecs_service.compactor) == 0 && !contains(
+      [for e in jsondecode(aws_ecs_task_definition.aspen.container_definitions)[0].environment : e.name], "ASPEN_ROLE"
+    )
+    error_message = "Without compactor_count, no compaction service runs and the Git tasks run the background worker (ASPEN_ROLE unset: all)."
+  }
+}
+
 run "nat_gateway_moves_tasks_to_private_subnets" {
   command = plan
 

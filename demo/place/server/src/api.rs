@@ -1,6 +1,7 @@
 //! The HTTP API of `demo/place/api/openapi.yaml`, under `/api/v1`.
 //!
-//! Every response is `Cache-Control: no-store` with
+//! Every response but `GET /canvas.svg` (`no-cache` with an ETag) is
+//! `Cache-Control: no-store`, and every one has
 //! `Access-Control-Allow-Origin: *`; every error is the contract's `Error`
 //! body, with `Retry-After` on 429 and 503. Request bodies are JSON of at
 //! most 64 KiB.
@@ -84,6 +85,7 @@ where
     let api = Router::new()
         .route("/config", get(config::<M, B>))
         .route("/canvas", get(canvas::<M, B>))
+        .route("/canvas.svg", get(canvas_svg::<M, B>))
         .route("/branches", get(branches::<M, B>))
         .route("/sessions", post(create_session::<M, B>))
         .route("/quota", get(quota::<M, B>))
@@ -91,6 +93,7 @@ where
         .route("/events", get(events::<M, B>))
         .route("/swarm", get(swarm::<M, B>).post(start_swarm::<M, B>))
         .route("/admin/kill-switch", post(kill_switch::<M, B>))
+        .route("/admin/reset-history", post(reset_history::<M, B>))
         .fallback(not_found)
         .with_state(place)
         .layer(axum::middleware::from_fn(common_headers));
@@ -116,7 +119,9 @@ async fn common_headers(request: Request, next: axum::middleware::Next) -> Respo
         next.run(request).await
     };
     let h = r.headers_mut();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     h.insert(
         "access-control-expose-headers",
@@ -230,6 +235,44 @@ async fn canvas<M, B>(State(place): State<Arc<Place<M, B>>>) -> Response {
         .expect("not poisoned")
         .snapshot(ttl);
     json_response(StatusCode::OK, &body)
+}
+
+/// `GET /canvas.svg`: `main`'s tiles as an image ([`crate::image`]). The
+/// ETag is `main`'s commit; `no-cache` makes caches such as GitHub's image
+/// proxy revalidate on every view, so a README shows the canvas as it is.
+async fn canvas_svg<M, B>(State(place): State<Arc<Place<M, B>>>, headers: HeaderMap) -> Response
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    let main = place.with_state(|s| s.main.clone());
+    let etag = format!("\"{}\"", main.commit);
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+    let mut response = if fresh {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let rules = &place.shared.rules;
+        let svg = place.svg.get(main.commit, || {
+            crate::image::canvas_svg(&main.pixels, rules.width, rules.height, &rules.palette)
+        });
+        (StatusCode::OK, svg).into_response()
+    };
+    let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, max-age=0"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        h.insert(header::ETAG, v);
+    }
+    response
 }
 
 async fn branches<M, B>(State(place): State<Arc<Place<M, B>>>) -> Response {
@@ -412,6 +455,17 @@ where
             None,
         );
     }
+    if tiles.len() > place.config.web_tiles_per_push {
+        let n = place.config.web_tiles_per_push;
+        return json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "error": "rejected",
+                "message": format!("A push from the page carries at most {n} {}. Click one tile at a time, or push more with git.", if n == 1 { "tile" } else { "tiles" }),
+                "rejections": [],
+            }),
+        );
+    }
     let tiles = match rules::validate_stroke(&tiles, &place.shared.rules) {
         Ok(t) => t,
         Err(rejections) => {
@@ -512,6 +566,14 @@ where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
 {
+    if !place.config.swarm_enabled {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not-found",
+            "The swarm is not available on this demo.",
+            None,
+        );
+    }
     let addr = client_key(request.headers(), peer(&request), &place.config.client_addr);
     // One call checks the kill switch, the run state and the address's
     // starts and starts the run, under one lock (#124).
@@ -539,6 +601,71 @@ where
     }
 }
 
+/// `None` when the request carries an operator credential, otherwise the
+/// error response.
+async fn refuse_non_operator<M, B>(
+    place: &Place<M, B>,
+    connect: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Option<Response>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    let addr = client_ip(headers, connect.map(|c| c.0.0), &place.config.client_addr);
+    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
+    let first = auth.next().map(HeaderValue::as_bytes);
+    let operator = if auth.next().is_some() {
+        Ok(false)
+    } else {
+        place.operators.is_operator(first, addr).await
+    };
+    if let Err(limited) = operator {
+        return Some(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate-limited",
+            &format!("Operator credentials refused: {limited}."),
+            Some(retry_secs_of(&limited)),
+        ));
+    }
+    if operator != Ok(true) {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Operator credentials required: an Aspen token or OIDC token with an admin grant on the canvas repository.",
+            None,
+        ));
+    }
+    None
+}
+
+/// `POST /admin/reset-history`: [`Place::reset_history`].
+async fn reset_history<M, B>(
+    State(place): State<Arc<Place<M, B>>>,
+    connect: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    if let Some(refused) = refuse_non_operator(&place, connect, &headers).await {
+        return refused;
+    }
+    match place.reset_history().await {
+        Ok(commit) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "commit": commit.to_string() }),
+        ),
+        Err(e) => error(
+            StatusCode::CONFLICT,
+            "reset-failed",
+            &format!("The history was not reset: {e}"),
+            None,
+        ),
+    }
+}
+
 async fn kill_switch<M, B>(
     State(place): State<Arc<Place<M, B>>>,
     connect: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
@@ -549,29 +676,8 @@ where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
 {
-    let addr = client_ip(&headers, connect.map(|c| c.0.0), &place.config.client_addr);
-    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
-    let first = auth.next().map(HeaderValue::as_bytes);
-    let operator = if auth.next().is_some() {
-        Ok(false)
-    } else {
-        place.operators.is_operator(first, addr).await
-    };
-    if let Err(limited) = operator {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate-limited",
-            &format!("Operator credentials refused: {limited}."),
-            Some(retry_secs_of(&limited)),
-        );
-    }
-    if operator != Ok(true) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Operator credentials required: an Aspen token or OIDC token with an admin grant on the canvas repository.",
-            None,
-        );
+    if let Some(refused) = refuse_non_operator(&place, connect, &headers).await {
+        return refused;
     }
     let bad = || {
         error(

@@ -131,6 +131,19 @@ override_resource {
   }
 }
 
+override_resource {
+  target = aws_acm_certificate.place_live
+  values = {
+    arn = "arn:aws:acm:us-east-1:111111111111:certificate/00000000-0000-0000-0000-000000000004"
+    domain_validation_options = [{
+      domain_name           = "live.place.staging.aspen.example.test"
+      resource_record_name  = "_x.live.place.staging.aspen.example.test."
+      resource_record_type  = "CNAME"
+      resource_record_value = "_y.acm-validations.aws."
+    }]
+  }
+}
+
 variables {
   aws_account_id      = "111111111111"
   environment         = "staging"
@@ -205,6 +218,19 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
   }
 
   override_resource {
+    target = aws_acm_certificate.place_live
+    values = {
+      arn = "arn:aws:acm:us-east-1:111111111111:certificate/00000000-0000-0000-0000-000000000014"
+      domain_validation_options = [{
+        domain_name           = "live.place.example.test"
+        resource_record_name  = "_x.live.place.example.test."
+        resource_record_type  = "CNAME"
+        resource_record_value = "_y.acm-validations.aws."
+      }]
+    }
+  }
+
+  override_resource {
     target = module.aspen.aws_acm_certificate.cdn
     values = {
       arn = "arn:aws:acm:us-east-1:111111111111:certificate/00000000-0000-0000-0000-000000000013"
@@ -232,6 +258,47 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
   assert {
     condition     = one(one(aws_lb_listener_rule.place[0].condition).host_header).values == toset(["place.example.test"])
     error_message = "Only place_hostname may reach the place task."
+  }
+}
+
+run "the_live_canvas_cdn_serves_only_the_image_cached_per_2_seconds" {
+  command = apply
+
+  assert {
+    condition     = output.place_live_canvas_url == "https://live.place.staging.aspen.example.test/api/v1/canvas.svg"
+    error_message = "The live canvas CDN should sit at live.<place host>."
+  }
+  assert {
+    condition     = one(aws_cloudfront_distribution.place_live[0].origin).domain_name == "place.staging.aspen.example.test" && one(one(aws_cloudfront_distribution.place_live[0].origin).origin_shield).enabled
+    error_message = "Its origin is the place hostname, behind Origin Shield."
+  }
+  assert {
+    condition = (
+      aws_cloudfront_cache_policy.place_live[0].min_ttl == 2 &&
+      aws_cloudfront_cache_policy.place_live[0].default_ttl == 2 &&
+      aws_cloudfront_cache_policy.place_live[0].max_ttl == 10 &&
+      one(one(one(aws_cloudfront_cache_policy.place_live[0].parameters_in_cache_key_and_forwarded_to_origin).query_strings_config).query_strings).items == toset(["t"]) &&
+      one(one(aws_cloudfront_cache_policy.place_live[0].parameters_in_cache_key_and_forwarded_to_origin).cookies_config).cookie_behavior == "none" &&
+      one(one(aws_cloudfront_cache_policy.place_live[0].parameters_in_cache_key_and_forwarded_to_origin).headers_config).header_behavior == "none"
+    )
+    error_message = "The cache key is the path and t only, held 2 seconds even though the origin says no-cache."
+  }
+  assert {
+    condition     = one(aws_cloudfront_distribution.place_live[0].default_cache_behavior).allowed_methods == toset(["GET", "HEAD"]) && one(one(aws_cloudfront_distribution.place_live[0].default_cache_behavior).function_association).event_type == "viewer-request"
+    error_message = "Only GET and HEAD, through the viewer function that refuses every other path."
+  }
+}
+
+run "the_live_canvas_cdn_can_be_turned_off" {
+  command = plan
+
+  variables {
+    place_live_cdn = false
+  }
+
+  assert {
+    condition     = length(aws_cloudfront_distribution.place_live) == 0 && output.place_live_canvas_url == null
+    error_message = "place_live_cdn = false removes the distribution."
   }
 }
 
@@ -393,6 +460,40 @@ run "place_can_be_left_out" {
   assert {
     condition     = length(aws_ecs_service.place) == 0 && length(aws_s3_bucket.place) == 0 && length(aws_lb_listener_rule.place) == 0 && output.place_url == null
     error_message = "Without place_image nothing of place is created."
+  }
+}
+
+run "the_canvas_mirror_is_off_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(jsondecode(aws_ecs_task_definition.place[0].container_definitions)) == 2 && length(aws_secretsmanager_secret.place_canvas_mirror_key) == 0
+    error_message = "Without place_canvas_mirror the place task has no mirror sidecar and no key secret."
+  }
+}
+
+run "the_canvas_mirror_gets_only_its_key" {
+  command = apply
+
+  variables {
+    place_canvas_mirror = "example/place-canvas"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[2].name == "canvas-mirror" &&
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[2].essential == false &&
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[2].secrets ==
+      [{ name = "MIRROR_CREDENTIAL", valueFrom = aws_secretsmanager_secret.place_canvas_mirror_key[0].arn }]
+    )
+    error_message = "The mirror sidecar is not essential and gets its credential and no other secret."
+  }
+  assert {
+    condition = (
+      { for e in jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment : e.name => e.value }["PLACE_MIRROR_URL"] ==
+      "https://github.com/example/place-canvas"
+    )
+    error_message = "place names the mirror in the canvas README."
   }
 }
 

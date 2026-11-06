@@ -340,8 +340,7 @@ impl GitServer for FaultyServer {
             client.run(&path, ["config", key, value])?;
         }
         let hook = path.join("hooks").join(self.fault.hook_name());
-        fs::write(&hook, self.fault.hook())?;
-        make_executable(&hook)?;
+        write_executable(&hook, self.fault.hook())?;
         self.firings
             .repos
             .lock()
@@ -359,14 +358,47 @@ impl GitServer for FaultyServer {
     }
 }
 
+/// Writes `contents` to `path` as an executable file that can be run at
+/// once, even while other threads of this process start programs.
+///
+/// A child `sh` writes the file, never this process. A file this process
+/// opened for writing is also open in every child another thread forks
+/// before the close, until that child runs its own program, and Linux
+/// refuses to run a file that is open for writing ("Text file busy"). The
+/// writing child's descriptor is never shared with this process's other
+/// children.
 #[cfg(unix)]
-fn make_executable(path: &std::path::Path) -> io::Result<()> {
+fn write_executable(path: &std::path::Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("sh")
+        .args(["-c", r#"cat > "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(contents.as_ref())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "writing {}: sh exited with {}: {}",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &std::path::Path) -> io::Result<()> {
+fn write_executable(_path: &std::path::Path, _contents: impl AsRef<[u8]>) -> io::Result<()> {
     Err(io::Error::other(
         "FaultyServer needs a Unix shell for its hook",
     ))
@@ -394,8 +426,7 @@ mod tests {
     /// Writes `fault`'s hook into `dir` as `name` and returns its path.
     fn install(dir: &Path, name: &str, fault: Fault) -> PathBuf {
         let hook = dir.join(name);
-        fs::write(&hook, fault.hook()).unwrap();
-        make_executable(&hook).unwrap();
+        write_executable(&hook, fault.hook()).unwrap();
         hook
     }
 
@@ -688,5 +719,62 @@ mod tests {
                 "packed {packed}: firings recorded"
             );
         }
+    }
+
+    /// A hook can be run the moment it is installed, even while other
+    /// threads of the process start programs. A child forked between the
+    /// hook's write and its close holds the file open for writing until it
+    /// runs its own program, and Linux refuses to run a file open for
+    /// writing ("Text file busy"). The test threads of this crate fork all
+    /// the time, so hooks written by this process used to fail to start now
+    /// and then (main CI, 2026-11-06).
+    #[test]
+    fn a_hook_runs_at_once_while_other_threads_fork() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FORKERS: usize = 4;
+        const HOOKS: usize = 300;
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..FORKERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        Command::new("true").status().unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let line = create_line(&"1".repeat(40), "refs/heads/b");
+        let busy = (0..HOOKS)
+            .filter(|i| {
+                let hook = dir.path().join(format!("hook-{i}"));
+                let fault = Fault::RejectPush { nth_push: u32::MAX };
+                write_executable(&hook, fault.hook()).unwrap();
+                match Command::new(&hook)
+                    .current_dir(dir.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        child.stdin.take().unwrap().write_all(&line).unwrap();
+                        child.wait().unwrap();
+                        false
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy => true,
+                    Err(e) => panic!("hook {i} did not start: {e}"),
+                }
+            })
+            .count();
+
+        stop.store(true, Ordering::Relaxed);
+        for forker in forkers {
+            forker.join().unwrap();
+        }
+        assert_eq!(busy, 0, "hooks of {HOOKS} refused as Text file busy");
     }
 }

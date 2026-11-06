@@ -87,6 +87,16 @@ pub struct Timings {
     pub upload: Duration,
     /// The commit transactions.
     pub commit: Duration,
+    /// Commits the ancestry walks expanded (each a `commit_index` read or a
+    /// read from a pack unless an earlier walk of the push cached it).
+    pub ancestry_commits: u64,
+    /// Object IDs looked up in the dependencies' packs to find which of the
+    /// pushed pack's objects they hold and to check connectivity. With the
+    /// walk of the changed paths (`aspen_pack::changed`) this is about the
+    /// objects the push changed, not every entry of every tree it touched.
+    pub located: u64,
+    /// Tree entries the walk of the changed paths compared.
+    pub changed_entries: u64,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -102,6 +112,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.hook += t.hook;
         self.upload += t.upload;
         self.commit += t.commit;
+        self.ancestry_commits += t.ancestry_commits;
+        self.located += t.located;
+        self.changed_entries += t.changed_entries;
     }
 }
 
@@ -212,6 +225,15 @@ where
         origin: Origin,
     ) -> Result<PushOutcome, ServiceError> {
         let started = Instant::now();
+        // With the merge queue on, clients may also write the queue's
+        // namespace (never its outcome refs, which only the queue writes).
+        let queued;
+        let r = if self.config.merge_queue && origin == Origin::Client {
+            queued = crate::queue::with_queue_writable(r);
+            &queued
+        } else {
+            r
+        };
         let span = tracing::info_span!(
             "push",
             repo = %r.name,
@@ -349,6 +371,7 @@ where
                     scoped_dep: None,
                     search: SearchPacks::default(),
                     pack: None,
+                    entered_trees: Vec::new(),
                     held: Vec::new(),
                     plans: HashMap::new(),
                     planned: Vec::new(),
@@ -503,6 +526,9 @@ struct Push<'a, M, B> {
     /// Closure packs of `trunk_dep` and `scoped_dep`.
     search: SearchPacks,
     pack: Option<PushedPack>,
+    /// Pushed trees the walk of the changed paths entered, by graph
+    /// position: trunk's newest trees once a trunk write commits.
+    entered_trees: Vec<usize>,
     /// Per graph position: the object is in `search`.
     held: Vec<bool>,
     /// Plans by (ref, new tip).
@@ -690,8 +716,9 @@ where
                     .filter_map(|w| Some((w.name == trunk, w.value.closure()?)))
                     .collect();
                 let started = Instant::now();
-                let outcome = meta
-                    .commit_push(&PushCommit {
+                let outcome = self
+                    .svc
+                    .commit_push(PushCommit {
                         repo: self.repo.id,
                         writes,
                     })
@@ -710,6 +737,10 @@ where
                 }
                 match outcome.map_err(store)? {
                     CommitOutcome::Committed(_) => {
+                        self.seed_base_cache().await;
+                        if closures.iter().any(|(is_trunk, _)| *is_trunk) {
+                            self.remember_trunk_trees();
+                        }
                         for (is_trunk, c) in closures {
                             if !is_trunk {
                                 self.svc.metrics.branch_committed(c);
@@ -801,6 +832,34 @@ where
         Ok(())
     }
 
+    /// Keeps the trees a committed trunk write brought, and its commits'
+    /// root trees, for the next push's walk of the changed paths: trunk's
+    /// newest trees ([`super::ReceiveConfig::trunk_tree_cache_bytes`]).
+    fn remember_trunk_trees(&mut self) {
+        let Some(p) = &self.pack else {
+            return;
+        };
+        let g = &p.graph;
+        let cache = &self.svc.trees;
+        for c in g.commits() {
+            let at = g.position(&c.id).expect("a commit of the pack");
+            if let Some(tree) = g
+                .internal_refs(at)
+                .iter()
+                .map(|&r| g.id(r as usize))
+                .chain(g.external_refs(at).iter().copied())
+                .find(|r| !c.parents.contains(r))
+            {
+                cache.insert_root(self.repo.id, c.id, tree);
+            }
+        }
+        for &at in &std::mem::take(&mut self.entered_trees) {
+            if let Some(data) = g.tree_data(at) {
+                cache.insert_tree(self.repo.id, g.id(at), data.clone());
+            }
+        }
+    }
+
     /// Proxy mode: forwards every accepted write to the upstream and keeps
     /// only what it accepted. An update whose upstream value is not Aspen's
     /// is not sent (`UpstreamAhead`); under `--atomic` the hook answers all
@@ -869,7 +928,55 @@ where
     }
 
     /// Tells the push hook which updates of `group` committed.
+    /// Puts the trees this push stored into the base-object cache. The
+    /// next push to the same ref (an agent's next commit, the next trunk
+    /// landing, a pull request branched from the new trunk) sends its trees
+    /// as deltas against these, and resolving them from the stored pack
+    /// costs a blob-store round trip per delta in their chains: about
+    /// 40-80 ms of each landing in the throughput benchmark. Best effort:
+    /// a read that fails only means the next push reads the store.
+    async fn seed_base_cache(&self) {
+        const MAX_TREES: usize = 32;
+        let Some(p) = &self.pack else { return };
+        let trees: Vec<ObjectId> = (0..p.graph.len())
+            .filter(|&at| p.graph.kind(at) == ObjectKind::Tree)
+            .map(|at| p.graph.id(at))
+            .collect();
+        if trees.is_empty() || trees.len() > MAX_TREES {
+            return;
+        }
+        let (pack, idx) = (p.ingested.pack_path.clone(), p.ingested.idx_path.clone());
+        let max = self.config().max_object_bytes;
+        let read = blocking(move || {
+            trees
+                .into_iter()
+                .filter_map(|id| {
+                    aspen_pack::scan::read_object(&pack, &idx, &id, max)
+                        .ok()
+                        .flatten()
+                        .map(|(kind, data)| (id, kind, data))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        if let Ok(objects) = read {
+            for (id, kind, data) in objects {
+                self.svc.packs.remember(id, kind, data);
+            }
+        }
+    }
+
     async fn notify_committed(&self, group: &[usize], verdicts: &[Verdict]) {
+        if self.config().merge_queue
+            && group.iter().any(|&i| {
+                let v = &verdicts[i];
+                v.kind.writes()
+                    && !is_delete(&v.kind)
+                    && v.name.as_str().starts_with(crate::queue::QUEUE_PREFIX)
+            })
+        {
+            self.svc.queue_signal.mark(self.repo.id);
+        }
         let Some(hook) = self.config().hook.clone() else {
             return;
         };
@@ -1263,6 +1370,7 @@ where
         let source = self.commits_source(lazy_roots);
         let answer = walker.is_ancestor(&source, a, d).await;
         drop(source);
+        self.timings.ancestry_commits = walker.expanded();
         self.walker = walker;
         answer.map_err(UnpackError::Store)
     }
@@ -1324,7 +1432,9 @@ where
             ingested.size,
         );
         let (graph, table) = blocking(move || {
-            let graph = PackGraph::scan(&pack_path, &idx_path, scan).map_err(UnpackError::from)?;
+            let graph =
+                PackGraph::scan_keeping_trees(&pack_path, &idx_path, scan, MAX_DIFFED_TREE_BYTES)
+                    .map_err(UnpackError::from)?;
             let layout =
                 |e: aspen_pack::LayoutError| store(local_io(format!("completed pack: {e}")));
             let idx_bytes = std::fs::read(&idx_path).map_err(|e| store(local_io(e)))?;
@@ -1336,15 +1446,76 @@ where
         })
         .await
         .map_err(store)??;
-        // Which of the pack's objects the dependencies already hold:
-        // completion bases, and anything the client sent again.
-        let all = SortedIds::from_unsorted(graph.ids().to_vec());
-        let found = aspen_core::ingest::ObjectLocator::locate(&svc.packs, &self.search, &all)
-            .await
-            .map_err(store)?;
-        self.held = found.iter().map(Option::is_some).collect();
-        // Connectivity: everything the pack references and lacks.
-        aspen_pack::scan::check_connectivity(&svc.packs, &self.search, &graph.missing()).await?;
+        // Which of the pack's objects the dependencies already hold
+        // (completion bases, and anything the client sent again), and what
+        // the pack references and lacks, which must be in the dependencies
+        // (connectivity). The walk of the changed paths answers both for
+        // whatever the push did not change without a lookup; only the rest
+        // is looked up.
+        let known: Vec<ObjectId> = self
+            .trunk_dep
+            .iter()
+            .chain(&self.scoped_dep)
+            .filter_map(|v| v.value.tip())
+            .collect();
+        let mut source = DepTrees {
+            svc,
+            repo: self.repo.id,
+            search: &self.search,
+        };
+        let changed = aspen_pack::changed::changed_paths(
+            aspen_pack::changed::ChangedInput {
+                graph: &graph,
+                known: &known,
+            },
+            &mut source,
+        )
+        .await
+        .map_err(store)?;
+        let missing = match changed {
+            Some(ch) => {
+                self.timings.changed_entries += ch.stats.entries;
+                let mut held = ch.held;
+                for id in ingested.completion_bases.as_slice() {
+                    if let Some(at) = graph.position(id) {
+                        held[at] = true;
+                    }
+                }
+                let rest: Vec<usize> = (0..graph.len()).filter(|&at| !held[at]).collect();
+                let ids = SortedIds::from_unsorted(rest.iter().map(|&at| graph.id(at)).collect());
+                self.timings.located += ids.len() as u64;
+                let found =
+                    aspen_core::ingest::ObjectLocator::locate(&svc.packs, &self.search, &ids)
+                        .await
+                        .map_err(store)?;
+                for (id, f) in ids.as_slice().iter().zip(found) {
+                    if f.is_some() {
+                        held[graph.position(id).expect("a pack object")] = true;
+                    }
+                }
+                let mut check = ch.check;
+                for (at, (&visited, &held)) in ch.visited.iter().zip(&held).enumerate() {
+                    if !visited && !held {
+                        check.extend_from_slice(graph.external_refs(at));
+                    }
+                }
+                self.held = held;
+                self.entered_trees = ch.trees;
+                SortedIds::from_unsorted(check)
+            }
+            None => {
+                let all = SortedIds::from_unsorted(graph.ids().to_vec());
+                self.timings.located += all.len() as u64;
+                let found =
+                    aspen_core::ingest::ObjectLocator::locate(&svc.packs, &self.search, &all)
+                        .await
+                        .map_err(store)?;
+                self.held = found.iter().map(Option::is_some).collect();
+                graph.missing()
+            }
+        };
+        self.timings.located += missing.len() as u64;
+        aspen_pack::scan::check_connectivity(&svc.packs, &self.search, &missing).await?;
         let pos_of_entry = table
             .entries()
             .iter()
@@ -1476,14 +1647,38 @@ where
         // tip. Reachability from a tag is reachability from what it peels
         // to.
         let peeled = self.peel(tip, kind).await?;
-        let mut answers = Vec::with_capacity(dep_versions.len());
-        for d in &dep_versions {
+        // The branch's own dependency is answered first: when its version
+        // is exact and depends on this same trunk version, its tip already
+        // reaches trunk's (an exact closure needs every dependency's tip to
+        // be an ancestor), so a new tip that reaches the branch's reaches
+        // trunk's too. Without this, every push to a branch walked the
+        // branch's whole history since trunk again, one commit lookup per
+        // commit, and a long-lived branch got slower with every push
+        // (bench/throughput).
+        let mut order: Vec<usize> = (0..dep_versions.len()).collect();
+        order.sort_by_key(|&i| dep_versions[i].name == trunk);
+        let mut answered: Vec<Option<Ancestry>> = vec![None; dep_versions.len()];
+        for &i in &order {
+            let d = &dep_versions[i];
             let dt = d.value.tip().expect("live dependency");
-            let a = match peeled {
+            let proven = d.name == trunk
+                && dep_versions.iter().zip(&answered).any(|(s, a)| {
+                    s.name != trunk
+                        && *a == Some(Ancestry::Descendant)
+                        && s.value.closure() == Some(Closure::Exact)
+                        && s.deps.trunk == Some(d.id)
+                });
+            answered[i] = Some(match peeled {
+                _ if proven => Ancestry::Descendant,
                 Some(c) => self.ancestry(dt, c, &[d.id]).await?,
                 // A tree or blob reaches no commit.
                 None => Ancestry::NotDescendant,
-            };
+            });
+        }
+        let mut answers = Vec::with_capacity(dep_versions.len());
+        for (d, a) in dep_versions.iter().zip(answered) {
+            let dt = d.value.tip().expect("live dependency");
+            let a = a.expect("every dependency answered");
             answers.push((d.value, Some(AncestryAnswer::new(dt, tip, a))));
         }
         let closure = Closure::of_new_version(tip, true, answers.iter().map(|(v, a)| (v, *a)))
@@ -2134,12 +2329,7 @@ where
         // blob deletion can remove what is uploaded here (issue #48). An
         // existing row is uploaded to as well: its writer may have died
         // before uploading, and the bytes are the same.
-        let record = self
-            .svc
-            .meta
-            .register_pack(&new_pack)
-            .await
-            .map_err(store)?;
+        let record = self.svc.register_pack(&new_pack).await.map_err(store)?;
         let keys = record.keys();
         let blobs = &self.svc.blobs;
         let (a, b, c) = futures_util::future::join3(
@@ -2187,6 +2377,129 @@ fn keep_flags(p: &PushedPack, members: &[bool], held: Option<&[bool]>) -> Vec<bo
         }
     }
     keep
+}
+
+/// Most bytes of pushed trees kept in memory for the walk of the changed
+/// paths. A push whose trees add up to more (an import of a large tree)
+/// looks up every object it references instead, as before the walk.
+const MAX_DIFFED_TREE_BYTES: u64 = 16 << 20;
+
+/// Most bytes one read of old trees (or commits, for their root trees) for
+/// that walk may hold; over it, those trees count as unreadable and the
+/// walk looks up their entries instead.
+const OLD_TREE_READ_BYTES: u64 = 16 << 20;
+
+/// The dependencies' trees, for the walk of the changed paths: from trunk's
+/// newest trees in memory, else read from the push's search packs (and
+/// then kept in memory).
+struct DepTrees<'a, M, B> {
+    svc: &'a ReceivePack<M, B>,
+    repo: aspen_core::id::RepoId,
+    search: &'a SearchPacks,
+}
+
+impl<M, B> DepTrees<'_, M, B>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    /// Reads objects of `kind` from the search packs; `None` for one they
+    /// lack, of another kind, or over the read budget.
+    async fn read(
+        &self,
+        ids: &[ObjectId],
+        kind: ObjectKind,
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let wanted = aspen_core::ingest::CandidateBases(SortedIds::from_unsorted(ids.to_vec()));
+        let bases = match self
+            .svc
+            .packs
+            .prefetch_bases_within(self.search, &wanted, OLD_TREE_READ_BYTES)
+            .await
+        {
+            Ok((p, _)) => p.bases,
+            Err(PrefetchError::OverBudget { .. }) => return Ok(vec![None; ids.len()]),
+            Err(PrefetchError::Store(e)) => return Err(e),
+        };
+        let mut buf = Vec::new();
+        ids.iter()
+            .map(|id| {
+                Ok(match bases.find_base(id, &mut buf)? {
+                    Some(k) if k == kind => Some(buf.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+}
+
+impl<M, B> aspen_pack::changed::OldTrees for DepTrees<'_, M, B>
+where
+    M: MetaStore + Clone + 'static,
+    B: BlobStore + Clone + 'static,
+{
+    async fn trees(&mut self, ids: &[ObjectId]) -> Result<Vec<Option<Arc<[u8]>>>, StoreError> {
+        let cache = &self.svc.trees;
+        let mut out: Vec<Option<Arc<[u8]>>> =
+            ids.iter().map(|id| cache.tree(self.repo, id)).collect();
+        let misses: Vec<ObjectId> = ids
+            .iter()
+            .zip(&out)
+            .filter(|(_, o)| o.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let read = self.read(&misses, ObjectKind::Tree).await?;
+        let read: HashMap<ObjectId, Arc<[u8]>> = misses
+            .into_iter()
+            .zip(read)
+            .filter_map(|(id, d)| Some((id, Arc::<[u8]>::from(d?))))
+            .collect();
+        for (id, o) in ids.iter().zip(out.iter_mut()) {
+            if o.is_none()
+                && let Some(d) = read.get(id)
+            {
+                cache.insert_tree(self.repo, *id, d.clone());
+                *o = Some(d.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn commit_trees(
+        &mut self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectId>>, StoreError> {
+        let cache = &self.svc.trees;
+        let mut out: Vec<Option<ObjectId>> =
+            ids.iter().map(|id| cache.root(self.repo, id)).collect();
+        let misses: Vec<ObjectId> = ids
+            .iter()
+            .zip(&out)
+            .filter(|(_, o)| o.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let read = self.read(&misses, ObjectKind::Commit).await?;
+        let read: HashMap<ObjectId, ObjectId> = misses
+            .into_iter()
+            .zip(read)
+            .filter_map(|(id, d)| Some((id, aspen_pack::scan::commit_tree(&d?).ok()?)))
+            .collect();
+        for (id, o) in ids.iter().zip(out.iter_mut()) {
+            if o.is_none()
+                && let Some(t) = read.get(id)
+            {
+                cache.insert_root(self.repo, *id, *t);
+                *o = Some(*t);
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn set(report: &mut ReportStatus, name: &RefName, status: RefStatus) {

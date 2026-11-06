@@ -29,6 +29,10 @@ pub struct WorkerOptions {
     pub idle_poll: Duration,
     /// Time between garbage-collection sweeps.
     pub gc_every: Duration,
+    /// Whether this worker runs the sweeps. An instance running several
+    /// workers lets one sweep: a sweep is safe on any number of workers,
+    /// but more of them in one process only repeat the work.
+    pub collect_garbage: bool,
 }
 
 impl WorkerOptions {
@@ -39,6 +43,7 @@ impl WorkerOptions {
             lease: Duration::from_secs(600),
             idle_poll: Duration::from_secs(5),
             gc_every: Duration::from_secs(300),
+            collect_garbage: true,
         }
     }
 }
@@ -281,7 +286,9 @@ where
         tokio::pin!(shutdown);
         let mut last_gc: Option<Instant> = None;
         loop {
-            if last_gc.is_none_or(|t| t.elapsed() >= self.options.gc_every) {
+            if self.options.collect_garbage
+                && last_gc.is_none_or(|t| t.elapsed() >= self.options.gc_every)
+            {
                 if let Err(e) = self.collect_garbage().await {
                     on_error(&e);
                 }

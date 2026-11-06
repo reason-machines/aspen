@@ -129,6 +129,35 @@ variable "desired_count" {
   default     = 1
 }
 
+variable "compactor_count" {
+  description = "Tasks of a separate compaction service running `aspen serve` with ASPEN_ROLE=compact: compaction, commit indexing and garbage collection, scaled apart from the Git tasks, which then run ASPEN_ROLE=serve (deploy/README.md, \"Process roles\"). 0 (the default) runs the background worker in every Git task (ASPEN_ROLE=all). Ignored while container_image is unset. Scale it on the aspen_compaction_backlog metric."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.compactor_count >= 0 && floor(var.compactor_count) == var.compactor_count
+    error_message = "compactor_count must be a whole number, 0 or more."
+  }
+}
+
+variable "compactor_cpu" {
+  description = "Fargate CPU units per compaction task."
+  type        = number
+  default     = 1024
+}
+
+variable "compactor_memory" {
+  description = "Fargate memory per compaction task in MiB."
+  type        = number
+  default     = 2048
+}
+
+variable "compactor_environment" {
+  description = "Extra or overriding environment for the compaction tasks only, such as ASPEN_COMPACT_WORKERS. container_environment is not applied to them: it may hold Git-only settings a compaction task refuses."
+  type        = map(string)
+  default     = {}
+}
+
 variable "fargate_spot" {
   description = "Run tasks on Fargate Spot (about 70% cheaper, can be interrupted with two minutes' notice)."
   type        = bool

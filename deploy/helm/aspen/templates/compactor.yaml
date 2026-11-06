@@ -1,0 +1,132 @@
+{{- if .Values.compactor.enabled }}
+# The background worker on its own (ASPEN_ROLE=compact): compaction, commit
+# indexing and garbage collection, sharing the database and bucket with the
+# server pods, which then run ASPEN_ROLE=serve. No Git and no Service: it
+# answers health checks on 7070 and serves metrics on the metrics port.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aspen.fullname" . }}-compactor
+  labels:
+    {{- include "aspen.labels" . | nindent 4 }}
+    app.kubernetes.io/component: compactor
+spec:
+  replicas: {{ .Values.compactor.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aspen.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: compactor
+  template:
+    metadata:
+      labels:
+        {{- include "aspen.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: compactor
+      annotations:
+        {{- if .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /-/metrics
+        {{- end }}
+        {{- with .Values.compactor.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "aspen.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # A job cut short is reclaimed after its lease and redone.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aspen
+          image: {{ include "aspen.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 7070
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          env:
+            - name: ASPEN_ROLE
+              value: compact
+            - name: ASPEN_COMPACT_WORKERS
+              value: {{ .Values.compaction.workers | int64 | quote }}
+            - name: ASPEN_LISTEN
+              value: "0.0.0.0:7070"
+            - name: ASPEN_METRICS_LISTEN
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            - name: DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.passwordSecret.name | quote }}
+                  key: {{ .Values.database.passwordSecret.key | quote }}
+            {{- include "aspen.blobEnv" . | nindent 12 }}
+            - name: ASPEN_SPOOL_DIR
+              value: /var/lib/aspen/spool
+            # Compaction verifies packs against the same object limits as
+            # pushes.
+            - name: ASPEN_MAX_OBJECT_BYTES
+              value: {{ .Values.push.maxObjectBytes | int64 | quote }}
+            - name: ASPEN_MAX_INFLATED_BYTES
+              value: {{ .Values.push.maxInflatedBytes | int64 | quote }}
+            {{- with .Values.compactor.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.compactor.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: spool
+              mountPath: /var/lib/aspen/spool
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        # Node disk, never memory (repacks mmap whole packs).
+        - name: spool
+          emptyDir:
+            sizeLimit: {{ .Values.compactor.spoolSizeLimit }}
+      {{- with .Values.compactor.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compactor.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compactor.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -9,7 +9,7 @@ info:
     `docs/TILES.md` for the exact format and push rules). Visitors paint
     through this API; anyone can also clone the repository and `git push`.
     Both paths produce the same thing: a commit on the pusher's own branch.
-    A merger bot folds every branch into `main` every few seconds.
+    A merger bot folds every branch into `main`.
 
     This document is the contract between the web front end in `demo/place`
     and the back end (plan node C7). The mock in `demo/place/mock` implements
@@ -66,6 +66,33 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CanvasSnapshot" }
+  /canvas.svg:
+    get:
+      tags: [canvas]
+      operationId: getCanvasImage
+      summary: Main's tiles as an image, for READMEs and links.
+      description: |
+        A pixel-crisp SVG of `main` (unpainted tiles as a faint checker),
+        rendered once per `main` commit and served from memory. It is
+        `Cache-Control: no-cache` with `main`'s commit as the ETag, so caches
+        such as GitHub's image proxy revalidate on every view and show the
+        canvas as it is; a matching `If-None-Match` gets 304.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: The canvas.
+          headers:
+            ETag: { schema: { type: string } }
+            Cache-Control: { schema: { type: string, const: "no-cache, max-age=0" } }
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        "304":
+          description: Main has not moved since the ETag sent.
   /branches:
     get:
       tags: [canvas]

@@ -54,6 +54,7 @@ pub mod fuzzing;
 pub mod listen;
 pub mod metrics;
 pub mod mirror;
+pub mod queue;
 pub mod receive;
 pub mod ssh;
 #[cfg(feature = "testing")]
@@ -233,6 +234,8 @@ struct Inner<M, B> {
     /// access layer, whose fallback counters join `/-/metrics`.
     client_addr: std::sync::OnceLock<access::ClientAddr>,
     shallow_cache: Option<upload_pack::exact::ShallowCache<M, B>>,
+    /// Fetches' compaction heat, written to the job queue in batches.
+    heat: upload_pack::heat::HeatNotes,
 }
 
 impl<M, B> Server<M, B>
@@ -240,6 +243,25 @@ where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
 {
+    /// Records one served fetch's compaction heat and, when a write is due
+    /// ([`upload_pack::heat::HEAT_FLUSH_EVERY`]), writes what this process
+    /// summed from a spawned task, off the fetch's path.
+    pub(crate) fn note_compaction_heat(&self, heat: Vec<aspen_core::meta::CompactionHeat>) {
+        let versions: u64 = heat.iter().map(|h| h.heat).sum();
+        self.inner.metrics.uncompacted_versions(versions);
+        let Some(due) = self.inner.heat.add(heat) else {
+            return;
+        };
+        let server = self.clone();
+        tokio::spawn(async move {
+            let inner = &server.inner;
+            if let Err(e) = upload_pack::heat::write(&inner.meta, &inner.heat, due).await {
+                inner.metrics.heat_write_failure();
+                tracing::warn!(error = %e, "recording compaction heat failed");
+            }
+        });
+    }
+
     /// A server over these stores.
     pub fn new(meta: M, blobs: B, config: ServerConfig) -> Self {
         let objects = StoredPacks::new(
@@ -270,6 +292,7 @@ where
                 mirror_metrics: None,
                 client_addr: std::sync::OnceLock::new(),
                 shallow_cache,
+                heat: upload_pack::heat::HeatNotes::default(),
             }),
         }
     }

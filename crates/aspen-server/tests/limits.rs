@@ -48,6 +48,40 @@ async fn a_push_whose_bases_exceed_the_budget_is_refused_for_good() {
     assert_eq!(s.stored_pack_files(), 1, "nothing new is stored");
 }
 
+/// A push whose bases need more than the floor each push reserves first
+/// still lands: its slot grows to the full per-push budget and reads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_whose_bases_exceed_the_floor_grows_its_slot() {
+    // The blob is about 200 KB: over a 64 KiB floor, within the budget.
+    let s = Server::start_with(
+        |c| {
+            c.prefetch_floor_bytes = 64 * 1024;
+            c.locate.max_prefetch_bytes = 32 * MIB;
+            c.prefetch_memory_bytes = 64 * MIB;
+        },
+        Default::default(),
+    )
+    .await;
+    assert_eq!(s.svc.prefetch_slots(), 64, "64 MiB in 1 MiB floors");
+    let w = s.clone_dir("w");
+    let content = big("x");
+    w.commit("big.txt", &content, "one");
+    assert!(push(&w, &s.url(), &["main"]).await.0);
+    assert_eq!(
+        s.svc.prefetch_escalations(),
+        0,
+        "a full push needs no bases"
+    );
+    w.commit("big.txt", &format!("{content}tail\n"), "two");
+    let (ok, out) = push(&w, &s.url(), &["main"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        s.live("refs/heads/main").await.value.tip(),
+        Some(oid(&w.rev("HEAD")))
+    );
+    assert!(s.svc.prefetch_escalations() >= 1, "the slot grew");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_gate_shares_one_budget_across_concurrent_pushes() {
     // A shared budget equal to one push's budget: one push at a time in

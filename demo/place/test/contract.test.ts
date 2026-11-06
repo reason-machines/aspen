@@ -75,6 +75,18 @@ describe('the mock conforms to api/openapi.yaml', () => {
   it('every endpoint and error status', async () => {
     await expectConforms('GET', '/config', undefined, undefined, 200);
     await expectConforms('GET', '/canvas', undefined, undefined, 200);
+    {
+      const svg = await fetch(`${h.baseUrl}/canvas.svg`);
+      expect(spec.paths['/canvas.svg']?.get).toBeDefined();
+      expect(svg.status).toBe(200);
+      expect(svg.headers.get('content-type')).toBe('image/svg+xml');
+      expect(svg.headers.get('cache-control')).toBe('no-cache, max-age=0');
+      expect(await svg.text()).toMatch(/^<svg [^>]*shape-rendering="crispEdges"/);
+      const etag = svg.headers.get('etag') ?? '';
+      expect(etag).toMatch(/^"[0-9a-f]{40}"$/);
+      const again = await fetch(`${h.baseUrl}/canvas.svg`, { headers: { 'If-None-Match': etag } });
+      expect([200, 304]).toContain(again.status);
+    }
     await expectConforms('GET', '/swarm', undefined, undefined, 200);
 
     const s = (await expectConforms('POST', '/sessions', undefined, undefined, 201)).json as {

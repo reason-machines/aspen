@@ -156,11 +156,21 @@ impl Injector for PartlyIdle {
     }
 }
 
+/// The epoch waits for the idle part past its minimum, up to
+/// [`RunConfig::fault_coverage_limit`], then fails the run. The limit is a
+/// few seconds here, not the default 5 minutes, so the required `test` job
+/// stays fast; the wait itself is what is checked.
 #[test]
 fn a_part_that_never_injects_fails_the_run() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = config("partly-idle", dir.path());
+    let mut cfg = config("partly-idle", dir.path());
+    cfg.fault_coverage_limit = Duration::from_secs(4);
+    let started = Instant::now();
     let report = run_stock(&cfg, Some(&mut PartlyIdle));
+    assert!(
+        started.elapsed() >= cfg.fault_coverage_limit,
+        "the epoch waited for the idle part until the coverage limit"
+    );
     assert!(report.get("fault: the part that works") > 0, "{report}");
     assert!(
         report

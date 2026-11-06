@@ -61,6 +61,8 @@ pub(crate) struct Walker {
     known: HashMap<ObjectId, Lookup>,
     /// Most commits one question may expand.
     budget: usize,
+    /// Commits expanded by every question so far.
+    expanded: u64,
 }
 
 impl Walker {
@@ -68,7 +70,13 @@ impl Walker {
         Self {
             known: HashMap::new(),
             budget,
+            expanded: 0,
         }
+    }
+
+    /// Commits expanded by every question this walker answered.
+    pub(crate) fn expanded(&self) -> u64 {
+        self.expanded
     }
 
     /// Seeds the cache with commits known without a lookup (the pushed
@@ -147,6 +155,7 @@ impl Walker {
                 b_only -= 1;
             }
             expanded += 1;
+            self.expanded += 1;
             if expanded > self.budget {
                 return Ok(Ancestry::Undecided);
             }

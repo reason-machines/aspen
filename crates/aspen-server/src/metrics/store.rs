@@ -113,7 +113,7 @@ fn write(out: &mut String, state: &State, failures: u64) {
     expo::gauge(
         out,
         "aspen_meta_stats_up",
-        "1 if the last read of the database gauges (aspen_jobs, aspen_trunk_repos) succeeded; they keep their last values while it is 0.",
+        "1 if the last read of the database gauges (aspen_jobs, aspen_compaction_backlog, aspen_trunk_repos) succeeded; they keep their last values while it is 0.",
         if state.up { 1.0 } else { 0.0 },
     );
     expo::counter(
@@ -169,6 +169,18 @@ fn write(out: &mut String, state: &State, failures: u64) {
             let lag = earliest.map_or(0, |t| snap.at_micros.saturating_sub(t.0).max(0));
             (vec![("kind", k.as_str())], lag as f64 / 1e6)
         }),
+    );
+    // The compaction backlog: compact jobs waiting or running. Each one is
+    // a cover (or a few, at higher levels) not built yet, so fetches of
+    // those versions send one pack per version instead of one per cover.
+    // Under a steady push rate it stays flat when compaction keeps up and
+    // grows when it does not (docs/OBSERVABILITY.md, "Compaction backlog").
+    expo::gauge(
+        out,
+        "aspen_compaction_backlog",
+        "Compact jobs not done: queued (due or backing off) plus running. Flat under steady pushes when compaction keeps up; growing means add compaction workers (ASPEN_COMPACT_WORKERS, or more ASPEN_ROLE=compact instances).",
+        (count(JobTag::Compact, OpenJobState::Queued)
+            + count(JobTag::Compact, OpenJobState::Running)) as f64,
     );
     expo::family(
         out,

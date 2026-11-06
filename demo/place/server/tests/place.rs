@@ -1476,3 +1476,298 @@ async fn ambient_strokes_merge_rarely_and_their_branches_go_once_merged() {
     let _ = stop.send(());
     run.await.unwrap();
 }
+
+/// An operator can replace `main`'s history with one root commit holding
+/// the same canvas: the picture is unchanged, merged branches (which hold
+/// the old history) are deleted, a fresh clone has one commit and passes
+/// `fsck`, and painting carries on on top of the new root. Everyone else is
+/// refused. The public demo's `main` grew to thousands of whole-tree
+/// commits before its growth was bounded, and a full clone took minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_resets_main_history_to_one_commit_with_the_same_canvas() {
+    let app = App::start(|_| {}).await;
+    let w = app.clone_work("ada").await;
+    for (i, color) in [RED, BLUE, YELLOW].into_iter().enumerate() {
+        w.paint(&[(i as u32, 1, color)], "stroke");
+        assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+        app.place.merge_once().await.unwrap().unwrap();
+    }
+    // One more stroke, still pending: the reset merges it first.
+    w.paint(&[(9, 9, RED)], "pending");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    let before = app.get("/api/v1/canvas").await;
+
+    let r = app
+        .http("POST", "/api/v1/admin/reset-history", &[], None)
+        .await;
+    assert_eq!(r.status, 403);
+    let operator = format!("Bearer {}", app.token("ops", &["admin:canvas"]));
+    let r = app
+        .http(
+            "POST",
+            "/api/v1/admin/reset-history",
+            &[("Authorization", &operator)],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let root = r.json()["commit"].as_str().unwrap().to_owned();
+    assert_eq!(app.tip("refs/heads/main").await.as_deref(), Some(&root[..]));
+    assert_eq!(
+        app.tip("refs/heads/paint/ada").await,
+        None,
+        "merged branches go"
+    );
+
+    // The same picture, with the pending stroke merged (16 x 16 canvas).
+    let after = app.get("/api/v1/canvas").await;
+    let (before, after) = (
+        before["pixels"].as_str().unwrap().to_owned(),
+        after["pixels"].as_str().unwrap().to_owned(),
+    );
+    let pending = 9 * 16 + 9;
+    assert_eq!(&before[pending..=pending], ".");
+    assert_ne!(&after[pending..=pending], ".");
+    assert_eq!(before[..pending], after[..pending]);
+    assert_eq!(before[pending + 1..], after[pending + 1..]);
+    let check = app.clone_work("check").await;
+    assert_eq!(check.git(&["rev-list", "--count", "--all"]).trim(), "1");
+    check.git(&["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(
+        std::fs::read(check.path.join("tiles/9_9.txt")).unwrap(),
+        format!("{RED}\n").as_bytes()
+    );
+    assert!(check.path.join("README.md").exists());
+
+    // Painting carries on from the new root.
+    check.paint(&[(3, 3, BLUE)], "after");
+    assert!(
+        check
+            .push(&[&app.url(), "HEAD:refs/heads/paint/bob"])
+            .await
+            .0
+    );
+    app.place.merge_once().await.unwrap().unwrap();
+    let again = app.clone_work("again").await;
+    assert_eq!(again.git(&["rev-list", "--count", "HEAD"]).trim(), "2");
+    assert_eq!(
+        again.git(&["rev-list", "--max-parents=0", "HEAD"]).trim(),
+        root
+    );
+}
+
+/// The canvas's README names where `main` is mirrored and says pushes are
+/// public; a restart with other settings rewrites it in one commit on
+/// `main` that leaves the tiles alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_readme_names_the_mirror_and_follows_the_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let app = App::start_in(path.clone(), None, |_| {}).await;
+    let w = app.clone_work("a").await;
+    let readme = std::fs::read_to_string(w.path.join("README.md")).unwrap();
+    assert!(readme.contains("Pushes are public"), "{readme}");
+    assert!(readme.contains("/api/v1/canvas.svg)"), "{readme}");
+    assert!(!readme.contains("read-only mirror"), "{readme}");
+    w.paint(&[(1, 1, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    app.place.merge_once().await.unwrap().unwrap();
+    let before = app.tip("refs/heads/main").await.unwrap();
+    drop(app);
+
+    let app = App::start_in(path, Some(dir), |c| {
+        c.mirror_url = Some("https://github.com/example/place-canvas".into());
+    })
+    .await;
+    let w = app.clone_work("b").await;
+    let readme = std::fs::read_to_string(w.path.join("README.md")).unwrap();
+    assert!(
+        readme.contains("This repository is a read-only mirror of `main`."),
+        "{readme}"
+    );
+    assert_eq!(
+        w.git(&["rev-parse", "HEAD^"]).trim(),
+        before,
+        "one commit on top of main"
+    );
+    assert_eq!(
+        w.git(&["diff", "--name-only", "HEAD^", "HEAD"]).trim(),
+        "README.md"
+    );
+    assert_eq!(
+        std::fs::read(w.path.join("tiles/1_1.txt")).unwrap(),
+        format!("{RED}\n").as_bytes()
+    );
+}
+
+/// `GET /api/v1/canvas.svg` is `main`'s tiles as an SVG for READMEs: `no-cache`
+/// with `main`'s commit as the ETag (so GitHub's image proxy revalidates
+/// and a README shows the live canvas), 304 for a matching
+/// `If-None-Match`, and a new image once a merge moves `main`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_canvas_svg_follows_main_and_revalidates_by_etag() {
+    let app = App::start(|_| {}).await;
+    let r = app.http("GET", "/api/v1/canvas.svg", &[], None).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("image/svg+xml"));
+    assert_eq!(r.header("cache-control"), Some("no-cache, max-age=0"));
+    let main = app.tip("refs/heads/main").await.unwrap();
+    let etag = format!("\"{main}\"");
+    assert_eq!(r.header("etag"), Some(&etag[..]));
+    assert!(r.text().starts_with("<svg "), "{}", r.text());
+    assert!(!r.text().contains("<path"), "nothing painted yet");
+
+    let r = app
+        .http(
+            "GET",
+            "/api/v1/canvas.svg",
+            &[("If-None-Match", &etag)],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 304);
+    assert_eq!(r.header("etag"), Some(&etag[..]));
+
+    let w = app.clone_work("w").await;
+    w.paint(&[(2, 3, RED)], "p");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    app.place.merge_once().await.unwrap().unwrap();
+    let r = app
+        .http(
+            "GET",
+            "/api/v1/canvas.svg",
+            &[("If-None-Match", &etag)],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "main moved");
+    assert_ne!(r.header("etag"), Some(&etag[..]));
+    assert!(
+        r.text()
+            .contains(&format!(r#"<path fill="{RED}" d="M2 3h1v1h-1z"/>"#)),
+        "{}",
+        r.text()
+    );
+}
+
+/// Ambient agents paint whole sprites from `place::sprites`, not noise:
+/// with one agent and a quick merge, `main` ends up holding exactly one
+/// sprite's tiles, and never inside a keep area.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ambient_agent_paints_one_whole_sprite() {
+    let app = App::start(|c| {
+        c.rules.width = 32;
+        c.rules.height = 32;
+        c.ambient_agents = 1;
+        c.ambient_interval = Duration::from_millis(40);
+        c.ambient_sprite_pause = Duration::from_secs(3600);
+        c.merge_interval = Duration::from_millis(50);
+        c.ambient_merge_interval = Duration::from_millis(0);
+        c.keep_areas = vec![(0, 0, 32, 10)];
+    })
+    .await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+    let palette = aspen_place::rules::default_palette();
+    let mut found = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snap = app.get("/api/v1/canvas").await;
+        let pixels = snap["pixels"].as_str().unwrap().to_owned();
+        let painted: Vec<(u32, u32, u8)> = pixels
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c != '.')
+            .map(|(i, c)| {
+                (
+                    (i % 32) as u32,
+                    (i / 32) as u32,
+                    c.to_digit(36).unwrap() as u8,
+                )
+            })
+            .collect();
+        if painted.is_empty() {
+            continue;
+        }
+        let x0 = painted.iter().map(|p| p.0).min().unwrap();
+        let y0 = painted.iter().map(|p| p.1).min().unwrap();
+        let mut got: Vec<(u32, u32, u8)> = painted.clone();
+        got.sort();
+        for s in aspen_place::sprites::SPRITES {
+            for v in 0..s.variants.len() {
+                let mut want: Vec<(u32, u32, u8)> = s
+                    .tiles(v, x0, y0, &palette)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| (t.x, t.y, t.color))
+                    .collect();
+                want.sort();
+                if want == got {
+                    found = Some((s.name, y0));
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let (name, y0) = found.expect("main holds exactly one whole sprite");
+    assert!(y0 >= 10, "{name} was painted inside the keep area");
+    let _ = stop.send(());
+    run.await.unwrap();
+}
+
+/// Merge commits record which tiles people and ambient sprites painted,
+/// and a restarted server rebuilds its memory of recent paint from them,
+/// so ambient agents keep clear of that work after every deploy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_memory_of_recent_paint_survives_a_restart() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let app = App::start_in(path.clone(), None, |_| {}).await;
+    let w = app.clone_work("w").await;
+    w.paint(&[(2, 3, RED), (4, 5, BLUE)], "people");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    app.place
+        .paint(
+            "agent/wren-12",
+            Actor::agent("agent/wren-12"),
+            &[Tile {
+                x: 9,
+                y: 9,
+                color: 3,
+            }],
+            "Ambient sprite",
+        )
+        .await
+        .unwrap();
+    app.place.merge_once().await.unwrap().unwrap();
+    let head = w.git(&["ls-remote", &app.url(), "refs/heads/main"]);
+    assert!(!head.is_empty());
+    drop(app);
+
+    let app = App::start_in(path, Some(dir), |_| {}).await;
+    let empty = app
+        .place
+        .with_state(|s| s.human_tiles.is_empty() && s.sprite_tiles.is_empty());
+    assert!(empty, "a fresh start remembers nothing");
+    app.place.rebuild_memory().await.unwrap();
+    let (people, sprites) = app.place.with_state(|s| {
+        let mut p: Vec<usize> = s.human_tiles.keys().copied().collect();
+        let mut q: Vec<usize> = s.sprite_tiles.keys().copied().collect();
+        p.sort();
+        q.sort();
+        (p, q)
+    });
+    assert_eq!(people, vec![3 * 16 + 2, 5 * 16 + 4]);
+    assert_eq!(sprites, vec![9 * 16 + 9]);
+    let check = app.clone_work("check").await;
+    let msg = check.git(&["log", "-1", "--format=%B", "HEAD"]);
+    assert!(msg.contains("People-tiles: 2,3 4,5"), "{msg}");
+    assert!(msg.contains("Sprite-tiles: 9,9"), "{msg}");
+}

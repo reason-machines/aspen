@@ -93,6 +93,11 @@ spec:
               value: {{ include "aspen.trustedProxyHops" . | quote }}
             - name: ASPEN_SPOOL_DIR
               value: /var/lib/aspen/spool
+            # With the compactor Deployment, these pods serve Git only.
+            - name: ASPEN_ROLE
+              value: {{ ternary "serve" "all" .Values.compactor.enabled | quote }}
+            - name: ASPEN_COMPACT_WORKERS
+              value: {{ .Values.compaction.workers | int64 | quote }}
             - name: ASPEN_PACKFILE_URIS
               value: {{ .Values.packfileUris | toString | quote }}
             - name: ASPEN_MAX_OBJECT_BYTES

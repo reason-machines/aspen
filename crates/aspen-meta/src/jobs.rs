@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aspen_core::error::StoreError;
 use aspen_core::id::JobId;
-use aspen_core::meta::{Job, JobEvent, JobState, JobTag, NewJob};
+use aspen_core::meta::{CompactionHeat, Job, JobEvent, JobState, JobTag, MAX_JOB_HEAT, NewJob};
 use sqlx::AssertSqlSafe;
 
 use crate::error::{conflict, store_error};
@@ -120,9 +120,10 @@ async fn write_transition(
 }
 
 /// [`aspen_core::meta::MetaStore::claim_job`]: the due job with the
-/// earliest due time (a queued job's `run_after`, or an expired lease's
-/// end), ties broken by job ID. A reclaim that [`Job::apply`] parks as dead
-/// is written and skipped.
+/// highest priority (fetch heat, [`add_heat`]), then the earliest due time
+/// (a queued job's `run_after`, or an expired lease's end), ties broken by
+/// job ID. A reclaim that [`Job::apply`] parks as dead is written and
+/// skipped.
 pub(crate) async fn claim(
     store: &SqlStore,
     tags: &[JobTag],
@@ -135,14 +136,14 @@ pub(crate) async fn claim(
     let kinds = placeholders(2, tags.len());
     let lock = store.skip_locked();
     let queued = format!(
-        "SELECT {JOB_COLS}, run_after_us AS due FROM jobs \
+        "SELECT {JOB_COLS}, priority, run_after_us AS due FROM jobs \
          WHERE state = 'queued' AND run_after_us <= $1 AND kind IN ({kinds}) \
-         ORDER BY run_after_us, id LIMIT 1{lock}"
+         ORDER BY priority DESC, run_after_us, id LIMIT 1{lock}"
     );
     let expired = format!(
-        "SELECT {JOB_COLS}, lease_expires_us AS due FROM jobs \
+        "SELECT {JOB_COLS}, priority, lease_expires_us AS due FROM jobs \
          WHERE state = 'running' AND lease_expires_us <= $1 AND kind IN ({kinds}) \
-         ORDER BY lease_expires_us, id LIMIT 1{lock}"
+         ORDER BY priority DESC, lease_expires_us, id LIMIT 1{lock}"
     );
     store
         .write(async |tx| {
@@ -175,7 +176,7 @@ async fn claim_in(
         // both states could lock just one row, but it would have to sort
         // every due job by a computed due time instead of reading the first
         // entry of each state's index, on every claim.
-        let mut best: Option<(i64, Job)> = None;
+        let mut best: Option<((std::cmp::Reverse<i64>, i64), Job)> = None;
         for sql in queries {
             let mut q = sqlx::query(AssertSqlSafe(sql.clone())).bind(now.0);
             for t in tags {
@@ -183,13 +184,15 @@ async fn claim_in(
             }
             if let Some(row) = q.fetch_optional(&mut *conn).await.map_err(store_error)? {
                 let due: i64 = rows::get(&row, "due")?;
+                let priority: i64 = rows::get(&row, "priority")?;
+                let key = (std::cmp::Reverse(priority), due);
                 let job = rows::job(&row)?;
                 let better = match &best {
                     None => true,
-                    Some((d, j)) => (due, job.id) < (*d, j.id),
+                    Some((k, j)) => (key, job.id) < (*k, j.id),
                 };
                 if better {
-                    best = Some((due, job));
+                    best = Some((key, job));
                 }
             }
         }
@@ -211,6 +214,45 @@ async fn claim_in(
             return Ok(Some(next));
         }
     }
+}
+
+/// [`aspen_core::meta::MetaStore::add_compaction_heat`]: one update per
+/// entry, in one transaction. Each scans the repository's queued jobs (the
+/// backlog, not the ref's history) and checks each `compact` job's version
+/// by its primary key.
+pub(crate) async fn add_heat(store: &SqlStore, heat: &[CompactionHeat]) -> Result<u64, StoreError> {
+    if heat.is_empty() {
+        return Ok(0);
+    }
+    let max = i64::try_from(MAX_JOB_HEAT).expect("MAX_JOB_HEAT fits i64");
+    store
+        .write(async |tx| {
+            let mut raised = 0;
+            for h in heat {
+                let add = i64::try_from(h.heat.min(MAX_JOB_HEAT)).expect("at most MAX_JOB_HEAT");
+                if add == 0 {
+                    continue;
+                }
+                let done = sqlx::query(
+                    "UPDATE jobs SET priority = \
+                     CASE WHEN priority > $1 - $2 THEN $1 ELSE priority + $2 END \
+                     WHERE state = 'queued' AND kind = 'compact' AND repo_id = $3 \
+                     AND EXISTS (SELECT 1 FROM ref_versions v WHERE v.id = jobs.ref_version_id \
+                     AND v.ref_name = $4 AND v.seq >= $5)",
+                )
+                .bind(max)
+                .bind(add)
+                .bind(h.repo.get())
+                .bind(h.name.as_str().to_owned())
+                .bind(h.from.to_db())
+                .execute(&mut **tx)
+                .await
+                .map_err(store_error)?;
+                raised += done.rows_affected();
+            }
+            Ok(raised)
+        })
+        .await
 }
 
 async fn locked_job(

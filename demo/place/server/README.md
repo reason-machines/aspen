@@ -26,7 +26,12 @@ simulated agents.
   update gets a number from one counter, and enters the event backlog and
   the live stream in one step, so `GET /canvas`, `GET /events?after=<seq>`
   and push responses always line up.
-- **Agents.** Ambient agents paint a stroke every few seconds each. The
+- **Agents.** Ambient agents paint small pixel sprites (a heart, a star, a
+  rocket…, `src/sprites.rs`), one at a time, where they cover nothing people
+  or other sprites painted in the last six hours, and stop when the canvas
+  has no such room. Merge commits record which tiles people and sprites
+  painted (`People-tiles:` and `Sprite-tiles:` trailers), and a restarted
+  server rebuilds that memory from `main`. The
   "Unleash 1,000 agents" swarm is one global run with server-side limits:
   `maxAgents`, `pushesPerSecondCap`, run length, cooldown and starts per
   client address apply whatever a client sends. A start checks the kill
@@ -45,6 +50,14 @@ simulated agents.
   credential: an Aspen API token or OIDC token with an `admin` grant on the
   canvas repository. Engaging it ends a running swarm at once, refuses new
   starts, and pauses the ambient agents.
+
+- **Reset history.** `POST /api/v1/admin/reset-history` (operator
+  credential, no body) merges what is pending, force-updates `main` to one
+  root commit holding the canvas as it is, and deletes every merged branch,
+  so a full clone fetches one commit. The picture does not change; earlier
+  clones see a forced update; garbage collection then deletes the packs only
+  the old history reached. It is an operator tool outside the page's API
+  contract: take a `git bundle` of the canvas first if the history matters.
 
 Branch namespaces `visitors/`, `agent/` and `swarm/` belong to the server's
 own painters; `agent/` branches are deleted as soon as their tiles have
@@ -97,9 +110,13 @@ curl -X POST http://127.0.0.1:7070/api/v1/admin/kill-switch \
 | `PLACE_BRANCH_TTL_SECONDS` | `600` | Idle branches whose tiles have merged are deleted after this. |
 | `PLACE_MERGE_INTERVAL_MS` | `3000` | How often the merger bot runs. |
 | `PLACE_AGENTS` | `6` | Ambient agents. |
-| `PLACE_AMBIENT_INTERVAL_MS` | `30000` | Mean time between one ambient agent's strokes. |
+| `PLACE_AMBIENT_INTERVAL_MS` | `30000` | Mean time between the pushes of one sprite an ambient agent paints. |
+| `PLACE_AMBIENT_SPRITE_PAUSE_SECONDS` | `1800` | Mean time an ambient agent rests between two sprites. |
+| `PLACE_KEEP_AREAS` | | `x,y,width,height;...`: areas ambient agents never paint over (people's work from before the server started; it remembers what people paint for six hours, in memory). |
 | `PLACE_AMBIENT_MERGE_INTERVAL_SECONDS` | `300` | How often, at most, the merger runs when only ambient agents have pushes pending; any other push is merged on the next run. Bounds how fast idle painting grows a full clone (about 2.6 MB a day: each merge stores a whole `tiles/` tree, and stored packs have no deltas yet). |
 | `PLACE_SWARM_MAX_AGENTS`, `PLACE_SWARM_PUSHES_PER_SECOND`, `PLACE_SWARM_RUN_SECONDS`, `PLACE_SWARM_COOLDOWN_SECONDS`, `PLACE_SWARM_STARTS_PER_HOUR` | `1000`, `120`, `20`, `40`, `6` | Swarm limits. |
+| `PLACE_SWARM_ENABLED` | `false` | Whether visitors may start the swarm (`POST /api/v1/swarm`); off answers 404. |
+| `PLACE_WEB_TILES_PER_PUSH` | `1` | Tiles one push from the page may carry: one click, one commit, one push. Git pushes keep `PLACE_TILES_PER_PUSH`. |
 | `PLACE_AGENT_CONCURRENCY` | `16` | Agent pushes in flight at once. |
 | `PLACE_EVENT_STREAMS`, `PLACE_EVENT_STREAMS_PER_ADDRESS` | `4096`, `16` | Event streams (`GET /api/v1/events`) open at once, in all and per client address; more are refused with 429. |
 | `PLACE_EVENT_STREAM_MAX_SECONDS` | `600` | An event stream ends after at most this long (at a random point in its last tenth, so streams do not all reconnect at once); the page reconnects with the `seq` of the last event it saw and misses nothing. |

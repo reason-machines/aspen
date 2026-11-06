@@ -43,7 +43,13 @@ locals {
 
   # The configuration contract Aspen reads (deploy/README.md). The compose
   # stack sets the same names. No AWS keys: the SDK picks up the task role.
+  # With a compaction service, the Git tasks serve Git only and the
+  # compaction tasks run the background worker (deploy/README.md, "Process
+  # roles"); otherwise every Git task runs both (ASPEN_ROLE unset: all).
+  compactor = var.compactor_count > 0 && !local.placeholder
+
   default_environment = {
+    ASPEN_ROLE            = local.compactor ? "serve" : ""
     ASPEN_LISTEN          = "0.0.0.0:${var.http_port}"
     ASPEN_SSH_LISTEN      = var.enable_ssh ? "0.0.0.0:${var.ssh_port}" : ""
     ASPEN_PUBLIC_URL      = local.public_url
@@ -100,6 +106,45 @@ locals {
         awslogs-group         = aws_cloudwatch_log_group.aspen.name
         awslogs-region        = local.region
         awslogs-stream-prefix = "aspen"
+        mode                  = "non-blocking"
+        max-buffer-size       = "4m"
+      }
+    }
+  }
+}
+
+locals {
+  # The compaction tasks read the same database and bucket, and nothing a
+  # Git server needs: no listeners for clients, no express keys, no SSH key.
+  compactor_environment = { for k, v in merge({
+    ASPEN_ROLE       = "compact"
+    ASPEN_LISTEN     = "0.0.0.0:${var.http_port}"
+    DATABASE_URL     = local.default_environment.DATABASE_URL
+    ASPEN_BLOB_URL   = local.default_environment.ASPEN_BLOB_URL
+    AWS_REGION       = local.region
+    ASPEN_LOG        = "info"
+    ASPEN_LOG_FORMAT = "json"
+  }, var.compactor_environment) : k => v if v != "" }
+
+  compactor_container_definition = {
+    name      = "aspen-compactor"
+    image     = local.image
+    essential = true
+    command   = var.container_command
+
+    environment = [for k in sort(keys(local.compactor_environment)) : { name = k, value = local.compactor_environment[k] }]
+    secrets     = [{ name = "PGPASSWORD", valueFrom = aws_secretsmanager_secret.db_password.arn }]
+
+    linuxParameters = { initProcessEnabled = true }
+    # A job cut short is reclaimed after its lease and redone.
+    stopTimeout = 30
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.aspen.name
+        awslogs-region        = local.region
+        awslogs-stream-prefix = "compactor"
         mode                  = "non-blocking"
         max-buffer-size       = "4m"
       }
@@ -192,6 +237,76 @@ resource "aws_ecs_service" "aspen" {
     aws_secretsmanager_secret_version.db_password,
     aws_secretsmanager_secret_version.express_keys,
     aws_secretsmanager_secret_version.ssh_host_key,
+  ]
+}
+
+# The compaction service (compactor_count > 0): no load balancer, since it
+# serves no Git. It shares the Git tasks' security group (ingress only from
+# the load balancers, so nothing reaches it) and task role (the pack bucket).
+resource "aws_ecs_task_definition" "compactor" {
+  count = local.compactor ? 1 : 0
+
+  family                   = "${var.name}-compactor"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.compactor_cpu
+  memory                   = var.compactor_memory
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = var.cpu_architecture
+  }
+
+  # Repacks run on the task's ephemeral storage, under
+  # <ASPEN_SPOOL_DIR>/compact: about twice the largest cover's packs.
+  dynamic "ephemeral_storage" {
+    for_each = var.ephemeral_storage_gib > 20 ? [1] : []
+
+    content {
+      size_in_gib = var.ephemeral_storage_gib
+    }
+  }
+
+  container_definitions = jsonencode([
+    { for k, v in local.compactor_container_definition : k => v if v != null }
+  ])
+}
+
+resource "aws_ecs_service" "compactor" {
+  count = local.compactor ? 1 : 0
+
+  name            = "${var.name}-compactor"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.compactor[0].arn
+  desired_count   = var.compactor_count
+
+  capacity_provider_strategy {
+    capacity_provider = var.fargate_spot ? "FARGATE_SPOT" : "FARGATE"
+    weight            = 1
+  }
+
+  network_configuration {
+    subnets          = var.nat_gateway ? aws_subnet.private[*].id : aws_subnet.public[*].id
+    security_groups  = [aws_security_group.tasks.id]
+    assign_public_ip = !var.nat_gateway
+  }
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+  enable_ecs_managed_tags            = true
+  propagate_tags                     = "SERVICE"
+  enable_execute_command             = var.enable_ecs_exec
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  depends_on = [
+    aws_ecs_cluster_capacity_providers.this,
+    aws_secretsmanager_secret_version.db_password,
   ]
 }
 

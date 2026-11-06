@@ -164,6 +164,12 @@ variable "place_running" {
   default     = true
 }
 
+variable "place_live_cdn" {
+  description = "CloudFront at live.<place host> serving only /api/v1/canvas.svg, cached per 2-second bucket, for pages that embed and poll the canvas (place-live.tf). false removes the distribution."
+  type        = bool
+  default     = true
+}
+
 variable "place_kill_switch" {
   description = "Start place with its kill switch engaged (no swarm, ambient agents paused); an operator releases it through the API. Use it for the first start of the public demo."
   type        = bool
@@ -216,4 +222,32 @@ variable "place_database_init_image" {
   description = "Image whose psql (15 or later, for \\getenv) creates the place database on first start."
   type        = string
   default     = "public.ecr.aws/docker/library/postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b"
+}
+
+variable "place_canvas_mirror" {
+  description = "A GitHub repository (owner/name) that a sidecar of the place task keeps a read-only copy of the canvas's main in, pushing with a deploy key or a repository-scoped token, fast-forward only. null turns it off. The credential goes into the place_canvas_mirror_key output's secret by hand (../README.md, \"Mirror the canvas to GitHub\")."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.place_canvas_mirror == null || can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.place_canvas_mirror))
+    error_message = "place_canvas_mirror must be owner/name."
+  }
+}
+
+variable "place_canvas_mirror_interval_seconds" {
+  description = "How often the mirror sidecar fetches main and, when it moved, pushes it (one fast-forward push per run; the first run is at start). 15 minutes keeps the public mirror's history to a commit or so per quarter hour."
+  type        = number
+  default     = 900
+
+  validation {
+    condition     = var.place_canvas_mirror_interval_seconds >= 30
+    error_message = "place_canvas_mirror_interval_seconds must be at least 30."
+  }
+}
+
+variable "place_canvas_mirror_image" {
+  description = "Image of the mirror sidecar: Alpine, which installs git and openssh-client at start."
+  type        = string
+  default     = "public.ecr.aws/docker/library/alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f"
 }

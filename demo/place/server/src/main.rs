@@ -58,6 +58,7 @@ fn config() -> Result<PlaceConfig, String> {
     let mut c = PlaceConfig::new(
         var("PLACE_CLONE_URL").unwrap_or_else(|| format!("https://place.{domain}/canvas.git")),
     );
+    c.mirror_url = var("PLACE_MIRROR_URL");
     c.dashboard_url = match var("PLACE_DASHBOARD_URL").as_deref() {
         Some("none") => None,
         Some(u) => Some(u.to_owned()),
@@ -77,6 +78,28 @@ fn config() -> Result<PlaceConfig, String> {
         "PLACE_AMBIENT_INTERVAL_MS",
         c.ambient_interval.as_millis() as u64,
     )?);
+    c.keep_areas = match var("PLACE_KEEP_AREAS") {
+        None => Vec::new(),
+        Some(v) => v
+            .split(';')
+            .filter(|a| !a.trim().is_empty())
+            .map(|a| {
+                let n: Vec<u32> = a
+                    .split(',')
+                    .map(|p| p.trim().parse::<u32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("PLACE_KEEP_AREAS {a:?}: {e}"))?;
+                match n[..] {
+                    [x, y, w, h] => Ok((x, y, w, h)),
+                    _ => Err(format!("PLACE_KEEP_AREAS {a:?}: expected x,y,width,height")),
+                }
+            })
+            .collect::<Result<_, String>>()?,
+    };
+    c.ambient_sprite_pause = Duration::from_secs(parse(
+        "PLACE_AMBIENT_SPRITE_PAUSE_SECONDS",
+        c.ambient_sprite_pause.as_secs(),
+    )?);
     c.ambient_merge_interval = Duration::from_secs(parse(
         "PLACE_AMBIENT_MERGE_INTERVAL_SECONDS",
         c.ambient_merge_interval.as_secs(),
@@ -89,6 +112,10 @@ fn config() -> Result<PlaceConfig, String> {
     c.swarm.run_seconds = parse("PLACE_SWARM_RUN_SECONDS", c.swarm.run_seconds)?;
     c.swarm.cooldown_seconds = parse("PLACE_SWARM_COOLDOWN_SECONDS", c.swarm.cooldown_seconds)?;
     c.swarm_starts_per_hour = parse("PLACE_SWARM_STARTS_PER_HOUR", c.swarm_starts_per_hour)?;
+    // The public demo defaults: visitors can't start the swarm, and a web push
+    // carries one tile (one click, one commit, one push).
+    c.swarm_enabled = parse("PLACE_SWARM_ENABLED", false)?;
+    c.web_tiles_per_push = parse("PLACE_WEB_TILES_PER_PUSH", 1)?;
     c.agent_concurrency = parse("PLACE_AGENT_CONCURRENCY", c.agent_concurrency)?;
     c.client_addr = ClientAddr::from_settings(
         parse("PLACE_TRUSTED_PROXY_HOPS", 0)?,

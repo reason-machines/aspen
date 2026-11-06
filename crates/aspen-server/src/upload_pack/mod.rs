@@ -24,6 +24,7 @@ mod deliver;
 pub mod exact;
 pub mod fetch;
 mod graph;
+pub mod heat;
 pub mod ls_refs;
 mod resolve;
 mod shallow;

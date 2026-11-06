@@ -37,6 +37,8 @@ bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 http-body = "1"
+# Object IDs of the trees, commits and tags the merge queue writes.
+sha1 = "0.11"
 # The HTTP listener (`listen`): hyper with a timer, so header reads time out
 # (axum::serve sets none), HTTP/1.1 and cleartext HTTP/2.
 hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
