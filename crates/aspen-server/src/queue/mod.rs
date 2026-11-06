@@ -43,6 +43,14 @@
 //! so do the root trees of the trunk commits it wrote, so a batch based on
 //! the worker's previous one reads no trunk object at all.
 //!
+//! **Pipelining.** While one batch's atomic push is in flight, the worker
+//! builds the next batch on top of it (its tip, tree and the commits it
+//! writes), from the entries it does not hold; if the push is refused, the
+//! batch built on it is dropped and the next one is built from what is
+//! stored. A batch then costs the longer of building and landing, not
+//! their sum. Pushes themselves stay one at a time: each needs the one
+//! before it on trunk.
+//!
 //! **Building a batch fast.** Everything an entry needs that does not
 //! depend on the rest of the batch (its commit, base, own changes and the
 //! blobs it brings) is prepared for all entries at once, up to 16 at a
@@ -97,7 +105,7 @@ use aspen_core::id::{ObjectId, RepoId, UnixMicros};
 use aspen_core::ingest::{ObjectKind, SearchPacks};
 use aspen_core::meta::{MetaStore, RefListQuery};
 use aspen_core::name::{RefName, RefPattern};
-use aspen_core::refs::{Ancestry, RefVersion};
+use aspen_core::refs::{Ancestry, RefValue, RefVersion};
 use aspen_core::repo::{ForcePolicy, Repo};
 
 use crate::receive::{AnyRef, ReceivePack, ServiceError};
@@ -136,6 +144,8 @@ pub struct QueueConfig {
     pub outcome_ttl: Option<Duration>,
     /// Time between expiry passes over one repository's outcome refs.
     pub expire_every: Duration,
+    /// Build the next batch while the previous one's push is in flight.
+    pub pipeline: bool,
 }
 
 impl Default for QueueConfig {
@@ -146,6 +156,7 @@ impl Default for QueueConfig {
             scan_every: Duration::from_secs(30),
             outcome_ttl: Some(Duration::from_secs(3600)),
             expire_every: Duration::from_secs(60),
+            pipeline: true,
         }
     }
 }
@@ -713,6 +724,52 @@ where
         Ok(out)
     }
 
+    /// Lands batches until nothing is pending: while one batch's push is in
+    /// flight, the next is built on top of it (its tip, tree and chain),
+    /// so a batch costs the longer of building and landing, not their sum.
+    /// A refused push (trunk or a queue ref moved) drops the batch built on
+    /// it and rebuilds from what is stored, at most [`MAX_ATTEMPTS`] times
+    /// in a row.
+    async fn land_all(&self, repo: &Repo, short: &str) -> Result<QueueReport, StoreError> {
+        let mut report = QueueReport::default();
+        let mut refused = 0;
+        let mut current = self.build(repo, short, None).await?;
+        while let Some(b) = current.take() {
+            let (landed, next) = if self.config.pipeline {
+                tokio::join!(
+                    self.land(repo, short, &b),
+                    self.build(repo, short, Some(&b))
+                )
+            } else {
+                (self.land(repo, short, &b).await, Ok(None))
+            };
+            if landed? {
+                refused = 0;
+                report.batches += 1;
+                report.merged += b.merged;
+                report.rejected += b.rejected;
+                current = match next? {
+                    Some(n) => Some(n),
+                    // Nothing was pending when the next batch was listed;
+                    // look again, on what is stored now.
+                    None => self.build(repo, short, None).await?,
+                };
+            } else {
+                report.refused += 1;
+                self.svc
+                    .queue_metrics
+                    .refused
+                    .fetch_add(1, Ordering::Relaxed);
+                refused += 1;
+                if refused >= MAX_ATTEMPTS {
+                    break;
+                }
+                current = self.build(repo, short, None).await?;
+            }
+        }
+        Ok(report)
+    }
+
     /// Lands `repo`'s pending entries, batch after batch, then expires
     /// its old outcome refs (every time when `expire_now`, otherwise at
     /// most every [`QueueConfig::expire_every`]).
@@ -721,51 +778,22 @@ where
         let Some(repo) = self.svc.meta().repo_by_id(repo).await? else {
             return Ok(report);
         };
-        loop {
-            let r = self.batch(&repo).await?;
-            let progress = r.merged + r.rejected > 0;
-            report += r;
-            if !progress {
-                break;
-            }
+        if let Some(short) = branch(&repo) {
+            report += self.land_all(&repo, short).await?;
         }
         report.expired += self.maybe_expire(&repo, expire_now).await?;
         Ok(report)
     }
 
-    /// Builds and lands one batch, rebuilding it after a refused push.
-    async fn batch(&self, repo: &Repo) -> Result<QueueReport, StoreError> {
-        let mut report = QueueReport::default();
-        let Some(short) = branch(repo) else {
-            return Ok(report);
-        };
-        for _ in 0..MAX_ATTEMPTS {
-            match self.attempt(repo, short).await? {
-                Attempt::Nothing => return Ok(report),
-                Attempt::Landed { merged, rejected } => {
-                    report.batches += 1;
-                    report.merged += merged;
-                    report.rejected += rejected;
-                    let m = &self.svc.queue_metrics;
-                    m.batches.fetch_add(1, Ordering::Relaxed);
-                    m.merged.fetch_add(merged, Ordering::Relaxed);
-                    m.rejected.fetch_add(rejected, Ordering::Relaxed);
-                    return Ok(report);
-                }
-                Attempt::Refused(why) => {
-                    tracing::debug!(repo = %repo.name, "merge queue: batch refused, rebuilding: {why}");
-                    report.refused += 1;
-                    self.svc
-                        .queue_metrics
-                        .refused
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    async fn attempt(&self, repo: &Repo, short: &str) -> Result<Attempt, StoreError> {
+    /// Builds one batch: on what is stored (`on` is `None`), or on top of
+    /// a batch whose push is still in flight (`on`, whose entries are left
+    /// out), so building the next batch overlaps landing this one.
+    async fn build(
+        &self,
+        repo: &Repo,
+        short: &str,
+        on: Option<&Built>,
+    ) -> Result<Option<Built>, StoreError> {
         let meta = self.svc.meta();
         let mut clock = Clock::new(&self.svc.queue_metrics);
         let prefix = format!("{QUEUE_PREFIX}{short}/");
@@ -786,37 +814,62 @@ where
                 .await?;
             let Some(last) = page.last() else { break };
             after = Some(last.name.clone());
-            entries.extend(page.into_iter().filter(|v| v.value.tip().is_some()));
+            entries.extend(page.into_iter().filter(|v| {
+                v.value.tip().is_some() && !on.is_some_and(|b| b.names.contains(&v.name))
+            }));
         }
         if entries.is_empty() {
-            return Ok(Attempt::Nothing);
+            return Ok(None);
         }
         entries.sort_by_key(|v| (v.created_at.0, v.id.get()));
         entries.truncate(self.config.batch.max(1));
         let trunk_name = repo.settings.trunk().clone();
-        let Some(trunk) = meta
+        let Some(mut trunk) = meta
             .current_version(repo.id, &trunk_name)
             .await?
             .filter(|v| v.value.tip().is_some())
         else {
             // Nothing to land on: entries wait until trunk exists.
-            return Ok(Attempt::Nothing);
+            return Ok(None);
         };
-        let t = trunk.value.tip().expect("live");
         clock.lap(Stage::List);
         let mut reader = Reader {
             svc: &self.svc,
             repo: repo.id,
-            trunk_packs: self.svc.closure_of(repo.id, &[trunk.id]).await?,
+            trunk_packs: SearchPacks::default(),
             trees: self.tree_cache(repo.id),
             chain: Arc::default(),
             chain_trees: Arc::default(),
             local: Mutex::new(HashMap::new()),
         };
-        (reader.chain, reader.chain_trees) = self.trunk_chain(&reader, repo.id, t).await?;
-        let t_tree = match reader.chain_trees.get(&t) {
-            Some(tree) => *tree,
-            None => reader.commit_tree(&reader.trunk_packs, t).await?,
+        let (t, t_tree) = match on {
+            // On top of the batch in flight: its tip, tree and chain. Trunk
+            // objects older than it come from the trunk it was built on;
+            // the trees it wrote are cached.
+            Some(prev) => {
+                reader.trunk_packs = prev.trunk_packs.clone();
+                let mut chain = (*prev.chain).clone();
+                let mut trees = (*prev.chain_trees).clone();
+                for (id, tree) in &prev.written {
+                    chain.insert(*id);
+                    trees.insert(*id, *tree);
+                }
+                (reader.chain, reader.chain_trees) = (Arc::new(chain), Arc::new(trees));
+                if let RefValue::Live { tip, .. } = &mut trunk.value {
+                    *tip = prev.tip;
+                }
+                (prev.tip, prev.root)
+            }
+            None => {
+                let t = trunk.value.tip().expect("live");
+                reader.trunk_packs = self.svc.closure_of(repo.id, &[trunk.id]).await?;
+                (reader.chain, reader.chain_trees) = self.trunk_chain(&reader, repo.id, t).await?;
+                let t_tree = match reader.chain_trees.get(&t) {
+                    Some(tree) => *tree,
+                    None => reader.commit_tree(&reader.trunk_packs, t).await?,
+                };
+                (t, t_tree)
+            }
         };
         clock.lap(Stage::Trunk);
         // Every entry is prepared at once (its commit, base, own changes and
@@ -841,7 +894,7 @@ where
         }
         clock.lap(Stage::Place);
         if fates.iter().all(|f| matches!(f, Fate::Later)) {
-            return Ok(Attempt::Nothing);
+            return Ok(None);
         }
         // Outcome refs a client reuses are cleared first (on their own: a
         // refused clear only means the batch push below is refused too and
@@ -903,14 +956,7 @@ where
                 new,
             });
         }
-        let target = worker_repo(repo, short);
         clock.lap(Stage::Outcomes);
-        if !clears.is_empty() {
-            let body = objects::atomic_request(&clears, None);
-            if let Err(why) = self.push(&target, body).await? {
-                return Ok(Attempt::Refused(why));
-            }
-        }
         // Compressing and hashing the batch's objects is CPU work: off the
         // async workers that serve every request.
         let pack = if b.pack.is_empty() {
@@ -926,28 +972,56 @@ where
             )
         };
         let body = objects::atomic_request(&commands, pack);
-        let written = std::mem::take(&mut b.written);
         clock.lap(Stage::Pack);
-        let pushed = self.push(&target, body).await?;
-        clock.lap(Stage::Push);
-        match pushed {
-            Ok(()) => {
-                self.extend_chain(repo.id, t, &written);
-                let now = UnixMicros::now().0;
-                let waited: i64 = entries
-                    .iter()
-                    .zip(&fates)
-                    .filter(|(_, f)| !matches!(f, Fate::Later))
-                    .map(|(e, _)| (now - e.created_at.0).max(0))
-                    .sum();
-                self.svc
-                    .queue_metrics
-                    .wait_micros
-                    .fetch_add(waited as u64, Ordering::Relaxed);
-                Ok(Attempt::Landed { merged, rejected })
-            }
-            Err(why) => Ok(Attempt::Refused(why)),
+        let landed: Vec<(RefName, i64)> = entries
+            .iter()
+            .zip(&fates)
+            .filter(|(_, f)| !matches!(f, Fate::Later))
+            .map(|(e, _)| (e.name.clone(), e.created_at.0))
+            .collect();
+        Ok(Some(Built {
+            names: landed.iter().map(|(n, _)| n.clone()).collect(),
+            created: landed.into_iter().map(|(_, c)| c).collect(),
+            merged,
+            rejected,
+            clears: (!clears.is_empty()).then(|| objects::atomic_request(&clears, None)),
+            body,
+            from: t,
+            tip: b.tip,
+            root: b.root.expect("set"),
+            written: std::mem::take(&mut b.written),
+            trunk_packs: reader.trunk_packs.clone(),
+            chain: reader.chain.clone(),
+            chain_trees: reader.chain_trees.clone(),
+        }))
+    }
+
+    /// Lands a built batch: clears reused outcome refs, then the atomic
+    /// push; `Ok(false)` when either was refused (something moved).
+    async fn land(&self, repo: &Repo, short: &str, b: &Built) -> Result<bool, StoreError> {
+        let mut clock = Clock::new(&self.svc.queue_metrics);
+        let target = worker_repo(repo, short);
+        if let Some(clears) = &b.clears
+            && let Err(why) = self.push(&target, clears.clone()).await?
+        {
+            tracing::debug!(repo = %repo.name, "merge queue: clearing outcomes refused: {why}");
+            return Ok(false);
         }
+        let pushed = self.push(&target, b.body.clone()).await?;
+        clock.lap(Stage::Push);
+        if let Err(why) = pushed {
+            tracing::debug!(repo = %repo.name, "merge queue: batch refused, rebuilding: {why}");
+            return Ok(false);
+        }
+        self.extend_chain(repo.id, b.from, &b.written);
+        let now = UnixMicros::now().0;
+        let waited: i64 = b.created.iter().map(|c| (now - c).max(0)).sum();
+        let m = &self.svc.queue_metrics;
+        m.wait_micros.fetch_add(waited as u64, Ordering::Relaxed);
+        m.batches.fetch_add(1, Ordering::Relaxed);
+        m.merged.fetch_add(b.merged, Ordering::Relaxed);
+        m.rejected.fetch_add(b.rejected, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Pushes `body` in process; `Ok(Err(reason))` when it was refused.
@@ -961,10 +1035,27 @@ where
     }
 }
 
-enum Attempt {
-    Nothing,
-    Landed { merged: u64, rejected: u64 },
-    Refused(String),
+/// A batch ready to land.
+struct Built {
+    /// The entries it lands or rejects, and when each was enqueued.
+    names: HashSet<RefName>,
+    created: Vec<i64>,
+    merged: u64,
+    rejected: u64,
+    /// Deletes of outcome refs clients reuse, pushed first.
+    clears: Option<Vec<u8>>,
+    /// The atomic push.
+    body: Vec<u8>,
+    /// Trunk's tip it builds on, and the tip and tree it lands.
+    from: ObjectId,
+    tip: ObjectId,
+    root: ObjectId,
+    /// Its trunk commits, in order, with their trees.
+    written: Vec<(ObjectId, ObjectId)>,
+    /// What a batch built on top of it starts from.
+    trunk_packs: SearchPacks,
+    chain: Arc<HashSet<ObjectId>>,
+    chain_trees: Arc<HashMap<ObjectId, ObjectId>>,
 }
 
 /// How many entries of a batch are prepared at once.

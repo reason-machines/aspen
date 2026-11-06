@@ -362,6 +362,40 @@ async fn a_queued_change_costs_one_blob_read() {
     );
 }
 
+/// Regression: while one batch's push is in flight, the worker builds the
+/// next one, so draining a backlog takes less wall time than its stages
+/// add up to. Without the overlap the stages are sequential parts of the
+/// wall time, which is then at least their sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_batch_is_built_while_one_lands() {
+    let mut h = Harness::start(10_000).await;
+    h.queue = MergeQueue::new(
+        h.svc.clone(),
+        QueueConfig {
+            batch: 32,
+            ..QueueConfig::default()
+        },
+    );
+    h.time_batch(vec!["warm".into()]).await;
+    enqueue_many(&h, 256).await;
+    let stages = |m: &std::collections::BTreeMap<String, f64>| -> f64 {
+        m.iter()
+            .filter(|(k, _)| k.starts_with("aspen_queue_stage_seconds_total"))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    let before = stages(&metrics(&h.url));
+    let (took, report) = h.land().await;
+    let spent = stages(&metrics(&h.url)) - before;
+    assert_eq!(report.merged, 256, "{report:?}");
+    assert!(report.batches >= 8, "{report:?}");
+    eprintln!("drained 256 in {took:?}; stages add up to {spent:.3} s");
+    assert!(
+        took.as_secs_f64() < 0.9 * spent,
+        "draining took {took:?}, the stages add up to {spent:.3} s: batches did not overlap"
+    );
+}
+
 /// How fast the worker drains a backlog of `PROFILE_N` queued changes
 /// (default 1000) in batches of `PROFILE_BATCH` (default 64), over the
 /// slow blob store, with stage times (exploration; run with `--ignored
