@@ -188,12 +188,6 @@ variable "place_live_cdn" {
   default     = true
 }
 
-variable "place_kill_switch" {
-  description = "Start place with its kill switch engaged (no swarm, ambient agents paused); an operator releases it through the API. Use it for the first start of the public demo."
-  type        = bool
-  default     = false
-}
-
 variable "place_cpu" {
   description = "Fargate CPU units for the place task (1024 = 1 vCPU). null takes the environment's size from main.tf (demo 16384, staging 512)."
   type        = number

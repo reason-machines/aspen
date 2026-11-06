@@ -1,11 +1,14 @@
 # shellcheck shell=sh
-# The canvas mirror sidecar (place.tf): at start and then every
-# MIRROR_INTERVAL seconds (15 minutes by default), fetch the canvas's main
+# The canvas mirror sidecar (place.tf): once aspen-place answers after a
+# start, and then every MIRROR_INTERVAL seconds (15 minutes by default),
+# fetch the canvas's main
 # from aspen-place in the same task and, when it moved, push it to the
 # GitHub repository MIRROR_REPO: one push per run. The push is forced,
 # because place starts main's history again from one root commit whenever
 # it outgrows PLACE_HISTORY_MAX_BYTES; the GitHub repository is a read-only
-# copy whose only writer is this sidecar.
+# copy whose only writer is this sidecar. It is forced with a lease: only
+# over the main this sidecar last pushed (read from GitHub at start), so a
+# write by anyone else is reported, never overwritten.
 #
 # MIRROR_CREDENTIAL is either an SSH deploy key (OpenSSH private key; SSH
 # goes over port 443, ssh.github.com, the only egress the place task has)
@@ -32,18 +35,60 @@ case "$MIRROR_CREDENTIAL" in
     ;;
 esac
 unset MIRROR_CREDENTIAL
-git init --quiet --bare /tmp/canvas.git
-cd /tmp/canvas.git
+git init --quiet --bare "${TMPDIR:-/tmp}/canvas.git"
+cd "${TMPDIR:-/tmp}/canvas.git"
+# This sidecar starts with place, which listens only once it has loaded the
+# canvas. Ask place for main every MIRROR_START_RETRY seconds (5) until it
+# names one, for at most one MIRROR_INTERVAL, so the first push after a
+# restart comes seconds after place is up rather than a whole interval
+# later. Each ask is cut off after 10 seconds, so a place that accepts the
+# connection and then stalls cannot hold the wait past its interval.
+retry=${MIRROR_START_RETRY:-5}
+case "$retry" in
+  '' | *[!0-9]*) retry=0 ;;
+esac
+if [ "$retry" -le 0 ]; then
+  echo "canvas-mirror: MIRROR_START_RETRY=${MIRROR_START_RETRY:-} is not a positive number of seconds; using 5"
+  retry=5
+fi
+started=$(date +%s)
+waiting=no
+until [ -n "$(timeout 10 git ls-remote "$MIRROR_SOURCE" refs/heads/main 2>/dev/null)" ]; do
+  waited=$(($(date +%s) - started))
+  if [ "$waited" -ge "$MIRROR_INTERVAL" ]; then
+    echo "canvas-mirror: place still does not answer at $MIRROR_SOURCE after ${waited}s"
+    break
+  fi
+  if [ "$waiting" = no ]; then
+    echo "canvas-mirror: waiting for place at $MIRROR_SOURCE"
+    waiting=yes
+  fi
+  sleep "$retry"
+done
+# GitHub's main as this sidecar last left it ("" if it has none), once
+# read.
 pushed=""
+known=no
 while :; do
-  if git fetch --quiet "$MIRROR_SOURCE" +refs/heads/main:refs/heads/main; then
+  if [ "$known" = no ] && remote_main=$(git ls-remote "$remote" refs/heads/main); then
+    pushed=$(printf '%s' "$remote_main" | cut -f1)
+    known=yes
+  fi
+  if [ "$known" = no ]; then
+    echo "canvas-mirror: could not read main from $MIRROR_REPO"
+  elif git fetch --quiet "$MIRROR_SOURCE" +refs/heads/main:refs/heads/main; then
     tip=$(git rev-parse refs/heads/main)
     if [ "$tip" != "$pushed" ]; then
-      if git push --quiet "$remote" +refs/heads/main:refs/heads/main; then
+      if git push --quiet --force-with-lease="refs/heads/main:$pushed" "$remote" refs/heads/main:refs/heads/main; then
         echo "canvas-mirror: pushed main $tip to $MIRROR_REPO"
         pushed=$tip
       else
-        echo "canvas-mirror: push of $tip to $MIRROR_REPO failed (GitHub refused)"
+        echo "canvas-mirror: push of $tip to $MIRROR_REPO failed (GitHub refused, or its main is not ${pushed:-absent}, as this mirror left it)"
+        # The push may have landed all the same; a main someone else
+        # wrote stays theirs until the sidecar restarts.
+        if [ "$(git ls-remote "$remote" refs/heads/main | cut -f1)" = "$tip" ]; then
+          pushed=$tip
+        fi
       fi
     fi
   else

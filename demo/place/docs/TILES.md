@@ -88,8 +88,11 @@ Worked example, with the default cap of 64 tiles:
    painting 30 more tiles, and pushes. Her client sends a zero old-oid. The
    range is `A2 ^T1 ^A1` = {`A2`}: 30 tiles, accepted. Counting from the
    zero old-oid (`A2 ^T1`) would include `A1` and refuse 70 tiles.
-3. Ada rewrites her branch as `B1` on `T0` (60 tiles) and force-pushes. The
-   same rule applies: `B1 ^T1 ^A2` = {`B1`}: 60 tiles, accepted.
+3. Ada rewrites her branch as `B1` on `T0` (60 tiles) and force-pushes.
+   `paint/` branches only move forward, so that push is refused; she
+   pushes `B1` to a new branch, `refs/heads/paint/ada-2`: `B1 ^T1` =
+   {`B1`}: 60 tiles, accepted. On a branch outside `paint/`, which Aspen
+   lets a client force, the same rule gives `B1 ^T1 ^A2` = {`B1`}.
 
 A rename of a tile file shows up as a delete plus an add, so it is refused
 with `delete-not-allowed`.
@@ -101,7 +104,8 @@ with `delete-not-allowed`.
 | Only branches (`refs/heads/*`) can be pushed; tags and other refs are refused. Branch names are at most 100 characters after `refs/heads/`. | `bad-ref` |
 | `refs/heads/main` belongs to the merger bot. Push to any other branch. | `protected-ref` |
 | Branches under `refs/heads/visitors/`, `refs/heads/agent/` and `refs/heads/swarm/` belong to the web page's visitors and the server's agents; Git clients may not push to them. | `protected-ref` |
-| Deleting a branch (new tip all zeros) is allowed; no commit rules apply. Whether a given client may delete or force-push a branch is Aspen's ref-update policy (spike S2), not a tile rule. | (none) |
+| Branches under `refs/heads/paint/` only move forward: a Git client may create one and fast-forward it, but not delete it or rewrite its history (a force-push, `-o force` or a rewind), because anyone can push to any branch and it may be someone else's. Push the rewrite to a new branch instead. The check compares the stored tip with the new one, never the client's old value. | (none; the `ng` line says so) |
+| Deleting any other branch (new tip all zeros) is allowed; no commit rules apply. Whether a given client may delete or force-push such a branch is Aspen's ref-update policy (spike S2), not a tile rule. | (none) |
 | Every changed path is under `tiles/`. | `outside-tiles` |
 | Every path under `tiles/` is a valid tile name. | `bad-tile-path` |
 | Every tile is inside the canvas. | `out-of-bounds` |

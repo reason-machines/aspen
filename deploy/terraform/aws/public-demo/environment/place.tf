@@ -36,7 +36,6 @@ locals {
     PLACE_DASHBOARD_URL      = var.place_dashboard_url
     PLACE_TRUSTED_PROXY_HOPS = "1"
     PLACE_DB_MAX_CONNECTIONS = tostring(local.place_db_max_connections)
-    PLACE_KILL_SWITCH        = var.place_kill_switch ? "1" : ""
     PLACE_MIRROR_URL         = var.place_canvas_mirror == null ? "" : "https://github.com/${var.place_canvas_mirror}"
   }, var.place_environment)
 }
