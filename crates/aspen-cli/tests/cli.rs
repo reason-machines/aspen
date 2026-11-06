@@ -450,6 +450,99 @@ fn dev_runs_the_compaction_worker() {
     assert_eq!(server.terminate().code(), Some(0));
 }
 
+/// `ASPEN_ROLE` splits one deployment into Git servers and compaction
+/// workers: an `ASPEN_ROLE=serve` process takes pushes and leaves their
+/// `compact` job queued (the backlog gauge shows it), and an
+/// `ASPEN_ROLE=compact` process sharing its database and bucket, serving
+/// no Git, builds the cover and empties the queue.
+#[test]
+fn serve_and_compact_roles_split_git_from_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    admin_ok(d, &["repo", "create", "acme/app"]);
+    let start = |role: &str| {
+        let mut cmd = aspen();
+        serve_env(&mut cmd, d);
+        cmd.arg("serve")
+            .env("ASPEN_ROLE", role)
+            .env("ASPEN_POLICY", r#"{"anonymous": ["write:acme/*"]}"#);
+        Running::start(cmd)
+    };
+    let packs = || {
+        std::fs::read_dir(d.join("blobs/repos/1/packs"))
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".pack"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let jobs = || admin_ok(d, &["doctor", "jobs"]);
+
+    let git_server = start("serve");
+    let git_metrics = git_server.logged_after("metrics on http://");
+    assert!(git_server.logs("ASPEN_ROLE=serve: no background worker here"));
+    let work = work_repo(d, 0);
+    for i in 0..16 {
+        std::fs::write(work.join("n.txt"), format!("{i}\n")).unwrap();
+        git_ok(&work, &["add", "n.txt"]);
+        git_ok(&work, &["commit", "-q", "-m", &format!("c{i}")]);
+        git_ok(
+            &work,
+            &["push", "-q", &git_server.url("/acme/app.git"), "main"],
+        );
+    }
+    let tip = git_ok(&work, &["rev-parse", "HEAD"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(packs(), 16, "nothing compacts in a serve-only process");
+    assert_eq!(
+        metric(&git_metrics, "aspen_compaction_backlog"),
+        1,
+        "the 16th push's compact job waits"
+    );
+
+    let worker = start("compact");
+    assert_eq!(http_get(&worker.addr, "/healthz"), (200, "ok\n".into()));
+    assert_eq!(http_get(&worker.addr, "/readyz").0, 200);
+    assert_eq!(
+        http_get(
+            &worker.addr,
+            "/acme/app.git/info/refs?service=git-upload-pack"
+        )
+        .0,
+        404,
+        "a compaction-only process serves no Git"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while packs() < 17 || !jobs().contains("No jobs are queued, running or dead") {
+        assert!(
+            Instant::now() < deadline,
+            "the compact process did not compact: {} packs, jobs:\n{}",
+            packs(),
+            jobs()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(packs(), 17, "16 push packs and one cover pack");
+    let worker_metrics = worker.logged_after("metrics on http://");
+    assert_eq!(metric(&worker_metrics, "aspen_compaction_backlog"), 0);
+
+    let clone = d.join("clone");
+    git_ok(
+        d,
+        &[
+            "clone",
+            "-q",
+            &git_server.url("/acme/app.git"),
+            clone.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(git_ok(&clone, &["rev-parse", "HEAD"]), tip);
+    git_ok(&clone, &["fsck", "--strict"]);
+    assert_eq!(worker.terminate().code(), Some(0));
+    assert_eq!(git_server.terminate().code(), Some(0));
+}
+
 /// `aspen dev --no-background-worker` (for benchmarks, D2): the same 16
 /// pushes enqueue the `compact` job, but nothing runs it, so no cover pack
 /// is stored and the job stays queued; fetches still work.

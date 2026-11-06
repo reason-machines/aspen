@@ -57,6 +57,10 @@ pub struct Metrics {
     forward_base_alerts: AtomicU64,
     corruption_alerts: AtomicU64,
     job_enqueue_failures: AtomicU64,
+    /// Versions fetches sent as their own push packs (compaction heat).
+    uncompacted_versions: AtomicU64,
+    /// Writes of compaction heat to the job queue that failed.
+    heat_write_failures: AtomicU64,
     /// Shallow fetches served exact packs: already recorded, or after
     /// waiting for their build (node C8).
     shallow_cached: AtomicU64,
@@ -187,6 +191,8 @@ impl Default for Metrics {
             forward_base_alerts: AtomicU64::new(0),
             corruption_alerts: AtomicU64::new(0),
             job_enqueue_failures: AtomicU64::new(0),
+            uncompacted_versions: AtomicU64::new(0),
+            heat_write_failures: AtomicU64::new(0),
             shallow_cached: AtomicU64::new(0),
             shallow_built: AtomicU64::new(0),
             shallow_closure: AtomicU64::new(0),
@@ -257,6 +263,16 @@ impl Metrics {
     /// A repair job (`rewrite_pack`) could not be enqueued.
     pub(crate) fn job_enqueue_failure(&self) {
         self.job_enqueue_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A served fetch sent `n` versions as their own push packs.
+    pub(crate) fn uncompacted_versions(&self, n: u64) {
+        self.uncompacted_versions.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Writing compaction heat to the job queue failed.
+    pub(crate) fn heat_write_failure(&self) {
+        self.heat_write_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A shallow fetch was served exactly.
@@ -495,6 +511,18 @@ impl Metrics {
             "aspen_job_enqueue_failures_total",
             "Repair jobs (rewrite_pack) that could not be enqueued; the next fetch retries.",
             get(&self.job_enqueue_failures),
+        );
+        expo::counter(
+            &mut s,
+            "aspen_fetch_uncompacted_versions_total",
+            "Versions served fetches sent as their own push packs: compaction heat, which raises the claim priority of those refs' compact jobs.",
+            get(&self.uncompacted_versions),
+        );
+        expo::counter(
+            &mut s,
+            "aspen_compaction_heat_write_failures_total",
+            "Writes of compaction heat to the job queue that failed (advisory: only job order is affected).",
+            get(&self.heat_write_failures),
         );
         expo::family(
             &mut s,

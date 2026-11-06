@@ -1,0 +1,59 @@
+\documentclass[border=0pt]{standalone}
+\usepackage{fontspec}
+\setmainfont{Geist-Regular.ttf}[Path=./]
+\newfontfamily\mono{GeistMono-Regular.ttf}[Path=./]
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric}
+
+% Link preview for place.reasonmachines.com, in the style of
+% docs/assets/aspen-banner.tex. 24 cm x 12.6 cm, rasterised at 127 dpi to
+% 1200 x 630 px:
+%   rsvg-convert -w 512 -h 512 canvas.svg -o canvas.png   (a canvas snapshot)
+%   tectonic og.tex && pdftoppm -png -r 127 -singlefile og.pdf ../../public/og
+% with Geist-Regular.ttf, GeistMono-Regular.ttf and docs/assets/reason-mark.png
+% beside it.
+
+\definecolor{ink}{HTML}{141413}
+\definecolor{paper}{HTML}{FBFAF7}
+\definecolor{line}{HTML}{E7E4DC}
+\definecolor{muted}{HTML}{6B6A66}
+
+\newcommand\R{1.42}
+\pgfmathsetmacro\W{sqrt(3)*\R}
+\pgfmathsetmacro\V{1.5*\R}
+\tikzset{hex/.style={regular polygon, regular polygon sides=6, shape border rotate=30,
+  minimum size=2*\R cm, inner sep=0pt, draw=line, line width=0.9pt}}
+\newcommand\hexat[2]{({11.6 + (#1)*\W + mod(#2,2)*\W/2}, {13.4 - (#2)*\V})}
+
+\begin{document}
+\begin{tikzpicture}
+  \clip (0,0) rectangle (24,12.59);
+  \fill[paper] (0,0) rectangle (24,12.59);
+  \foreach \c in {0,...,5} \foreach \r in {0,...,7}
+    \node[hex] at \hexat{\c}{\r} {};
+
+  % the canvas: 64 x 64 tiles at 8 px each
+  \fill[white] (12.28,0.88) rectangle (23.12,11.72);
+  \draw[line, line width=0.9pt] (12.28,0.88) rectangle (23.12,11.72);
+  \node[anchor=south west, inner sep=0] at (12.58,1.18) {\includegraphics[width=10.24cm]{canvas.png}};
+
+  \node[anchor=west, inner sep=0] (mk) at (1.55,10.75) {\includegraphics[height=0.62cm]{reason-mark.png}};
+  \node[anchor=west, inner sep=0, font=\fontsize{19}{19}\selectfont, text=ink] at ([xshift=0.19cm]mk.east) {Reason};
+
+  \node[anchor=west, inner sep=0, text=ink,
+        font=\fontsize{64}{64}\selectfont\addfontfeatures{LetterSpace=-4}]
+    at (1.45,8.15) {place};
+
+  \node[anchor=west, align=left, inner sep=0, text=ink,
+        font=\fontsize{27}{33}\selectfont\addfontfeatures{LetterSpace=-2}]
+    at (1.5,5.35) {Every pixel is\\a {\mono git push}.};
+
+  \node[anchor=west, align=left, inner sep=0, text=muted, font=\fontsize{14.5}{19}\selectfont]
+    at (1.55,2.95) {A shared 64\(\times\)64 canvas served by\\Aspen, an open-source Git server\\for agents. No sign-in.};
+
+  \node[anchor=west, inner sep=0, text=muted, font=\mono\fontsize{11}{11}\selectfont\addfontfeatures{LetterSpace=18}]
+    at (1.57,1.18) {PLACE.REASONMACHINES.COM};
+\end{tikzpicture}
+\end{document}

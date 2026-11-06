@@ -9,8 +9,14 @@
 //! `testkit/scripts/check-aspen-mutations.py` shows this run fails when
 //! Aspen misbehaves.
 
+use std::io::Write;
+use std::net::TcpStream;
+use std::time::Duration;
+
 use aspen_testkit::oracle::seeds;
-use aspen_testkit::{AspenOptions, AspenServer, Branch, Config, Op, Oracle, StockServer};
+use aspen_testkit::{
+    AspenOptions, AspenServer, Branch, Config, GitServer, Op, Oracle, StockServer,
+};
 
 fn aspen() -> AspenServer {
     AspenServer::start(AspenOptions::new(env!("CARGO_BIN_EXE_aspen"))).expect("aspen serve starts")
@@ -161,4 +167,79 @@ fn a_delete_of_a_missing_ref_agrees_with_stock_git() {
     );
     assert_eq!(run.stats.known, 0);
     assert_eq!(run.stats.refs_accepted, 1, "{}", run.stats);
+}
+
+/// Nightly `differential-long` (`aspen, sqlite, wide`, 5 clones) diverged on
+/// 2026-11-05 and 2026-11-06: in a step of 5 concurrent pushes, one push to
+/// Aspen ended with no ref status at all. Every oracle client is the same
+/// anonymous caller, and `aspen serve` caps a caller at 4 concurrent pushes
+/// by default (issue #118), so the fifth was refused with `429` before it
+/// reported a ref. The oracle's server runs without per-caller caps
+/// (`aspen_testkit::aspen::ORACLE_LIMITS`); this holds more pushes open
+/// than the default cap from the oracle's address, on another repository,
+/// and checks an oracle push still agrees with stock Git. Before the fix
+/// the oracle's first push was refused: `too many concurrent pushes for
+/// this caller (at most 4); retry in 5 s`.
+#[test]
+fn the_oracle_server_admits_more_concurrent_pushes_than_the_default_cap() {
+    let reference = StockServer::start().unwrap();
+    let candidate = aspen();
+    let held_repo = candidate.create_repo("held.git").unwrap();
+    let path = held_repo
+        .strip_prefix(candidate.base_url())
+        .expect("the repository URL starts with the base URL")
+        .to_owned()
+        + "/git-receive-pack";
+    let addr = candidate
+        .base_url()
+        .strip_prefix("http://")
+        .expect("an http base URL")
+        .to_owned();
+    // With the oracle's own push, twice the default per-caller cap; well
+    // under the instance's 16 push slots.
+    let held: Vec<TcpStream> = (0..7).map(|_| hold_receive_pack(&addr, &path)).collect();
+    let push = [Op::Push {
+        clone: 1,
+        branch: Branch(1),
+        commits: 1,
+    }];
+    let run = Oracle::new(&reference, &candidate, config())
+        .run(&push)
+        .unwrap();
+    assert!(
+        run.divergence.is_none(),
+        "{:?}\n\naspen log tail:\n{}",
+        run.divergence,
+        candidate.log_tail(40)
+    );
+    // The push ran beside 7 pushes of the same caller, not after them.
+    for (i, s) in held.iter().enumerate() {
+        assert!(still_waiting(s), "held push {i} was answered");
+    }
+    drop(held);
+    assert_eq!(run.stats.refs_accepted, 1, "{}", run.stats);
+}
+
+/// Sends a receive-pack POST's headers and none of its body, so that it
+/// holds a push slot of this caller until the connection is dropped, and
+/// gives the server half a second to take it.
+fn hold_receive_pack(addr: &str, path: &str) -> TcpStream {
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/x-git-receive-pack-request\r\n\
+         Content-Length: 1000\r\n\r\n"
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    s
+}
+
+/// Whether the server has not answered the request on `s` yet.
+fn still_waiting(s: &TcpStream) -> bool {
+    s.set_nonblocking(true).unwrap();
+    let peeked = s.peek(&mut [0; 1]);
+    s.set_nonblocking(false).unwrap();
+    matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
 }

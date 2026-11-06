@@ -54,9 +54,15 @@ sets the same variables; `aspen serve --help` lists them with their defaults.
 | `ASPEN_SPOOL_DIR` | `/var/lib/aspen/spool` | Where pushes are spooled and completed: a real disk, never tmpfs, about twice the largest push. The compaction worker every instance runs repacks under `<ASPEN_SPOOL_DIR>/compact` and needs about twice the largest cover's packs there |
 | `ASPEN_MAX_OBJECT_BYTES`, `ASPEN_MAX_INFLATED_BYTES` | `536870912`, `8589934592` | Largest object, and most one push may inflate to |
 | `ASPEN_MAX_PUSH_BYTES`, `ASPEN_MAX_PUSH_OBJECTS` | `8589934592`, `10000000` | Largest pack and most objects per push |
-| `ASPEN_PREFETCH_MEMORY_BYTES` | `4294967296` | Delta-base memory shared by concurrent pushes |
+| `ASPEN_PREFETCH_MEMORY_BYTES` | `4294967296` | Delta-base memory shared by concurrent pushes. Each push reserves 64 MiB of it before reading stored packs, and its full per-push budget (at least 1 GiB, 4 x `ASPEN_MAX_OBJECT_BYTES`) only if its bases need more, so the default admits 64 small pushes at once and 2 large ones |
+| `ASPEN_ROLE` | `all` | What this process runs: `all` (Git and the background worker), `serve` (Git, the merge queue and mirror mode; no compaction, commit indexing or garbage collection) or `compact` (the background worker only; no Git). See [Process roles](#process-roles) |
+| `ASPEN_COMPACT_WORKERS` | `8` | Background jobs (compaction and commit indexing) this instance runs at once, 1 to 64. Jobs mostly wait on the object store; one worker also runs the garbage-collection sweeps. Ignored with `ASPEN_ROLE=serve` |
+| `ASPEN_MERGE_QUEUE`, `ASPEN_MERGE_QUEUE_BATCH` | `off`, `64` | The merge queue: clients push a change to a ref of their own under `refs/queue/<trunk branch>/` (writable while it is on), and every instance's worker lands pending changes on trunk in batches of up to `ASPEN_MERGE_QUEUE_BATCH`, each batch one atomic compare-and-swap. A change that touches a path trunk or an earlier change in its batch changed is rejected. Each change's outcome is a ref: `refs/queue-done/<trunk>/<same name>` at the trunk commit that landed it, or `refs/queue-rejected/<trunk>/<same name>` at a report commit naming the conflicting paths ([docs/PLAN.md](../docs/PLAN.md), decisions log, 2026-11-06) |
+| `ASPEN_GROUP_COMMIT`, `ASPEN_GROUP_COMMIT_WINDOW_MS`, `ASPEN_GROUP_COMMIT_MAX_BATCH` | `off`, `2`, `64` | Group commit: concurrent pushes register their packs in one database transaction and commit their ref updates in another, batching pushes that arrive within the window (milliseconds, 0 to 1000) up to the batch size (1 to 1024). Each push is answered only after its pack is uploaded and its own ref update has committed; a lost compare-and-swap affects only that push. Each push still writes its own pack objects ([docs/PLAN.md](../docs/PLAN.md), decisions log, "Group commit") |
+| `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS` | `3600` | Seconds merge-queue outcome refs are kept before the queue deletes them; `0` keeps them for ever |
 | `ASPEN_MAX_CONCURRENT_FETCHES`, `ASPEN_MAX_CONCURRENT_PUSHES`, `ASPEN_MAX_CONCURRENT_STITCHES` | `32`, `16`, `32` | Fetch requests, push requests and inline packs this instance runs at once, whoever sends them (SSH sessions count as requests). A request beyond them waits in the queue, then gets `503` with `Retry-After` (a retryable `ERR` over SSH and for a stitch). Each caller is also capped by `concurrent` in `ASPEN_LIMITS` (16, 4 and 8 by default; `429`) |
-| `ASPEN_ADMISSION_QUEUE` | `64` | Requests of each kind that may wait (at most 10 s) for one of those slots; `0` refuses as soon as every slot is taken |
+| `ASPEN_ADMISSION_QUEUE` | `64` | Requests of each kind that may wait (at most `ASPEN_ADMISSION_QUEUE_WAIT_SECS`, 10 s by default) for one of those slots; `0` refuses as soon as every slot is taken |
+| Throughput tuning: `ASPEN_ADMISSION_QUEUE_WAIT_SECS`, `ASPEN_PREFETCH_FLOOR_BYTES`, `ASPEN_PREFETCH_PER_PUSH_BYTES`, `ASPEN_PREFETCH_WAIT_SECS`, `ASPEN_PREFETCH_PARALLEL_READS`, `ASPEN_IDX_CACHE_BYTES`, `ASPEN_IDX_WHOLE_MAX_BYTES`, `ASPEN_OBJECT_CACHE_BYTES`, `ASPEN_TRUNK_TREE_CACHE_BYTES`, `ASPEN_PUSH_THREADS`, `ASPEN_SYNC_COMMIT_ROWS`, `ASPEN_UPLOAD_PART_BYTES`, `ASPEN_UPLOAD_CONCURRENCY`, `ASPEN_DB_LOCK_TIMEOUT_SECS`, `ASPEN_DB_STATEMENT_TIMEOUT_SECS`, `ASPEN_COMPACT_IDLE_POLL_MS` | unset | Every throughput setting, with its default, meaning and how to tune it, is in the configuration reference ([site/src/configuration.md](../site/src/configuration.md#throughput-tuning)); unset keeps the default |
 | `ASPEN_PACKFILE_URIS` | `auto` | `auto` turns packfile URIs on when the store presigns URLs or express routes are set; `true`, `false` |
 | `ASPEN_EXPRESS_SERVE` | `auto` | Serve `/-/express` from this server: `auto` when `ASPEN_EXPRESS_URLS` names `<ASPEN_PUBLIC_URL>/-/express`; `true` for a CDN whose origin is this server |
 | `ASPEN_MIGRATE` | `true` | Apply schema migrations at startup (concurrent instances serialize on the database's migration lock) |
@@ -144,6 +150,34 @@ shares the HTTP server's repositories, access decisions and rate-limit
 buckets. SIGTERM stops accepting connections and
 finishes the requests in flight. It speaks HTTP/1.1 and cleartext HTTP/2
 (h2c) on the same port.
+
+### Process roles
+
+By default every `aspen serve` process serves Git and also runs the
+background worker: `compact` jobs (covers over each ref's versions),
+`index_commits` jobs and garbage collection. Under a high push rate the
+worker competes with pushes for CPU, disk and the database pool on the
+same instances, and adding Git servers is the only way to add compaction.
+`ASPEN_ROLE` splits the two:
+
+| `ASPEN_ROLE` | Git (HTTP, SSH), merge queue, mirror mode | Background worker |
+|---|---|---|
+| `all` (default) | yes | yes, `ASPEN_COMPACT_WORKERS` jobs at once |
+| `serve` | yes | no |
+| `compact` | no: `ASPEN_LISTEN` answers only `/healthz` and `/readyz` | yes, `ASPEN_COMPACT_WORKERS` jobs at once |
+
+Every process reads the same `DATABASE_URL` and `ASPEN_BLOB_URL`. Jobs are
+leased, so any number of `all` and `compact` processes share the queue,
+and garbage collection is safe on all of them at once. A deployment with
+`serve` processes must run at least one `compact` (or `all`) process, or
+covers are never built, large pushes' commits are never indexed and
+garbage is never collected. `ASPEN_ROLE=compact` refuses `ASPEN_SSH_LISTEN`
+and `ASPEN_MERGE_QUEUE=on`, which only a Git server uses. Scale the
+`compact` processes on `aspen_compaction_backlog`: flat under a steady push
+rate means compaction keeps up ([docs/OBSERVABILITY.md](../docs/OBSERVABILITY.md),
+"Compaction backlog"). The Helm chart (`compactor.enabled`) and the AWS
+module (`compactor_count`) run them as their own Deployment and ECS
+service.
 
 Repositories and API tokens are created with the same binary, against the
 same `DATABASE_URL`:

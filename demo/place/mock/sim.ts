@@ -246,6 +246,28 @@ export class PlaceSim {
     };
   }
 
+  /** `main` as the SVG of `GET /canvas.svg`, with its commit as the ETag. */
+  canvasSvg(): { etag: string; svg: string } {
+    const { width, height, palette } = this.opts;
+    const scale = Math.max(1, Math.floor(720 / Math.max(width, height, 1)));
+    const paths: string[] = palette.map(() => '');
+    for (let y = 0; y < height; y++) {
+      let x = 0;
+      while (x < width) {
+        const c = this.main[y * width + x];
+        const start = x;
+        while (x < width && this.main[y * width + x] === c) x++;
+        if (c !== UNSET && c < paths.length) paths[c] += `M${start} ${y}h${x - start}v1h-${x - start}z`;
+      }
+    }
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${width * scale}" height="${height * scale}" viewBox="0 0 ${width} ${height}" shape-rendering="crispEdges"><title>place canvas</title>` +
+      `<rect width="${width}" height="${height}" fill="#fafafa"/>` +
+      palette.map((p, i) => (paths[i] ? `<path fill="${p.color}" d="${paths[i]}"/>` : '')).join('') +
+      '</svg>';
+    return { etag: `"${this.mainCommit}"`, svg };
+  }
+
   snapshot(): CanvasSnapshot {
     let pixels = '';
     for (const v of this.main) pixels += v === UNSET ? '.' : v.toString(36);

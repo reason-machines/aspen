@@ -8,6 +8,8 @@
 //!   distinct branches, measuring push→fetch latency;
 //! - [`workloads::storm`]: a fetch storm, M jobs fetching one commit at once;
 //! - [`workloads::clone`]: clone throughput;
+//! - [`workloads::queue`]: merge-queue landings, N clients enqueueing
+//!   changes and waiting for each to land on trunk;
 //! - [`workloads::stale`]: the stale-branch fetch, a client current on trunk
 //!   fetching a branch created N trunk pushes ago.
 //!

@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 aspen-core = { path = "../aspen-core" }
 aspen-pack = { path = "../aspen-pack" }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
@@ -21,6 +22,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync",
 aspen-blob = { path = "../aspen-blob" }
 aspen-meta = { path = "../aspen-meta" }
 aspen-planner = { path = "../aspen-planner" }
+# The trailer of the tiny packs tests write by hand.
+gix-hash = { version = "=0.28.1", features = ["sha1"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

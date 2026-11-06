@@ -203,11 +203,12 @@ where
 {
     let haves_used = haves.len();
     let started = std::time::Instant::now();
-    let (rows, stats, loaded) = plan_counted(server, repo, mode, wants, haves, graph).await?;
+    let (rows, stats, loaded, heat) = plan_counted(server, repo, mode, wants, haves, graph).await?;
     let took = started.elapsed();
     server
         .metrics()
         .plan(&stats, loaded, haves_used, dropped, took);
+    server.note_compaction_heat(heat);
     tracing::debug!(
         visited = stats.visited,
         chain_skips = stats.chain_skips,
@@ -236,13 +237,14 @@ where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
 {
-    let (rows, stats, _) = plan_counted(server, repo, mode, wants, haves, graph).await?;
+    let (rows, stats, _, _) = plan_counted(server, repo, mode, wants, haves, graph).await?;
     Ok((rows, stats))
 }
 
 /// Plans like [`plan_quietly`] and also returns how many ref versions the
-/// planner's graph held when the plan was made: every one was one metadata
-/// read (the wants', the haves' and those loaded on demand).
+/// planner's graph held when the plan was made (every one was one metadata
+/// read: the wants', the haves' and those loaded on demand) and the plan's
+/// compaction heat ([`super::heat::heat_of`]).
 async fn plan_counted<M, B>(
     server: &Server<M, B>,
     repo: &Repo,
@@ -250,7 +252,15 @@ async fn plan_counted<M, B>(
     wants: &[resolve::Want],
     haves: Vec<(ObjectId, HaveVersion)>,
     mut graph: LoadedGraph,
-) -> Result<(Vec<PackRecord>, aspen_planner::PlanStats, usize), Failure>
+) -> Result<
+    (
+        Vec<PackRecord>,
+        aspen_planner::PlanStats,
+        usize,
+        Vec<aspen_core::meta::CompactionHeat>,
+    ),
+    Failure,
+>
 where
     M: MetaStore + Clone + 'static,
     B: BlobStore + Clone + 'static,
@@ -274,8 +284,9 @@ where
                 .cloned()
                 .expect("the planner only returns packs the graph holds")
         })
-        .collect();
-    Ok((rows, stats, graph.version_count()))
+        .collect::<Vec<_>>();
+    let heat = super::heat::heat_of(repo.id, &graph, &rows);
+    Ok((rows, stats, graph.version_count(), heat))
 }
 
 /// The packs and the `shallow-info` of a shallow request (fetch path step

@@ -19,19 +19,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aspen_auth::{AuthService, Limits};
-use aspen_blob::{AnyBlobStore, LocalBlobStore, LocalUrlSigner};
-use aspen_compact::{CompactConfig, Compactor, Worker, WorkerOptions};
+use aspen_blob::{AnyBlobStore, LocalBlobStore, LocalUrlSigner, UploadOptions};
+use aspen_compact::{CompactConfig, Compactor, Worker};
 use aspen_core::error::StoreError;
 use aspen_core::meta::MetaStore;
 use aspen_core::name::{RefName, RepoName};
-use aspen_core::pack::PushLimits;
 use aspen_core::repo::RepoSettings;
 use aspen_meta::SqlStore;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
 use aspen_server::access::Access;
 use aspen_server::access::tokens::SqlTokens;
 use aspen_server::mirror::SqlMirrors;
-use aspen_server::receive::ReceiveConfig;
 use aspen_server::ssh::keys::SqlSshKeys;
 use aspen_server::ssh::{PrivateKey, SshConfig, SshServer};
 use aspen_server::upload_pack::exact::ShallowCacheConfig;
@@ -41,7 +39,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 
-use crate::config::{HostKey, ServeConfig, Switch};
+use crate::config::{HostKey, Role, ServeConfig, Switch};
 
 /// What differs between `aspen serve` and `aspen dev`.
 #[derive(Debug)]
@@ -79,6 +77,7 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     // The S3 client and sqlx's TLS need a rustls provider (A4 obligation).
     let _ = rustls::crypto::ring::default_provider().install_default();
     let label = startup.label;
+    let role = config.role;
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -107,7 +106,12 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
         (None, true) => Some(random_secret()?),
         (None, false) => None,
     };
-    let blobs = open_blobs(&config.blob_url, secret.as_deref(), public_url.as_deref())?;
+    let blobs = open_blobs(
+        &config.blob_url,
+        secret.as_deref(),
+        public_url.as_deref(),
+        config.upload_options(),
+    )?;
     let presigns = match &blobs {
         AnyBlobStore::Object(_) => true,
         AnyBlobStore::Local(local) => local.url_signer().is_some(),
@@ -135,12 +139,7 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
         shallow.max_repo_bytes = config.shallow_max_repo_bytes;
         server_config.shallow_cache = Some(shallow);
     }
-    let mut receive = ReceiveConfig::new(&config.spool_dir, max_object, max_inflated);
-    receive.push_limits = PushLimits {
-        max_objects: config.max_push_objects,
-        max_pack_bytes: config.max_push_bytes,
-    };
-    receive.prefetch_memory_bytes = config.prefetch_memory_bytes;
+    let receive = config.receive_config(max_object, max_inflated);
     // Compaction and commit indexing (C1): the worker started below runs
     // the `compact` and `index_commits` jobs pushes enqueue, and garbage
     // collection. It must lay covers out the way the push path schedules
@@ -154,10 +153,17 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     compact
         .validate()
         .map_err(|e| format!("compaction settings: {e}"))?;
-    let mut compactor = Worker::new(
-        Compactor::new(meta.clone(), blobs.clone(), compact),
-        WorkerOptions::new(worker_id(label)?),
-    );
+    // Several workers, each with its own lease name, run jobs at once; one
+    // of them also runs the garbage-collection sweeps.
+    let mut compactors = Vec::with_capacity(config.compact_workers);
+    for i in 0..config.compact_workers {
+        let mut options = config.worker_options(worker_id(label)?);
+        options.collect_garbage = i == 0;
+        compactors.push(Worker::new(
+            Compactor::new(meta.clone(), blobs.clone(), compact.clone()),
+            options,
+        ));
+    }
 
     let mut server = Server::new(meta.clone(), blobs.clone(), server_config)
         .with_receive_pack(receive)
@@ -237,13 +243,30 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
         None => None,
     };
 
-    let app = router(meta, server.router(Arc::clone(&access)));
+    let queue_svc = server.receive_pack().cloned();
+    // A compaction-only process answers health checks on ASPEN_LISTEN and
+    // nothing else: no Git route is mounted.
+    let app = if role.serves_git() {
+        router(meta, server.router(Arc::clone(&access)))
+    } else {
+        router(meta, Router::new())
+    };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let until_stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
         let _ = rx.wait_for(|s| *s).await;
     };
 
-    tracing::info!("aspen {label}: listening on http://{addr}");
+    // Tools and tests read the address from the end of this line.
+    match role {
+        Role::All => tracing::info!("aspen {label}: listening on http://{addr}"),
+        Role::Serve => {
+            tracing::info!("aspen {label}: ASPEN_ROLE=serve (Git only): listening on http://{addr}")
+        }
+        Role::Compact => tracing::info!(
+            "aspen {label}: ASPEN_ROLE=compact (background jobs and health checks only, no \
+             Git): listening on http://{addr}"
+        ),
+    }
     if startup.warn_unlimited_rates
         && let Some(warning) = crate::config::unlimited_rates_warning(&config.limits)
     {
@@ -293,18 +316,41 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
         }
         None => None,
     };
-    tracing::info!("aspen {label}: mirror sync passes every {sync_secs} s");
-    let mirror_task = tokio::spawn(mirror.run(worker_id(label)?));
-    // Every instance runs a worker: jobs are leased, and garbage collection
-    // is safe on several workers at once (pack generations, issue #48).
-    let compact_task = if config.background_worker {
-        tracing::info!("aspen {label}: compaction and indexing worker running");
+    // Mirror mode forwards and replays pushes, so it runs where Git is
+    // served.
+    let mirror_task = if role.serves_git() {
+        tracing::info!("aspen {label}: mirror sync passes every {sync_secs} s");
+        tokio::spawn(mirror.run(worker_id(label)?))
+    } else {
+        tokio::spawn(async {})
+    };
+    // Every instance whose role runs jobs runs a worker: jobs are leased,
+    // and garbage collection is safe on several workers at once (pack
+    // generations, issue #48), so any number of `all` and `compact`
+    // processes share the queue.
+    let compact_task = if !role.runs_jobs() {
+        tracing::info!(
+            "aspen {label}: ASPEN_ROLE=serve: no background worker here; compaction, commit \
+             indexing and garbage collection run in ASPEN_ROLE=compact (or all) processes"
+        );
+        tokio::spawn(async {})
+    } else if config.background_worker {
+        tracing::info!(
+            "aspen {label}: compaction and indexing worker running ({} jobs at once)",
+            compactors.len()
+        );
+        // A JoinSet, so aborting this task at shutdown aborts every worker.
         tokio::spawn(async move {
-            compactor
-                .run(std::future::pending(), |e| {
-                    tracing::warn!("aspen {label}: background worker: {e}");
-                })
-                .await;
+            let mut workers = tokio::task::JoinSet::new();
+            for mut w in compactors {
+                workers.spawn(async move {
+                    w.run(std::future::pending(), |e| {
+                        tracing::warn!("aspen {label}: background worker: {e}");
+                    })
+                    .await;
+                });
+            }
+            while workers.join_next().await.is_some() {}
         })
     } else {
         tracing::warn!(
@@ -312,6 +358,32 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
              garbage collection"
         );
         tokio::spawn(async {})
+    };
+    // The merge queue (docs/PLAN.md decisions log, 2026-11-06): every
+    // instance may run one; batches land by compare-and-swap.
+    let queue_task = match (config.merge_queue && role.serves_git(), queue_svc) {
+        (true, Some(svc)) => {
+            tracing::info!(
+                "aspen {label}: merge queue on (up to {} entries per trunk update)",
+                config.merge_queue_batch
+            );
+            let queue = aspen_server::queue::MergeQueue::new(
+                svc,
+                aspen_server::queue::QueueConfig {
+                    batch: config.merge_queue_batch,
+                    outcome_ttl: config.merge_queue_outcome_ttl,
+                    ..Default::default()
+                },
+            );
+            Some(tokio::spawn(async move {
+                queue
+                    .run(std::future::pending(), |e| {
+                        tracing::warn!("aspen {label}: merge queue: {e}");
+                    })
+                    .await;
+            }))
+        }
+        _ => None,
     };
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -339,6 +411,11 @@ async fn serve(config: ServeConfig, startup: Startup) -> Result<(), BoxError> {
     // Jobs are leased and idempotent, so a job cut short here is reclaimed
     // after its lease by any worker and redone.
     compact_task.abort();
+    // A batch either landed atomically or not at all; the next instance to
+    // start rebuilds what is pending.
+    if let Some(t) = queue_task {
+        t.abort();
+    }
     if let Some(p) = prober {
         p.abort();
     }
@@ -433,14 +510,21 @@ async fn readyz(State(readiness): State<Arc<Readiness>>) -> (StatusCode, &'stati
 }
 
 /// Opens `ASPEN_BLOB_URL`. A `file://` store with a secret and a public URL
-/// presigns `<public>/-/blobs/...` URLs that this server serves.
+/// presigns `<public>/-/blobs/...` URLs that this server serves; an object
+/// store uploads with `upload` (`ASPEN_UPLOAD_*`).
 pub(crate) fn open_blobs(
     url: &str,
     secret: Option<&[u8]>,
     public_url: Option<&str>,
+    upload: UploadOptions,
 ) -> Result<AnyBlobStore, BoxError> {
     let store = aspen_blob::open(url).map_err(|e| format!("ASPEN_BLOB_URL: {e}"))?;
     Ok(match (store, secret, public_url) {
+        (AnyBlobStore::Object(object), _, _) => AnyBlobStore::Object(
+            object
+                .with_upload_options(upload)
+                .map_err(|e| format!("ASPEN_UPLOAD_PART_BYTES, ASPEN_UPLOAD_CONCURRENCY: {e}"))?,
+        ),
         (AnyBlobStore::Local(local), Some(secret), Some(public)) => {
             let signer = LocalUrlSigner::new(&format!("{public}/-/blobs"), secret)
                 .map_err(|e| format!("ASPEN_BLOB_URL_SECRET: {e}"))?;

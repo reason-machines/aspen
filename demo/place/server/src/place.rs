@@ -64,20 +64,36 @@ pub struct PlaceConfig {
     /// so this bounds how fast idle painting grows a clone: about 2.6 MB a
     /// day at the default of 5 minutes.
     pub ambient_merge_interval: Duration,
-    /// Mean time between one ambient agent's strokes (each is spread
-    /// uniformly over half to one and a half times this). Every stroke is a
-    /// commit on the agent's branch, advertised until it merges.
+    /// Mean time between the pushes of one sprite an ambient agent paints
+    /// (each is spread uniformly over half to one and a half times this).
+    /// Every push is a commit on the agent's branch, advertised until it
+    /// merges.
     pub ambient_interval: Duration,
+    /// Mean time an ambient agent rests between two sprites ([`crate::sprites`]).
+    pub ambient_sprite_pause: Duration,
+    /// Areas `(x, y, width, height)` ambient agents never paint over, for
+    /// people's work painted before the server started (it remembers what
+    /// people paint only in memory, for six hours).
+    pub keep_areas: Vec<(u32, u32, u32, u32)>,
     /// What `GET /config` tells people to `git clone`.
     pub clone_url: String,
     /// The live dashboard, if there is one.
     pub dashboard_url: Option<String>,
+    /// Where `main` is mirrored read-only, if anywhere (named in the
+    /// canvas's README).
+    pub mirror_url: Option<String>,
     /// Background agents that paint a stroke every few seconds each.
     pub ambient_agents: usize,
     /// The swarm's limits.
     pub swarm: SwarmLimits,
     /// Swarm runs one client address may start per hour.
     pub swarm_starts_per_hour: usize,
+    /// Whether visitors may start the swarm through `POST /swarm`. Off on the
+    /// public demo, where one click paints one tile and nothing else.
+    pub swarm_enabled: bool,
+    /// Tiles one push through the web API may carry. The public page sends
+    /// one tile per click; Git pushes keep `rules.tiles_per_push`.
+    pub web_tiles_per_push: usize,
     /// Sessions one client address may create per minute.
     pub sessions_per_minute: usize,
     /// Sessions kept at once; more are refused until some expire.
@@ -132,8 +148,11 @@ impl PlaceConfig {
             merge_interval: Duration::from_millis(3000),
             ambient_merge_interval: Duration::from_secs(300),
             ambient_interval: Duration::from_secs(30),
+            ambient_sprite_pause: Duration::from_secs(1800),
+            keep_areas: Vec::new(),
             clone_url: clone_url.into(),
             dashboard_url: None,
+            mirror_url: None,
             ambient_agents: 6,
             swarm: SwarmLimits {
                 max_agents: 1000,
@@ -143,6 +162,8 @@ impl PlaceConfig {
                 ramp_ms: 3000,
             },
             swarm_starts_per_hour: 6,
+            swarm_enabled: true,
+            web_tiles_per_push: 64,
             sessions_per_minute: 10,
             max_sessions: 100_000,
             event_backlog: 5000,
@@ -272,10 +293,64 @@ impl Rng {
 #[derive(Debug)]
 struct Ambient {
     name: String,
-    x: u32,
-    y: u32,
-    color: u8,
+    /// The sprite being painted, if any.
+    job: Option<SpriteJob>,
     next_ms: u64,
+}
+
+/// A sprite an ambient agent is painting, push by push.
+#[derive(Debug)]
+struct SpriteJob {
+    tiles: Vec<Tile>,
+    next: usize,
+    rect: Rect,
+}
+
+/// A rectangle of tiles: `(x, y, width, height)`.
+type Rect = (u32, u32, u32, u32);
+
+fn overlap(a: Rect, b: Rect) -> u32 {
+    let w = (a.0 + a.2).min(b.0 + b.2).saturating_sub(a.0.max(b.0));
+    let h = (a.1 + a.3).min(b.1 + b.3).saturating_sub(a.1.max(b.1));
+    w * h
+}
+
+/// Where to put a `w` x `h` sprite on the canvas: the best of a few
+/// random spots, never one covering `human` (tiles people painted
+/// recently), and preferring spots clear of `busy` (other agents' sprites,
+/// recent ones included) so sprites spread out. `None` when every spot
+/// tried covers people's work.
+fn choose_spot(
+    rng: &mut Rng,
+    rules: &Rules,
+    (w, h): (u32, u32),
+    human: &[usize],
+    busy: &[Rect],
+) -> Option<(u32, u32)> {
+    if w > rules.width || h > rules.height {
+        return None;
+    }
+    let mut best: Option<(u32, (u32, u32))> = None;
+    for _ in 0..48 {
+        let x = rng.below(u64::from(rules.width - w + 1)) as u32;
+        let y = rng.below(u64::from(rules.height - h + 1)) as u32;
+        let rect = (x, y, w, h);
+        let covers_people = human.iter().any(|&i| {
+            let (tx, ty) = (i as u32 % rules.width, i as u32 / rules.width);
+            tx >= x && tx < x + w && ty >= y && ty < y + h
+        });
+        if covers_people {
+            continue;
+        }
+        let score: u32 = busy.iter().map(|b| overlap(rect, *b)).sum();
+        if best.is_none_or(|(s, _)| score < s) {
+            best = Some((score, (x, y)));
+        }
+        if score == 0 {
+            break;
+        }
+    }
+    best.map(|(_, spot)| spot)
 }
 
 /// Checks an `Authorization` header for operator rights (the kill switch).
@@ -401,11 +476,16 @@ pub struct Place<M, B> {
     permits: Arc<Semaphore>,
     rng: Mutex<Rng>,
     ambient: Mutex<Vec<Ambient>>,
+    /// False while [`Place::run`]'s [`Place::rebuild_memory`] is still
+    /// reading recent paint from `main`'s merge commits.
+    memory_ready: std::sync::atomic::AtomicBool,
     /// Locked inside `shared.state` by [`Place::start_swarm`]; never lock
     /// `shared.state` while holding it.
     pub(crate) sessions: Mutex<crate::api::Sessions>,
     pub(crate) event_streams: Arc<Slots>,
     pub(crate) operators: Arc<dyn Operators>,
+    /// `GET /canvas.svg`, rendered once per `main` commit.
+    pub(crate) svg: crate::image::SvgCache,
 }
 
 /// The canvas repository, created with `main` as trunk if missing.
@@ -460,14 +540,53 @@ pub fn shared(repo: &Repo, config: &PlaceConfig) -> Arc<Shared> {
     })
 }
 
-const README: &str = "# place\n\n\
-A shared pixel canvas. Every tile is a file, tiles/<x>_<y>.txt, holding one\n\
-palette color as exactly \"#rrggbb\" and a newline. Paint on your own branch:\n\n\
-    printf '#d6262b\\n' > tiles/12_40.txt\n\
-    git add tiles && git commit -m 'paint'\n\
-    git push origin HEAD:refs/heads/paint/<you>\n\n\
-A merger bot folds every branch into main every few seconds. Only tile files\n\
-may change; see docs/TILES.md in the Aspen repository for every rule.\n";
+/// The canvas's `README.md`. Every commit the server writes keeps it, and
+/// [`Place::open`] rewrites `main`'s copy when it differs from this one. It
+/// shows the live canvas (`GET /api/v1/canvas.svg`) and makes no timing
+/// claims, since merge and mirror intervals are settings.
+pub fn readme(config: &PlaceConfig) -> String {
+    let clone = &config.clone_url;
+    let page = clone
+        .strip_suffix(&format!("/{}.git", config.repo))
+        .unwrap_or(clone);
+    let mut lines = vec![
+        "# place".to_owned(),
+        String::new(),
+        format!(
+            "[![The canvas, live]({page}{api}/canvas.svg)]({page})",
+            api = crate::api::API_BASE
+        ),
+        String::new(),
+        "A shared pixel canvas where every brush stroke is a `git push`, served by".to_owned(),
+        "[Aspen](https://github.com/reason-machines/aspen).".to_owned(),
+        String::new(),
+        "## Paint".to_owned(),
+        String::new(),
+        format!("    git clone --depth=1 {clone} && cd {}", config.repo),
+        "    printf '#d6262b\\n' > tiles/12_40.txt".to_owned(),
+        "    git add tiles && git commit -m paint".to_owned(),
+        "    git push origin HEAD:refs/heads/paint/<you>".to_owned(),
+        String::new(),
+        "Each tile is `tiles/<x>_<y>.txt`, holding one palette color as `#rrggbb` and a newline."
+            .to_owned(),
+        "Pushes may change only tile files. The rules are in".to_owned(),
+        "[TILES.md](https://github.com/reason-machines/aspen/blob/main/demo/place/docs/TILES.md)."
+            .to_owned(),
+        "A bot merges branches into `main`.".to_owned(),
+        String::new(),
+        "## Notes".to_owned(),
+        String::new(),
+        "- Pushes are public, including the name and email in your commits.".to_owned(),
+    ];
+    if config.mirror_url.is_some() {
+        lines.push(
+            "- This repository is a read-only mirror of `main`. Push to the demo, not here."
+                .to_owned(),
+        );
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
 
 impl<M, B> Place<M, B>
 where
@@ -500,9 +619,7 @@ where
         let ambient = (0..config.ambient_agents)
             .map(|i| Ambient {
                 name: format!("agent/{}-{}", words[i % words.len()], 10 + rng.below(89)),
-                x: rng.below(u64::from(config.rules.width)) as u32,
-                y: rng.below(u64::from(config.rules.height)) as u32,
-                color: rng.below(config.rules.palette.len() as u64) as u8,
+                job: None,
                 next_ms: now + 300 + rng.below(2000),
             })
             .collect();
@@ -517,11 +634,14 @@ where
             merge_lock: tokio::sync::Mutex::new(()),
             rng: Mutex::new(rng),
             ambient: Mutex::new(ambient),
+            memory_ready: std::sync::atomic::AtomicBool::new(true),
             sessions: Mutex::new(sessions),
             event_streams,
             operators,
+            svg: crate::image::SvgCache::default(),
         });
         place.load_main().await?;
+        place.refresh_readme().await?;
         place.load_branches().await?;
         Ok(place)
     }
@@ -562,6 +682,51 @@ where
         RefName::new(TRUNK_REF).expect("valid")
     }
 
+    /// Writes a commit on `main` that replaces its `README.md` with
+    /// [`readme`], when they differ (the text changed with a new version or
+    /// the deployment's settings). The tiles do not change.
+    async fn refresh_readme(&self) -> Result<(), PlaceError> {
+        let main = self.with_state(|s| s.main.clone());
+        let mut pb = PackBuilder::default();
+        let id = pb.add(ObjectKind::Blob, readme(&self.config).into_bytes());
+        let Some(at) = main.extras.iter().position(|e| e.name == b"README.md") else {
+            return Ok(());
+        };
+        if main.extras[at].id == id {
+            return Ok(());
+        }
+        let mut extras = (*main.extras).clone();
+        extras[at].id = id;
+        let commit = self.add_commit(
+            &mut pb,
+            &main.pixels,
+            &extras,
+            &[main.commit],
+            "Update the README\n\nWritten by the place server; the canvas is unchanged.",
+        );
+        match self
+            .push(
+                &Self::trunk(),
+                false,
+                main.commit,
+                commit,
+                Some(pb.finish()),
+                "merger",
+            )
+            .await?
+        {
+            Report::Ok => {
+                self.with_state(|s| {
+                    s.main.commit = commit;
+                    s.main.extras = Arc::new(extras);
+                });
+                Ok(())
+            }
+            // `main` moved (another writer): the next start tries again.
+            Report::Rejected(_) => self.load_main().await,
+        }
+    }
+
     async fn load_main(&self) -> Result<(), PlaceError> {
         let trunk = Self::trunk();
         let current = self.meta.current_version(self.repo.id, &trunk).await?;
@@ -576,7 +741,7 @@ where
             }
             None => {
                 let mut pb = PackBuilder::default();
-                let readme = pb.add(ObjectKind::Blob, README.as_bytes().to_vec());
+                let readme = pb.add(ObjectKind::Blob, readme(&self.config).into_bytes());
                 let extras = vec![TreeEntry {
                     mode: MODE_FILE,
                     name: b"README.md".to_vec(),
@@ -881,11 +1046,16 @@ where
         let (plan, main) = self.with_state(|s| (s.plan_merge(), s.main.clone()));
         let Some(plan) = plan else { return Ok(None) };
         let mut pb = PackBuilder::default();
-        let message = format!(
+        let mut message = format!(
             "Merge {} branches through push {}\n\nMerged by the place merger bot: each push's tiles are\nreplayed onto main in push order.",
             plan.branches.len(),
             plan.through
         );
+        message.push_str(&memory_trailers(
+            &self.shared.rules,
+            &plan.people,
+            &plan.sprites,
+        ));
         let commit = self.add_commit(
             &mut pb,
             &plan.pixels,
@@ -914,6 +1084,107 @@ where
                 Err(PlaceError::Refused(r))
             }
         }
+    }
+
+    /// Replaces `main`'s history with one root commit holding the canvas as
+    /// it is now, after merging what is pending, and deletes every branch
+    /// whose tiles have all merged (they hold the old history). The picture
+    /// does not change; clones made before see a forced update of `main`.
+    /// An operator's tool for a demo whose history has outgrown its use:
+    /// every stroke stores a whole `tiles/` tree, and stored packs have no
+    /// deltas yet, so a full clone grows with every merge. Garbage
+    /// collection then deletes the packs only the old history reached.
+    /// Returns the new root commit.
+    pub async fn reset_history(&self) -> Result<ObjectId, PlaceError> {
+        self.merge_once().await?;
+        let commit = {
+            let _guard = self.merge_lock.lock().await;
+            let trunk = Self::trunk();
+            let version = self
+                .meta
+                .current_version(self.repo.id, &trunk)
+                .await?
+                .ok_or_else(|| PlaceError::Corrupt("main does not exist".into()))?;
+            let main = self.with_state(|s| s.main.clone());
+            if version.value.tip() != Some(main.commit) {
+                // `main` moved under us: start again from what is stored.
+                self.load_main().await?;
+                return Err(PlaceError::Refused("main moved; try again".into()));
+            }
+            // An orphan commit's pack holds everything it reaches: the
+            // extras (the README) are read from the current history.
+            let mut pb = PackBuilder::default();
+            for e in main.extras.iter() {
+                match self.svc.read_object(self.repo.id, version.id, e.id).await? {
+                    Some((ObjectKind::Blob, data)) => {
+                        pb.add(ObjectKind::Blob, data);
+                    }
+                    _ => {
+                        return Err(PlaceError::Corrupt(format!(
+                            "{} at the root of main is not a blob",
+                            String::from_utf8_lossy(&e.name)
+                        )));
+                    }
+                }
+            }
+            let message = format!(
+                "Start the canvas again from main at {}\n\nThe history before this commit was removed by an operator; the canvas is\nunchanged.",
+                main.commit
+            );
+            let commit = self.add_commit(&mut pb, &main.pixels, &main.extras, &[], &message);
+            let body = crate::git::forced_receive_request(
+                trunk.as_str(),
+                main.commit,
+                commit,
+                pb.finish(),
+            );
+            let repo = Repo {
+                settings: self
+                    .repo
+                    .settings
+                    .clone()
+                    .with_allow_force(aspen_core::repo::ForcePolicy::All),
+                ..self.repo.clone()
+            };
+            let out = self
+                .svc
+                .push(
+                    &repo,
+                    None,
+                    &Internal("operator"),
+                    None,
+                    std::io::Cursor::new(body),
+                )
+                .await
+                .map_err(|ServiceError::Store(e)| e)?;
+            match crate::git::parse_report(&out.response) {
+                Report::Ok => {}
+                Report::Rejected(r) => {
+                    self.load_main().await?;
+                    return Err(PlaceError::Refused(r));
+                }
+            }
+            self.with_state(|s| s.main.commit = commit);
+            commit
+        };
+        let due = self.with_state(|s| s.expirable(0, u64::MAX));
+        for (branch, head, deleted) in due {
+            let lock = self.branch_lock(&branch);
+            let _guard = lock.lock().await;
+            if !deleted {
+                let name = RefName::new(format!("refs/heads/{branch}"))
+                    .map_err(|e| PlaceError::Corrupt(e.to_string()))?;
+                let report = self
+                    .push(&name, true, head, ObjectId::ZERO, None, "expiry")
+                    .await?;
+                if report != Report::Ok && report.reason() != Some(RejectReason::NoSuchRef) {
+                    continue;
+                }
+            }
+            self.with_state(|s| s.expire(&branch, now_ms()));
+            self.locks.lock().expect("not poisoned").remove(&branch);
+        }
+        Ok(commit)
     }
 
     /// Deletes branches whose tiles have all merged and that have been
@@ -1031,10 +1302,58 @@ where
         })
     }
 
+    /// Restores the memory of recent paint (people's tiles and sprites'
+    /// tiles from the last six hours) from the trailers of `main`'s merge
+    /// commits, walking back from the tip, so a restart does not let
+    /// ambient agents paint over them. Bounded to [`MEMORY_WALK`] commits.
+    pub async fn rebuild_memory(&self) -> Result<(), PlaceError> {
+        let trunk = Self::trunk();
+        let Some(version) = self.meta.current_version(self.repo.id, &trunk).await? else {
+            return Ok(());
+        };
+        let Some(mut at) = version.value.tip() else {
+            return Ok(());
+        };
+        let now_s = now_ms() / 1000;
+        let window_s = crate::state::HUMAN_MEMORY_MS / 1000;
+        let rules = self.shared.rules.clone();
+        for _ in 0..MEMORY_WALK {
+            let Some((ObjectKind::Commit, data)) =
+                self.svc.read_object(self.repo.id, version.id, at).await?
+            else {
+                break;
+            };
+            let (time, people, sprites) = parse_memory(&data, &rules);
+            let Some(time) = time.filter(|t| t + window_s > now_s) else {
+                break;
+            };
+            self.with_state(|s| s.remember(&people, &sprites, time * 1000));
+            let (_, parents) = parse_commit(&data).map_err(PlaceError::Corrupt)?;
+            match parents.first() {
+                Some(p) => at = *p,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Runs the merger bot, branch expiry, the ambient agents and the
     /// swarm until `shutdown` resolves, then merges what is pending one
     /// last time.
     pub async fn run(self: Arc<Self>, shutdown: impl std::future::Future<Output = ()>) {
+        {
+            self.memory_ready
+                .store(false, std::sync::atomic::Ordering::Release);
+            let place = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = place.rebuild_memory().await {
+                    eprintln!("place: rebuilding the memory of recent paint failed: {e}");
+                }
+                place
+                    .memory_ready
+                    .store(true, std::sync::atomic::Ordering::Release);
+            });
+        }
         let mut merge = tokio::time::interval(self.config.merge_interval);
         merge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // When a merge with only ambient pushes may next run.
@@ -1121,31 +1440,88 @@ where
         if killed {
             return;
         }
+        // Tiles people painted recently, read only when an agent is about
+        // to pick a new sprite (lock order: `shared.state` is never taken
+        // while `ambient` is held).
+        // Until the memory of recent paint is rebuilt from `main` after a
+        // start, agents pick no new sprites.
+        let picking = self.memory_ready.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .ambient
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|a| a.next_ms <= now && a.job.is_none());
+        let human: Vec<usize> = if picking {
+            let mut human: Vec<usize> = self.with_state(|s| s.protected_tiles(now));
+            for &(x, y, w, h) in &self.config.keep_areas {
+                for ty in y..(y + h).min(rules.height) {
+                    for tx in x..(x + w).min(rules.width) {
+                        human.push(rules.index(tx, ty));
+                    }
+                }
+            }
+            human
+        } else {
+            Vec::new()
+        };
+        let chunk = rules.tiles_per_push.max(1);
         let due: Vec<(String, Vec<Tile>)> = {
             let mut ambient = self.ambient.lock().expect("not poisoned");
             let mut rng = self.rng.lock().expect("not poisoned");
             let mut out = Vec::new();
-            for a in ambient.iter_mut().filter(|a| a.next_ms <= now) {
-                let mean = (self.config.ambient_interval.as_millis() as u64).max(2);
-                a.next_ms = now + mean / 2 + rng.below(mean);
-                if rng.below(10) < 3 {
-                    a.color = rng.below(rules.palette.len() as u64) as u8;
+            let busy_of = |ambient: &[Ambient]| {
+                ambient
+                    .iter()
+                    .filter_map(|a| a.job.as_ref().map(|j| j.rect))
+                    .collect::<Vec<Rect>>()
+            };
+            for i in 0..ambient.len() {
+                if ambient[i].next_ms > now {
+                    continue;
                 }
-                let mut tiles: Vec<Tile> = Vec::new();
-                for _ in 0..2 + rng.below(6) {
-                    let step = |v: u32, max: u32, r: u64| {
-                        (i64::from(v) + r as i64 - 1).clamp(0, i64::from(max) - 1) as u32
-                    };
-                    a.x = step(a.x, rules.width, rng.below(3));
-                    a.y = step(a.y, rules.height, rng.below(3));
-                    if tiles.iter().all(|t| (t.x, t.y) != (a.x, a.y)) {
-                        tiles.push(Tile {
-                            x: a.x,
-                            y: a.y,
-                            color: a.color,
+                if ambient[i].job.is_none() {
+                    if !picking {
+                        continue;
+                    }
+                    let sprite = &crate::sprites::SPRITES
+                        [rng.below(crate::sprites::SPRITES.len() as u64) as usize];
+                    let variant = rng.below(sprite.variants.len() as u64) as usize;
+                    let busy = busy_of(&ambient);
+                    let (w, h) = sprite.size();
+                    let picked =
+                        choose_spot(&mut rng, &rules, (w, h), &human, &busy).and_then(|(x, y)| {
+                            sprite
+                                .tiles(variant, x, y, &rules.palette)
+                                .map(|tiles| SpriteJob {
+                                    tiles,
+                                    next: 0,
+                                    rect: (x, y, w, h),
+                                })
                         });
+                    match picked {
+                        Some(job) => ambient[i].job = Some(job),
+                        None => {
+                            // No room clear of people's work and recent
+                            // sprites (the canvas is full for now), or a
+                            // color missing from the palette: try later.
+                            ambient[i].next_ms = now + 60_000;
+                            continue;
+                        }
                     }
                 }
+                let a = &mut ambient[i];
+                let job = a.job.as_mut().expect("set above");
+                let end = (job.next + chunk).min(job.tiles.len());
+                let tiles = job.tiles[job.next..end].to_vec();
+                job.next = end;
+                let mean = if job.next >= job.tiles.len() {
+                    a.job = None;
+                    (self.config.ambient_sprite_pause.as_millis() as u64).max(2)
+                } else {
+                    (self.config.ambient_interval.as_millis() as u64).max(2)
+                };
+                a.next_ms = now + mean / 2 + rng.below(mean);
                 out.push((a.name.clone(), tiles));
             }
             out
@@ -1157,13 +1533,71 @@ where
             let place = self.clone();
             tokio::spawn(async move {
                 let _ = place
-                    .paint(&branch, Actor::agent(&branch), &tiles, "Ambient stroke")
+                    .paint(&branch, Actor::agent(&branch), &tiles, "Ambient sprite")
                     .await;
                 drop(permit);
             });
         }
     }
 }
+
+/// Trailers that record which tiles of a merge people painted and which
+/// ambient sprites painted, so [`Place::rebuild_memory`] can restore the
+/// memory of recent paint from `main` after a restart.
+pub fn memory_trailers(rules: &Rules, people: &[usize], sprites: &[usize]) -> String {
+    let w = rules.width as usize;
+    let list = |tiles: &[usize]| {
+        tiles
+            .iter()
+            .map(|i| format!("{},{}", i % w, i / w))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut out = String::new();
+    if !people.is_empty() || !sprites.is_empty() {
+        out.push('\n');
+    }
+    if !people.is_empty() {
+        out.push_str(&format!("\nPeople-tiles: {}", list(people)));
+    }
+    if !sprites.is_empty() {
+        out.push_str(&format!("\nSprite-tiles: {}", list(sprites)));
+    }
+    out
+}
+
+/// The committer time (Unix seconds) and the people's and sprites' tiles a
+/// merge commit's trailers name ([`memory_trailers`]).
+pub fn parse_memory(commit: &[u8], rules: &Rules) -> (Option<u64>, Vec<usize>, Vec<usize>) {
+    let text = String::from_utf8_lossy(commit);
+    let mut time = None;
+    let (mut people, mut sprites) = (Vec::new(), Vec::new());
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("committer ") {
+            time = rest.rsplit(' ').nth(1).and_then(|s| s.parse().ok());
+        }
+        let (into, list) = if let Some(l) = line.strip_prefix("People-tiles: ") {
+            (&mut people, l)
+        } else if let Some(l) = line.strip_prefix("Sprite-tiles: ") {
+            (&mut sprites, l)
+        } else {
+            continue;
+        };
+        for xy in list.split(' ') {
+            if let Some((x, y)) = xy.split_once(',')
+                && let (Ok(x), Ok(y)) = (x.parse::<u32>(), y.parse::<u32>())
+                && x < rules.width
+                && y < rules.height
+            {
+                into.push(rules.index(x, y));
+            }
+        }
+    }
+    (time, people, sprites)
+}
+
+/// The most `main` commits [`Place::rebuild_memory`] reads.
+pub const MEMORY_WALK: usize = 2000;
 
 /// Why a swarm could not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1191,5 +1625,80 @@ pub fn actor_for(short: &str) -> Actor {
         Actor::agent(short)
     } else {
         Actor::git(short)
+    }
+}
+
+#[cfg(test)]
+mod readme_tests {
+    use super::*;
+
+    /// The public demo's README, word for word (it is also the GitHub
+    /// mirror's front page).
+    #[test]
+    fn the_public_demo_readme() {
+        let mut c = PlaceConfig::new("https://place.reasonmachines.com/canvas.git");
+        c.mirror_url = Some("https://github.com/reason-machines/place-canvas".into());
+        let expected = "# place
+
+[![The canvas, live](https://place.reasonmachines.com/api/v1/canvas.svg)](https://place.reasonmachines.com)
+
+A shared pixel canvas where every brush stroke is a `git push`, served by
+[Aspen](https://github.com/reason-machines/aspen).
+
+## Paint
+
+    git clone --depth=1 https://place.reasonmachines.com/canvas.git && cd canvas
+    printf '#d6262b\\n' > tiles/12_40.txt
+    git add tiles && git commit -m paint
+    git push origin HEAD:refs/heads/paint/<you>
+
+Each tile is `tiles/<x>_<y>.txt`, holding one palette color as `#rrggbb` and a newline.
+Pushes may change only tile files. The rules are in
+[TILES.md](https://github.com/reason-machines/aspen/blob/main/demo/place/docs/TILES.md).
+A bot merges branches into `main`.
+
+## Notes
+
+- Pushes are public, including the name and email in your commits.
+- This repository is a read-only mirror of `main`. Push to the demo, not here.
+";
+        assert_eq!(readme(&c), expected);
+    }
+}
+
+#[cfg(test)]
+mod sprite_spot_tests {
+    use super::*;
+
+    fn rules(w: u32, h: u32) -> Rules {
+        Rules {
+            width: w,
+            height: h,
+            palette: rules::default_palette(),
+            tiles_per_push: 64,
+        }
+    }
+
+    /// Sprites never cover tiles people painted, and spread away from
+    /// other sprites when there is room.
+    #[test]
+    fn spots_avoid_people_and_spread_out() {
+        let r = rules(32, 32);
+        let mut rng = Rng(7);
+        // People painted the whole left half.
+        let human: Vec<usize> = (0..32u32)
+            .flat_map(|y| (0..16u32).map(move |x| (y * 32 + x) as usize))
+            .collect();
+        let busy = [(16, 0, 8, 8)];
+        for _ in 0..50 {
+            let (x, y) = choose_spot(&mut rng, &r, (8, 8), &human, &busy).unwrap();
+            assert!(x >= 16, "covers people's work at {x},{y}");
+            assert_eq!(overlap((x, y, 8, 8), busy[0]), 0, "{x},{y}");
+        }
+        // No room clear of people: no spot.
+        let everything: Vec<usize> = (0..32 * 32).collect();
+        assert_eq!(choose_spot(&mut rng, &r, (8, 8), &everything, &[]), None);
+        // Larger than the canvas: no spot.
+        assert_eq!(choose_spot(&mut rng, &rules(4, 4), (8, 8), &[], &[]), None);
     }
 }

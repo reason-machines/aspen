@@ -4,9 +4,11 @@
 //!
 //! 1. **Active**: every client runs its loop, and the injector takes a
 //!    fault step every so often. The phase lasts [`RunConfig::active`],
-//!    or longer until an [`ActiveUntil`] condition holds. At its end the
-//!    injector heals everything and clients finish the command they are
-//!    in.
+//!    or longer until an [`ActiveUntil`] condition holds, and longer
+//!    while a composite injector (`mixed`, `smoke`) has a fault that has
+//!    not injected yet, for at most [`RunConfig::fault_coverage_limit`]
+//!    ([`ActivePhase::wait_for_faults`]). At its end the injector heals
+//!    everything and clients finish the command they are in.
 //! 2. **Quiet**: nothing runs for a while, so work a fault left in flight
 //!    on the server (a push whose client gave up) can end.
 //! 3. **Checks**: the boundary reads, linearizability of each ref's
@@ -25,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -118,8 +120,13 @@ impl std::fmt::Debug for ActiveUntil {
 /// Once over it stays over, so every client and the injector agree.
 #[derive(Debug)]
 pub struct ActivePhase<'a> {
+    started: Instant,
     earliest: Instant,
     limit: Instant,
+    /// Set while the injector has faults that never injected; the phase
+    /// then goes on past its minimum, until `faults_limit`.
+    faults_pending: AtomicBool,
+    faults_limit: Instant,
     until: Option<&'a ActiveUntil>,
     /// The run's history and how many pushes it had acknowledged when the
     /// phase began, for [`Progress`].
@@ -136,8 +143,11 @@ impl<'a> ActivePhase<'a> {
     pub fn lasting(d: Duration) -> ActivePhase<'static> {
         let now = Instant::now();
         ActivePhase {
+            started: now,
             earliest: now + d,
             limit: now + d,
+            faults_pending: AtomicBool::new(false),
+            faults_limit: now + d,
             until: None,
             history: None,
             state: AtomicU8::new(RUNNING),
@@ -150,12 +160,33 @@ impl<'a> ActivePhase<'a> {
         let now = Instant::now();
         let limit = until.map_or(min, |u| u.limit.max(min));
         Self {
+            started: now,
             earliest: now + min,
             limit: now + limit,
+            faults_pending: AtomicBool::new(false),
+            faults_limit: now + min,
             until,
             history: Some((history, history.acked_pushes())),
             state: AtomicU8::new(RUNNING),
         }
+    }
+
+    /// Lets [`Self::wait_for_faults`] keep the phase going for up to
+    /// `limit` from its start (never less than its minimum).
+    pub fn with_fault_coverage(mut self, limit: Duration) -> Self {
+        self.faults_limit = self.earliest.max(self.started + limit);
+        self
+    }
+
+    /// Says whether the injector still has faults that never injected.
+    /// While it has, the phase does not end, until the limit given to
+    /// [`Self::with_fault_coverage`]: a run must exercise every fault it
+    /// claims, and a short run whose slow faults (a Postgres failover waits
+    /// for a new synchronous standby) used up the steps would otherwise
+    /// fail as vacuous by chance. A fault still idle at the limit fails the
+    /// run as vacuous, as before.
+    pub fn wait_for_faults(&self, pending: bool) {
+        self.faults_pending.store(pending, Ordering::Release);
     }
 
     /// What the phase has done so far.
@@ -174,6 +205,9 @@ impl<'a> ActivePhase<'a> {
         }
         let now = Instant::now();
         if now < self.earliest {
+            return false;
+        }
+        if self.faults_pending.load(Ordering::Acquire) && now < self.faults_limit {
             return false;
         }
         let state = match self.until {
@@ -229,6 +263,10 @@ pub struct RunConfig {
     pub stop: Stop,
     /// Time between fault steps (each step may also last a while).
     pub fault_gap: (Duration, Duration),
+    /// Longest an epoch's active phase goes on, from its start, while the
+    /// injector has faults that never injected
+    /// ([`ActivePhase::wait_for_faults`]). Never shortens the phase.
+    pub fault_coverage_limit: Duration,
     /// Start a fresh repository after this many epochs.
     pub repo_epochs: usize,
     /// Working directory for clients, checks and the history file.
@@ -260,6 +298,7 @@ impl RunConfig {
             quiet: Duration::from_secs(3),
             stop: Stop::Epochs(3),
             fault_gap: (Duration::from_millis(300), Duration::from_millis(2500)),
+            fault_coverage_limit: Duration::from_secs(300),
             repo_epochs: 20,
             root,
             verbose: false,
@@ -333,7 +372,11 @@ pub fn run(
         let first_op = history.len();
 
         // 1. Active.
-        let phase = ActivePhase::new(cfg.active, cfg.active_until.as_ref(), &history);
+        let phase = ActivePhase::new(cfg.active, cfg.active_until.as_ref(), &history)
+            .with_fault_coverage(cfg.fault_coverage_limit);
+        if let Some(inj) = injector.as_ref() {
+            phase.wait_for_faults(!inj.idle_parts().is_empty());
+        }
         let mut fault_labels: Vec<String> = Vec::new();
         let mut fault_errors: Vec<String> = Vec::new();
         let mut inj_rng = Rng::new(rng.next_u64());
@@ -355,6 +398,7 @@ pub fn run(
                             Ok(None) => {}
                             Err(e) => errors.push(e.to_string()),
                         }
+                        p.wait_for_faults(!inj.idle_parts().is_empty());
                     }
                     if let Err(e) = inj.heal() {
                         errors.push(format!("heal: {e}"));
@@ -716,6 +760,39 @@ mod tests {
         assert!(phase.sleep(Duration::from_secs(10)));
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(phase.timed_out());
+    }
+
+    #[test]
+    fn a_phase_waits_past_its_minimum_while_faults_are_pending() {
+        let phase = ActivePhase::lasting(Duration::from_millis(50))
+            .with_fault_coverage(Duration::from_secs(60));
+        phase.wait_for_faults(true);
+        assert!(!phase.sleep(Duration::from_millis(200)));
+        assert!(!phase.over());
+        phase.wait_for_faults(false);
+        assert!(phase.over());
+        assert!(!phase.timed_out());
+    }
+
+    #[test]
+    fn pending_faults_hold_a_phase_only_until_the_coverage_limit() {
+        let started = Instant::now();
+        let phase = ActivePhase::lasting(Duration::from_millis(50))
+            .with_fault_coverage(Duration::from_millis(300));
+        phase.wait_for_faults(true);
+        assert!(phase.sleep(Duration::from_secs(10)));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn pending_faults_do_not_hold_a_phase_without_a_coverage_limit() {
+        let phase = ActivePhase::lasting(Duration::from_millis(50));
+        phase.wait_for_faults(true);
+        assert!(phase.sleep(Duration::from_secs(10)));
+        // Nor does a limit shorter than the minimum cut it.
+        let phase = ActivePhase::lasting(Duration::from_millis(300))
+            .with_fault_coverage(Duration::from_millis(10));
+        assert!(!phase.sleep(Duration::from_millis(100)));
     }
 
     fn push(history: &History, outcome: Outcome) {

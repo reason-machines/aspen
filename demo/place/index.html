@@ -8,9 +8,31 @@
     <meta name="theme-color" content="#131a18" media="(prefers-color-scheme: dark)" />
     <meta
       name="description"
-      content="A shared pixel canvas where every brush stroke is a git push. Paint here, or clone the repository and push a tile."
+      content="A shared pixel canvas where every pixel is a git push. Click to paint, or clone the repository and push a tile."
     />
-    <title>place: every brush stroke is a git push</title>
+    <title>place: every pixel is a git push</title>
+    <link rel="canonical" href="https://place.reasonmachines.com/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="place" />
+    <meta property="og:url" content="https://place.reasonmachines.com/" />
+    <meta property="og:title" content="place: every pixel is a git push" />
+    <meta
+      property="og:description"
+      content="A shared 64×64 canvas served by Aspen, an open-source Git server for agents. Click a tile and it's one commit and one push. No sign-in."
+    />
+    <meta property="og:image" content="https://place.reasonmachines.com/og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="The place canvas: a 64×64 grid of pixel art painted by git pushes, beside the words place, every pixel is a git push." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="place: every pixel is a git push" />
+    <meta
+      name="twitter:description"
+      content="A shared 64×64 canvas served by Aspen, an open-source Git server for agents. Click a tile and it's one commit and one push. No sign-in."
+    />
+    <meta name="twitter:image" content="https://place.reasonmachines.com/og.png" />
+    <meta name="twitter:image:alt" content="The place canvas: a 64×64 grid of pixel art painted by git pushes, beside the words place, every pixel is a git push." />
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect width='2' height='2' fill='%23e3a21a'/%3E%3Crect x='2' y='2' width='2' height='2' fill='%231c2b27'/%3E%3Crect x='2' width='2' height='2' fill='%23d6262b'/%3E%3Crect y='2' width='2' height='2' fill='%233690ea'/%3E%3C/svg%3E"
@@ -21,12 +43,13 @@
     <a class="skip" href="#canvas">Skip to the canvas</a>
     <header class="masthead">
       <div class="brand">
+        <a class="gh-mark" href="https://github.com/reason-machines/aspen" aria-label="Aspen on GitHub" title="Aspen on GitHub">
+          <svg viewBox="0 0 16 16" width="22" height="22" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span class="visually-hidden">Aspen on GitHub</span>
+        </a>
         <h1 class="wordmark">place</h1>
-        <p class="tagline">Every brush stroke is a <code>git push</code> to your own branch.</p>
+        <p class="tagline">Every pixel is a <code>git push</code>, served by <a href="https://github.com/reason-machines/aspen">Aspen</a>.</p>
       </div>
-      <nav class="masthead-links" aria-label="Elsewhere">
-        <span id="dashboard-slot"></span>
-      </nav>
     </header>
 
     <main class="layout">
@@ -40,6 +63,11 @@
           <span class="stat main-commit">main at <code id="stat-main">-------</code>, merged <span id="stat-merge">-</span></span>
         </div>
 
+        <div class="board">
+          <fieldset class="palette-set">
+            <legend class="visually-hidden">Color</legend>
+            <div class="palette" id="palette"></div>
+          </fieldset>
         <div class="plat" id="plat">
           <div class="ruler ruler-x" id="ruler-x" aria-hidden="true"></div>
           <div class="ruler ruler-y" id="ruler-y" aria-hidden="true"></div>
@@ -50,13 +78,14 @@
               tabindex="0"
               role="application"
               aria-roledescription="pixel canvas"
-              aria-label="Pixel canvas. Arrow keys move the cursor, Space paints the tile, Enter pushes your stroke, Escape discards it."
+              aria-label="Pixel canvas. Arrow keys move the cursor; Space or Enter paints the tile, as one push."
               aria-describedby="cursor-readout"
             ></canvas>
             <div class="loading" id="loading">Loading the canvas</div>
           </div>
         </div>
 
+        </div>
         <div class="canvas-bar">
           <p class="readout" id="cursor-readout" aria-live="polite">Point at a tile to see its file.</p>
           <div class="view-tools">
@@ -81,48 +110,28 @@
         </p>
       </section>
 
-      <aside class="rail">
+      <aside class="rail" id="rail">
         <section class="panel paint" aria-labelledby="paint-title">
           <h2 id="paint-title">Paint</h2>
-          <fieldset class="palette-set">
-            <legend class="visually-hidden">Color</legend>
-            <div class="palette" id="palette"></div>
-          </fieldset>
+          <p class="paint-hint" id="stroke-count">Click a tile. Each click is one commit and one push.</p>
           <div class="branch-line">
             <span class="branch-label">Your branch</span>
             <code id="own-branch" class="own-branch">creating…</code>
-          </div>
-          <div class="stroke-line">
-            <button type="button" class="btn btn-push" id="push-btn" disabled>Push stroke</button>
-            <span id="stroke-count" class="stroke-count">Draw on the canvas. Each stroke is pushed when you lift the brush.</span>
           </div>
           <div class="quota" id="quota">
             <div class="meter" aria-hidden="true"><span id="quota-fill"></span></div>
             <p id="quota-text">Quota loads with your branch.</p>
           </div>
           <p class="status" id="paint-status" role="status" aria-live="polite"></p>
+          <div class="agent-copy">
+            <button type="button" class="btn btn-copy-prompt" id="prompt-copy">Copy prompt</button>
+            <span class="copy-status" id="prompt-copy-status" role="status" aria-live="polite"></span>
+          </div>
         </section>
 
         <section class="panel git" aria-labelledby="git-title">
-          <h2 id="git-title">Or push from a terminal</h2>
-          <p>It is a real repository. Each tile is a file holding one color.</p>
+          <h2 id="git-title">Push from a terminal</h2>
           <ol class="steps" id="git-steps"></ol>
-          <details class="format">
-            <summary>Tile file rules</summary>
-            <ul>
-              <li>Path <code>tiles/&lt;x&gt;_&lt;y&gt;.txt</code>, with <span id="rule-range">x and y from 0</span>.</li>
-              <li>Contents: exactly <code>#rrggbb</code> in lowercase plus one newline, 8 bytes, using a palette color.</li>
-              <li>Regular files only. No other paths, no deletions, no merge commits.</li>
-              <li>Push to any branch except <code>main</code>; the merger bot folds it in. Up to <span id="rule-tiles">64</span> tiles per push.</li>
-            </ul>
-          </details>
-        </section>
-
-        <section class="panel swarm" aria-labelledby="swarm-title" id="swarm-panel" data-state="idle">
-          <h2 id="swarm-title">Load test</h2>
-          <button type="button" class="btn btn-swarm" id="swarm-btn">Unleash 1,000 agents</button>
-          <p class="swarm-state" id="swarm-state" role="status" aria-live="polite">Checking the swarm…</p>
-          <p class="swarm-limits" id="swarm-limits"></p>
         </section>
 
         <section class="panel feed" aria-labelledby="feed-title">
@@ -132,12 +141,6 @@
       </aside>
     </main>
 
-    <footer class="foot">
-      <p>
-        Served by <a href="https://github.com/reason-machines/aspen">Aspen</a>, a Git server built for many concurrent
-        writers. Branches run in parallel; only <code>main</code> is merged.
-      </p>
-    </footer>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

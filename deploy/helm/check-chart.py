@@ -13,6 +13,8 @@ asserts what the chart promises (see deploy/README.md, "Kubernetes"):
 - /-/metrics is on its own port, which no Service or Ingress exposes, and
   an optional NetworkPolicy admits only the configured scrapers to it;
 - read and push request rates are limited by default (issue #125);
+- with `compactor.enabled`, a separate Deployment runs the background worker
+  (ASPEN_ROLE=compact) and the server pods serve Git only (ASPEN_ROLE=serve);
 - Git over SSH needs a host key from a Secret, mounted for the pod only, and
   its Service keeps client addresses (`externalTrafficPolicy: Local`);
 - every ASPEN_* variable the chart sets is one the binary reads;
@@ -185,6 +187,10 @@ known = binary_variables()
 chart_vars = {n for n in env if n.startswith("ASPEN_")}
 check(chart_vars <= known, f"every ASPEN_* variable the chart sets is read by aspen (unknown: {sorted(chart_vars - known)})")
 
+check(env["ASPEN_ROLE"]["value"] == "all" and env["ASPEN_COMPACT_WORKERS"]["value"] == "8"
+      and find(docs, "Deployment", "t-aspen-compactor") is None,
+      "without the compactor every server pod also runs the background worker (ASPEN_ROLE=all)")
+
 test_pod = find(docs, "Pod")
 check(test_pod["spec"]["containers"][0]["args"][:1] == ["healthcheck"]
       and test_pod["spec"]["containers"][0]["args"][-1].endswith("/readyz"), "`helm test` checks /readyz")
@@ -270,6 +276,46 @@ check(env["ASPEN_TRUSTED_PROXY_HOPS"]["value"] == "0", "trustedProxyHops=0 is ke
 limits = json.loads(find(render("limits.read=null"), "ConfigMap", "t-aspen")["data"]["limits.json"])
 check("read" not in limits and "push" in limits, "one default rate can be removed (limits.read=null)")
 
+# --- the compactor Deployment (process roles) ---------------------------------
+docs = render("compactor.enabled=true", "compactor.replicaCount=3", "compaction.workers=16")
+server = env_of(find(docs, "Deployment", "t-aspen")["spec"]["template"]["spec"]["containers"][0])
+comp_dep = find(docs, "Deployment", "t-aspen-compactor")
+comp_pod = comp_dep["spec"]["template"]["spec"]
+comp = comp_pod["containers"][0]
+cenv = env_of(comp)
+check(server["ASPEN_ROLE"]["value"] == "serve", "with the compactor, server pods serve Git only (ASPEN_ROLE=serve)")
+check(comp["args"] == ["serve"] and cenv["ASPEN_ROLE"]["value"] == "compact"
+      and comp_dep["spec"]["replicas"] == 3 and cenv["ASPEN_COMPACT_WORKERS"]["value"] == "16",
+      "the compactor Deployment runs ASPEN_ROLE=compact with its own replica count and workers")
+check(cenv["DATABASE_URL"] == server["DATABASE_URL"] and cenv["ASPEN_BLOB_URL"] == server["ASPEN_BLOB_URL"]
+      and cenv["PGPASSWORD"]["valueFrom"]["secretKeyRef"] == {"name": "aspen-db", "key": "password"},
+      "the compactor shares the servers' database and bucket, with the password from its Secret")
+check(not any(n in cenv for n in ["ASPEN_SSH_LISTEN", "ASPEN_MERGE_QUEUE", "ASPEN_POLICY_FILE"]),
+      "the compactor gets no Git-only settings")
+check({n for n in cenv if n.startswith("ASPEN_")} <= known,
+      "every ASPEN_* variable of the compactor is read by aspen")
+comp_labels = comp_dep["spec"]["template"]["metadata"]["labels"]
+svc = find(docs, "Service", "t-aspen")
+check(comp_labels["app.kubernetes.io/component"] == "compactor"
+      and not all(comp_labels.get(k) == v for k, v in svc["spec"]["selector"].items()),
+      "no Service routes Git to the compactor pods")
+check(comp["livenessProbe"]["httpGet"]["path"] == "/healthz" and comp["readinessProbe"]["httpGet"]["path"] == "/readyz",
+      "the compactor is probed at /healthz and /readyz")
+csc = comp["securityContext"]
+check(csc["readOnlyRootFilesystem"] and not csc["allowPrivilegeEscalation"] and csc["capabilities"]["drop"] == ["ALL"]
+      and comp_pod["securityContext"]["runAsUser"] == 10001, "the compactor runs unprivileged on a read-only root")
+cvols = {v["name"]: v for v in comp_pod["volumes"]}
+check("emptyDir" in cvols["spool"] and "medium" not in cvols["spool"]["emptyDir"]
+      and cenv["ASPEN_SPOOL_DIR"]["value"] == "/var/lib/aspen/spool", "the compactor's spool is node disk")
+check(dict((p["name"], p["containerPort"]) for p in comp["ports"]).get("metrics") == 9464,
+      "the compactor serves metrics on the metrics port")
+docs = render("compactor.enabled=true", "metrics.networkPolicy.enabled=true",
+              "metrics.networkPolicy.from[0].podSelector.matchLabels.app=prometheus")
+cnp = find(docs, "NetworkPolicy", "t-aspen-compactor")
+check(cnp is not None and cnp["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "compactor"
+      and [p["port"] for r in cnp["spec"]["ingress"] if "from" in r for p in r["ports"]] == ["metrics"],
+      "the metrics NetworkPolicy covers the compactor pods too")
+
 # --- metrics NetworkPolicy (issue #125) ---------------------------------------
 scraper = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "monitoring"}}}
 docs = render("metrics.networkPolicy.enabled=true", "ssh.enabled=true", "ssh.hostKeySecret.name=k",
@@ -354,6 +400,11 @@ refusals = [
     (["extraEnv[0].name=OTEL_EXPORTER_OTLP_PASSWORD", "extraEnv[0].value=hunter2"], "looks like a secret"),
     (["extraEnv[0].name=SIGNING_KEY", "extraEnv[0].value=hunter2"], "extraEnv SIGNING_KEY looks like a secret"),
     (["trustedProxyHops=many"], "trustedProxyHops must be a whole number"),
+    (["compaction.workers=0"], "compaction.workers must be 1 to 64"),
+    (["compaction.workers=65"], "compaction.workers must be 1 to 64"),
+    (["compactor.enabled=true", "compactor.replicaCount=0"], "compactor.replicaCount must be at least 1"),
+    (["compactor.enabled=true", "compactor.extraEnv[0].name=API_TOKEN", "compactor.extraEnv[0].value=hunter2"],
+     "compactor.extraEnv API_TOKEN looks like a secret"),
     (["mirror.credentials[0].name=GitHub", "mirror.credentials[0].tokenSecret.name=s"], "must be 1 to 64 of a-z"),
     (["mirror.credentials[0].name=gh"], "set exactly one of tokenSecret.name or githubApp"),
     (["mirror.credentials[0].name=gh", "mirror.credentials[0].tokenSecret.name=s",

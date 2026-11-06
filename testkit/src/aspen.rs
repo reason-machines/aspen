@@ -10,6 +10,15 @@
 //! `write:*` policy, since the oracle pushes without credentials. The
 //! compaction worker and exact shallow packs run as they do in production.
 //!
+//! One setting differs from a deployment's defaults: the per-caller caps on
+//! concurrent work are off ([`ORACLE_LIMITS`]). Every oracle client is the
+//! same anonymous caller (`127.0.0.1`), and stock `git http-backend` has no
+//! such cap, so with the defaults (4 pushes at once) a step that runs more
+//! concurrent pushes than that sees Aspen refuse one with `429` before it
+//! reports any ref, which is admission working as designed (issue #118),
+//! not a ref-semantics divergence. The instance-wide limits stay on; they
+//! queue instead of refusing.
+//!
 //! The testkit does not link Aspen: it takes the path of an `aspen` binary
 //! built from the same checkout, so it stays a std-only tool and the layering
 //! rule (only tooling and roots depend on a root) is not touched.
@@ -29,6 +38,12 @@ use crate::server::{GitServer, RefMap, parse_ref_lines};
 
 /// How long `aspen serve` may take to migrate and start listening.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `ASPEN_LIMITS` for the server under test: no per-caller cap on
+/// concurrent fetches, pushes or stitches (module docs), and otherwise the
+/// defaults (no request rates or push quotas).
+pub const ORACLE_LIMITS: &str =
+    r#"{"concurrent": {"fetches": null, "pushes": null, "stitches": null}}"#;
 
 /// Where an [`AspenServer`] keeps its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +130,7 @@ impl AspenServer {
             .env("ASPEN_METRICS_LISTEN", "off")
             .env("ASPEN_POLICY", r#"{"anonymous":["write:*"]}"#)
             .env_remove("ASPEN_POLICY_FILE")
-            .env_remove("ASPEN_LIMITS")
+            .env("ASPEN_LIMITS", ORACLE_LIMITS)
             .env_remove("ASPEN_LIMITS_FILE")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .stdin(Stdio::null())

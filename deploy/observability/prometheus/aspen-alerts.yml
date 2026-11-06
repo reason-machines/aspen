@@ -109,6 +109,21 @@ groups:
             Workers are not keeping up, or none runs for this kind. Commits
             without index rows are still served from packs, more slowly.
 
+      - alert: AspenCompactionBacklogGrowing
+        expr: >-
+          max(aspen_compaction_backlog) > 100
+          and deriv(max(aspen_compaction_backlog)[30m:1m]) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The compaction backlog has grown for 30 minutes ({{ $value }} jobs)"
+          description: >-
+            Compaction is not keeping up with pushes, so fetches send one pack
+            per version instead of one per cover. Raise ASPEN_COMPACT_WORKERS
+            or run more ASPEN_ROLE=compact processes (docs/OBSERVABILITY.md,
+            "Compaction backlog").
+
       - alert: AspenMetaStatsDown
         expr: min by (instance) (aspen_meta_stats_up) == 0
         for: 5m

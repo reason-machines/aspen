@@ -297,6 +297,9 @@ impl MetaStore for Fake {
     async fn repo_by_id(&self, _: RepoId) -> Result<Option<Repo>, StoreError> {
         unreachable!()
     }
+    async fn list_repos(&self, _: Option<RepoId>, _: u32) -> Result<Vec<Repo>, StoreError> {
+        unreachable!()
+    }
     async fn current_version(
         &self,
         _: RepoId,
@@ -469,6 +472,12 @@ impl MetaStore for Fake {
         unreachable!()
     }
     async fn release_jobs(&self, _: &[JobTag], _: &str, _: &str) -> Result<u64, StoreError> {
+        unreachable!()
+    }
+    async fn add_compaction_heat(
+        &self,
+        _: &[aspen_core::meta::CompactionHeat],
+    ) -> Result<u64, StoreError> {
         unreachable!()
     }
     async fn update_job(&self, _: JobId, _: JobEvent) -> Result<Job, StoreError> {

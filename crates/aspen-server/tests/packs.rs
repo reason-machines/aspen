@@ -326,6 +326,7 @@ async fn a_forced_trunk_update_runs_under_a_one_slot_gate() {
     let s = Server::start_with(
         |c| {
             c.prefetch_memory_bytes = c.locate.max_prefetch_bytes;
+            c.prefetch_floor_bytes = c.locate.max_prefetch_bytes;
             c.prefetch_wait = std::time::Duration::from_secs(3);
             // Only tips get rows, so ancestry reads commits from packs.
             c.sync_commit_rows = 0;

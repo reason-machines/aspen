@@ -839,6 +839,28 @@ pub struct NewJob {
 /// Attempts after which a failing job is parked as dead.
 pub const MAX_JOB_ATTEMPTS: u32 = 10;
 
+/// What fetches of one ref have been waiting on compaction for
+/// ([`MetaStore::add_compaction_heat`]): they sent `heat` versions of the
+/// ref as their own push packs, the earliest at `from`, because the covers
+/// over them were not built yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionHeat {
+    /// Repository.
+    pub repo: RepoId,
+    /// The ref.
+    pub name: RefName,
+    /// The earliest such version's `seq`: a `compact` job on a version at
+    /// or after it builds a cover a fetch would have used.
+    pub from: Seq,
+    /// How many versions were sent that way, summed over fetches.
+    pub heat: u64,
+}
+
+/// The most priority one [`MetaStore::add_compaction_heat`] entry adds to a
+/// job, and the most priority a job can reach (so `priority + heat` never
+/// overflows the 64-bit column).
+pub const MAX_JOB_HEAT: u64 = 1 << 40;
+
 /// A job's state (`jobs.state` plus its lease and schedule columns).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
@@ -1072,6 +1094,15 @@ pub trait MetaStore: Send + Sync {
         name: &RepoName,
     ) -> impl Future<Output = Result<Option<Repo>, StoreError>> + Send;
 
+    /// Repositories with IDs above `after` (all when `None`), in ID order,
+    /// at most `limit` (for background work that visits every repository,
+    /// such as the merge queue's scan).
+    fn list_repos(
+        &self,
+        after: Option<RepoId>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<Repo>, StoreError>> + Send;
+
     /// Looks a repository up by ID (for jobs, which name only `repo_id`).
     fn repo_by_id(
         &self,
@@ -1165,6 +1196,59 @@ pub trait MetaStore: Send + Sync {
         &self,
         push: &PushCommit,
     ) -> impl Future<Output = Result<CommitOutcome, StoreError>> + Send;
+
+    /// Group commit: the commit transactions of several pushes, run as one
+    /// transaction where the store can. Each push keeps the semantics of
+    /// [`MetaStore::commit_push`] on its own: its writes all land or none
+    /// do, and its compare-and-swap is checked against its own expected
+    /// versions, so one push that loses its compare-and-swap (or is
+    /// refused) writes nothing and changes nothing for the others. The
+    /// answer has one entry per push, in `pushes` order.
+    ///
+    /// The outer `Err` means the batch as a whole failed: no push in it may
+    /// be reported as committed, because the store cannot say which of
+    /// them are durable (the transaction rolled back, or its `COMMIT` did
+    /// not answer). An inner `Ok(CommitOutcome::Committed(_))` is durable
+    /// when this returns.
+    ///
+    /// The provided body runs [`MetaStore::commit_push`] once per push, one
+    /// transaction each: correct for any store, with no batching. Stores
+    /// that can batch override it (`aspen-meta`'s `SqlStore` runs every
+    /// push in one transaction, each behind its own savepoint).
+    fn commit_pushes(
+        &self,
+        pushes: &[PushCommit],
+    ) -> impl Future<Output = Result<Vec<Result<CommitOutcome, StoreError>>, StoreError>> + Send
+    {
+        async move {
+            let mut out = Vec::with_capacity(pushes.len());
+            for push in pushes {
+                out.push(self.commit_push(push).await);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Group commit: [`MetaStore::register_pack`] for several packs, as one
+    /// transaction where the store can. Each pack is registered as
+    /// [`MetaStore::register_pack`] would register it on its own, and a
+    /// pack the store refuses (a size conflict) fails only its own entry.
+    /// One answer per pack, in `packs` order; the outer `Err` means the
+    /// batch failed and no pack in it may be treated as registered.
+    ///
+    /// The provided body registers one pack per transaction.
+    fn register_packs(
+        &self,
+        packs: &[NewPack],
+    ) -> impl Future<Output = Result<Vec<Result<PackRecord, StoreError>>, StoreError>> + Send {
+        async move {
+            let mut out = Vec::with_capacity(packs.len());
+            for pack in packs {
+                out.push(self.register_pack(pack).await);
+            }
+            Ok(out)
+        }
+    }
 
     /// Commit index rows, one answer per ID in `ids` order.
     fn lookup_commits(
@@ -1366,15 +1450,37 @@ pub trait MetaStore: Send + Sync {
         jobs: &[NewJob],
     ) -> impl Future<Output = Result<Vec<JobId>, StoreError>> + Send;
 
-    /// Claims the oldest due job of one of `tags` for `owner`, following
+    /// Claims a due job of one of `tags` for `owner`, following
     /// [`Job::apply`] with [`JobEvent::Claim`]; `None` if none is due. An
     /// expired job that the claim parks as dead is not returned.
+    ///
+    /// Among queued jobs the one with the highest priority goes first
+    /// ([`MetaStore::add_compaction_heat`]), then the earliest due, then the
+    /// lowest ID; a running job whose lease expired is taken back before
+    /// any queued job due later than its lease ended. With no heat recorded
+    /// this is oldest due first.
     fn claim_job(
         &self,
         tags: &[JobTag],
         owner: &str,
         lease: Duration,
     ) -> impl Future<Output = Result<Option<Job>, StoreError>> + Send;
+
+    /// Raises the claim priority of the queued `compact` jobs that fetches
+    /// are waiting for, so a backlog of compaction builds the covers fetches
+    /// read first. For each entry, every queued `compact` job on a version
+    /// of `name` with `seq` at or after `from` gains `heat` (at most
+    /// [`MAX_JOB_HEAT`] per entry; a job's priority stops at
+    /// [`MAX_JOB_HEAT`]). Jobs that are running, done or dead, and other
+    /// kinds, are not changed. Returns how many job rows were raised.
+    ///
+    /// Advisory: a lost or late call only changes the order jobs run in,
+    /// never whether they run. The fetch path batches its calls
+    /// (`aspen_server::upload_pack::heat`).
+    fn add_compaction_heat(
+        &self,
+        heat: &[CompactionHeat],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
     /// Gives back every running job of `tags` leased to `owner`, in one
     /// transaction: each is failed by its holder with no backoff

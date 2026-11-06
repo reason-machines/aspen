@@ -76,6 +76,11 @@ impl LoadedGraph {
     }
 
     /// Ref versions loaded so far, each one metadata read.
+    /// Every version loaded so far.
+    pub(crate) fn versions(&self) -> impl Iterator<Item = &RefVersion> {
+        self.versions.values()
+    }
+
     pub(crate) fn version_count(&self) -> usize {
         self.versions.len()
     }

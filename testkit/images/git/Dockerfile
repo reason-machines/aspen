@@ -14,10 +14,28 @@ RUN apt-get update \
       ca-certificates curl xz-utils make gcc libc6-dev cargo \
       libcurl4-openssl-dev zlib1g-dev libexpat1-dev \
  && rm -rf /var/lib/apt/lists/*
+# kernel.org's mirrors sometimes fail or stall for minutes: on 2026-11-05 a
+# bare `curl | tar` from one mirror failed four nightly jobs, two of them
+# after 18 minutes. So each mirror is tried in turn, three rounds, each
+# transfer bounded in time and retried; the tarball goes to a file first, so
+# a transfer cut off midway is never extracted.
 RUN test -n "$GIT_VERSION" \
+ && file="git-${GIT_VERSION}.tar.xz" \
+ && for round in 1 2 3; do \
+      for host in mirrors.edge.kernel.org cdn.kernel.org; do \
+        if curl -fsSL --connect-timeout 20 --max-time 300 --retry 2 --retry-all-errors \
+             -o "/tmp/$file" "https://$host/pub/software/scm/git/$file"; then \
+          break 2; \
+        fi; \
+        rm -f "/tmp/$file"; \
+        echo "round $round: downloading $file from $host failed" >&2; \
+      done; \
+      if [ "$round" -lt 3 ]; then sleep $((round * 20)); fi; \
+    done \
+ && if [ ! -s "/tmp/$file" ]; then echo "cannot download $file from kernel.org" >&2; exit 1; fi \
  && mkdir /src \
- && curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
-    | tar -xJ -C /src --strip-components=1
+ && tar -xJf "/tmp/$file" -C /src --strip-components=1 \
+ && rm "/tmp/$file"
 WORKDIR /src
 # NO_OPENSSL: without it Git's build includes <openssl/ssl.h> (imap-send and
 # git-compat-util.h), and this stage has no libssl-dev, so make fails on every

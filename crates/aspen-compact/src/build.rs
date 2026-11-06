@@ -8,19 +8,23 @@ use std::pin::Pin;
 use aspen_core::blob::{BlobStore, ByteRange};
 use aspen_core::error::StoreError;
 use aspen_core::id::{ObjectId, PackId, RefVersionId, RepoId, Seq};
-use aspen_core::meta::{Cover, MetaStore, NewCover, SeqRange, VerifiedRange};
+use aspen_core::meta::{Cover, CoverLayout, MetaStore, NewCover, SeqRange, VerifiedRange};
 use aspen_core::name::RefName;
 use aspen_core::pack::{CoverLevel, EntryTable, PackRecord};
 use aspen_core::refs::RefVersion;
 use aspen_pack::idx::IdxV2;
 use aspen_pack::repack::{RepackOptions, RepackSource, RepackedPack, write_repack};
 use aspen_pack::verify::verify_pack;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use crate::{CompactConfig, CompactError, local_io};
 
 /// Bytes per blob read while downloading a source.
 const READ_CHUNK: u64 = 8 << 20;
+
+/// Source packs a repack downloads at once.
+const PARALLEL_DOWNLOADS: usize = 8;
 
 /// What one call did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,7 +102,7 @@ where
             })?;
         let fanout = self.config.layout.fanout();
         let end = v.seq.get() - v.seq.get() % fanout;
-        let mut refs = RefCovers::load(&self.meta, v.repo, &v.name).await?;
+        let mut refs = RefCovers::new(v.repo, &v.name);
         let mut report = CompactReport::default();
         if let Ok(end) = Seq::new(end) {
             self.ensure_ending_at(&mut refs, end, &mut report).await?;
@@ -116,7 +120,7 @@ where
         through: Seq,
     ) -> Result<CompactReport, CompactError> {
         let fanout = self.config.layout.fanout();
-        let mut refs = RefCovers::load(&self.meta, repo, name).await?;
+        let mut refs = RefCovers::new(repo, name);
         let mut report = CompactReport::default();
         let mut end = fanout;
         while end <= through.get() {
@@ -133,6 +137,13 @@ where
         end: Seq,
         report: &mut CompactReport,
     ) -> Result<(), CompactError> {
+        // Every cover this builds or reads lies inside the highest cover
+        // ending at `end`, so read exactly those, keyed: a job's metadata
+        // reads do not grow with the ref's history (a long trunk has tens
+        // of thousands of covers; reading them all on every job made
+        // compaction slower the longer the ref, until it fell behind).
+        refs.load_inside(&self.meta, &self.config.layout, end)
+            .await?;
         for (level, range) in self.config.layout.ending_at(end) {
             let mut r = CompactReport::default();
             self.ensure_cover(refs, level, range, &mut r).await?;
@@ -307,16 +318,24 @@ where
             .prefix("compact-")
             .tempdir_in(&self.config.spool_dir)
             .map_err(|e| local_io("creating a spool directory", e))?;
-        let mut local = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            if row.pack.repo != repo {
-                return Err(StoreError::Corrupt {
-                    what: format!("pack {} of a cover is in another repository", row.id),
-                }
-                .into());
+        if let Some(row) = rows.iter().find(|r| r.pack.repo != repo) {
+            return Err(StoreError::Corrupt {
+                what: format!("pack {} of a cover is in another repository", row.id),
             }
-            local.push(self.download(row, work.path(), i).await?);
+            .into());
         }
+        // Sources download in parallel: a level-1 cover has 16 small
+        // sources of three blobs each, and reading them one round trip at a
+        // time made each job take seconds of mostly waiting on the store,
+        // so compaction fell behind a busy repository (bench/throughput).
+        let mut downloads = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            downloads.push(self.download(row, work.path(), i));
+        }
+        let local: Vec<LocalSource> = stream::iter(downloads)
+            .buffered(PARALLEL_DOWNLOADS)
+            .try_collect()
+            .await?;
         let options = RepackOptions {
             max_delta_depth: self.config.max_delta_depth,
             max_object_bytes: self.config.max_object_bytes,
@@ -349,13 +368,11 @@ where
         // before uploading (issue #48).
         let record = self.meta.register_pack(&new).await?;
         let keys = record.keys();
-        self.blobs
-            .upload_file(&keys.pack, &written.pack_path)
-            .await?;
-        self.blobs.upload_file(&keys.idx, &written.idx_path).await?;
-        self.blobs
-            .upload_file(&keys.entries, &written.entries_path)
-            .await?;
+        tokio::try_join!(
+            self.blobs.upload_file(&keys.pack, &written.pack_path),
+            self.blobs.upload_file(&keys.idx, &written.idx_path),
+            self.blobs.upload_file(&keys.entries, &written.entries_path),
+        )?;
         if existing.is_none() {
             report.packs_written += 1;
             report.objects_written += u64::from(written.object_count);
@@ -507,36 +524,86 @@ fn write_and_check(
     Ok(written)
 }
 
-/// One ref's covers, and the versions read so far, for one call.
+/// One ref's covers inside the ranges one call builds, and the versions
+/// read so far.
 #[derive(Debug)]
 struct RefCovers {
     repo: RepoId,
     name: RefName,
     covers: HashMap<(CoverLevel, Seq), Cover>,
+    /// Top-level covers whose range was read into `covers` at every level
+    /// up to theirs: a key at or below such a level, inside such a range,
+    /// that `covers` lacks has no cover.
+    loaded: Vec<(CoverLevel, SeqRange)>,
     versions: HashMap<Seq, RefVersion>,
 }
 
 impl RefCovers {
-    async fn load<M: MetaStore>(
-        meta: &M,
-        repo: RepoId,
-        name: &RefName,
-    ) -> Result<Self, StoreError> {
-        let covers = meta
-            .covers(repo, name)
-            .await?
-            .into_iter()
-            .map(|c| ((c.level, c.range.first()), c))
-            .collect();
-        Ok(Self {
+    fn new(repo: RepoId, name: &RefName) -> Self {
+        Self {
             repo,
             name: name.clone(),
-            covers,
+            covers: HashMap::new(),
+            loaded: Vec::new(),
             versions: HashMap::new(),
-        })
+        }
+    }
+
+    /// Reads every cover, at every level, inside the highest cover of
+    /// `layout` ending at `end`: the covers [`Compactor::ensure_ending_at`]
+    /// may build or read. One keyed read per level, of `fanout^(k - l)`
+    /// keys at level `l` below the top level `k`: one key for the usual
+    /// job (a level-1 cover), 4,369 for the job that ends a level-4 cover
+    /// with fanout 16, never all of the ref's covers.
+    async fn load_inside<M: MetaStore>(
+        &mut self,
+        meta: &M,
+        layout: &CoverLayout,
+        end: Seq,
+    ) -> Result<(), StoreError> {
+        let Some(&(top, range)) = layout.ending_at(end).last() else {
+            return Ok(());
+        };
+        if self
+            .loaded
+            .iter()
+            .any(|&(l, r)| l >= top && r.first() <= range.first() && range.last() <= r.last())
+        {
+            return Ok(());
+        }
+        for l in 1..=top.get() {
+            let level = CoverLevel::new(l).expect("at most the top level");
+            let span = layout.span(level);
+            let firsts: Vec<Seq> = (range.first().get()..=range.last().get())
+                .step_by(usize::try_from(span).expect("a span fits usize"))
+                .map(|s| Seq::new(s).expect("in range"))
+                .collect();
+            for c in meta
+                .covers_at(self.repo, &self.name, level, &firsts)
+                .await?
+            {
+                self.put(c);
+            }
+        }
+        self.loaded.push((top, range));
+        Ok(())
+    }
+
+    /// Whether the cover at `level` starting at `first` was read, if it
+    /// exists.
+    fn is_loaded(&self, level: CoverLevel, first: Seq) -> bool {
+        self.loaded
+            .iter()
+            .any(|&(l, r)| level <= l && r.first() <= first && first <= r.last())
     }
 
     fn cover(&self, level: CoverLevel, first: Seq) -> Option<&Cover> {
+        debug_assert!(
+            self.is_loaded(level, first),
+            "{} L{} cover at {first} read before its range was loaded",
+            self.name,
+            level.get()
+        );
         self.covers.get(&(level, first))
     }
 

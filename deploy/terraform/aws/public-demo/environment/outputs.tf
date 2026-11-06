@@ -23,6 +23,11 @@ output "place_url" {
   value       = local.place ? local.place_url : null
 }
 
+output "place_live_canvas_url" {
+  description = "The canvas image through its CDN (live.<place host>), for pages that poll it, or null without place or place_live_cdn."
+  value       = local.place_live ? "https://${local.place_live_host}/api/v1/canvas.svg" : null
+}
+
 output "place_clone_url" {
   description = "The canvas repository, or null without place_image."
   value       = local.place ? "${local.place_url}/canvas.git" : null
@@ -56,4 +61,9 @@ output "placeholder" {
 output "account_budget_usd" {
   description = "Monthly limit of the account stack's budget that watches this environment (checked at plan time)."
   value       = module.account_budget.limit_usd
+}
+
+output "place_canvas_mirror_key" {
+  description = "Secrets Manager secret the canvas mirror's credential (deploy key or token) goes in, or null without place_canvas_mirror."
+  value       = local.canvas_mirror ? aws_secretsmanager_secret.place_canvas_mirror_key[0].arn : null
 }

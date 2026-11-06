@@ -24,10 +24,10 @@
 //! per external one, plus a row per commit. That has not been measured on a
 //! Linux-sized push; S4 measured 140 bytes per object for gix's own tree.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use aspen_core::id::ObjectId;
 use aspen_core::ingest::{ObjectKind, SortedIds};
@@ -50,6 +50,10 @@ pub struct PackGraph {
     external: Vec<ObjectId>,
     /// Every commit in the pack, sorted by ID.
     commits: Vec<CommitInfo>,
+    /// The bytes of every tree, by position, when
+    /// [`PackGraph::scan_keeping_trees`] kept them; `None` when it was not
+    /// asked to or they were over its limit.
+    trees: Option<HashMap<u32, Arc<[u8]>>>,
 }
 
 /// What one walk of [`PackGraph::reach`] found.
@@ -73,6 +77,19 @@ impl PackGraph {
     /// are ignored: both are always collected. The declared-size checks of
     /// [`crate::scan::scan`] run first, under the same limits.
     pub fn scan(pack: &Path, idx: &Path, options: ScanOptions) -> Result<Self, ScanError> {
+        Self::scan_keeping_trees(pack, idx, options, 0)
+    }
+
+    /// [`PackGraph::scan`], also keeping every tree's bytes while they add
+    /// up to at most `max_tree_bytes` ([`PackGraph::tree_data`]), for a
+    /// walk of the paths a push changed (`crate::changed`). Over the limit
+    /// none are kept, and memory goes back to what `scan` uses.
+    pub fn scan_keeping_trees(
+        pack: &Path,
+        idx: &Path,
+        options: ScanOptions,
+        max_tree_bytes: u64,
+    ) -> Result<Self, ScanError> {
         let pack_err = |e: gix_error::Error| ScanError::Pack(gix_chain(&e));
         let index = gix_pack::index::File::at(idx, gix_hash::Kind::Sha1).map_err(pack_err)?;
         crate::scan::check_declared_sizes(pack, &index, &options)?;
@@ -96,9 +113,12 @@ impl PackGraph {
             nodes: Vec<Option<Node>>,
             commits: Vec<CommitInfo>,
             error: Option<ObjectError>,
+            trees: Option<HashMap<u32, Arc<[u8]>>>,
+            tree_bytes: u64,
         }
         let found = Mutex::new(Found {
             nodes: (0..n).map(|_| None).collect(),
+            trees: (max_tree_bytes > 0).then(HashMap::new),
             ..Found::default()
         });
         let processor = |kind: gix_object::Kind,
@@ -141,6 +161,14 @@ impl PackGraph {
             let mut f = found.lock().expect("not poisoned");
             match parsed {
                 Ok((at, node, commit)) => {
+                    if node.kind == ObjectKind::Tree && f.trees.is_some() {
+                        f.tree_bytes += bytes.len() as u64;
+                        if f.tree_bytes > max_tree_bytes {
+                            f.trees = None;
+                        } else if let Some(t) = f.trees.as_mut() {
+                            t.insert(at as u32, Arc::from(bytes));
+                        }
+                    }
                     f.nodes[at] = Some(node);
                     f.commits.extend(commit);
                     Ok(())
@@ -201,7 +229,19 @@ impl PackGraph {
             external_at,
             external,
             commits: found.commits,
+            trees: found.trees,
         })
+    }
+
+    /// The bytes of the tree at `at`, when the scan kept them
+    /// ([`PackGraph::scan_keeping_trees`]).
+    pub fn tree_data(&self, at: usize) -> Option<&Arc<[u8]>> {
+        self.trees.as_ref()?.get(&(at as u32))
+    }
+
+    /// Whether the scan kept every tree's bytes.
+    pub fn trees_kept(&self) -> bool {
+        self.trees.is_some()
     }
 
     /// Objects in the pack.
@@ -491,6 +531,7 @@ impl PackGraph {
             external_at: vec![0; n + 1],
             external: Vec::new(),
             commits: Vec::new(),
+            trees: None,
         }
     }
 }

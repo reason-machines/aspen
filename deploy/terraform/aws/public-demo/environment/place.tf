@@ -20,6 +20,8 @@
 locals {
   place = var.place_image != null
 
+  canvas_mirror = local.place && var.place_canvas_mirror != null
+
   place_database_user = "place"
 
   place_url = "https://${local.place_host}"
@@ -34,6 +36,7 @@ locals {
     PLACE_DASHBOARD_URL      = var.place_dashboard_url
     PLACE_TRUSTED_PROXY_HOPS = "1"
     PLACE_KILL_SWITCH        = var.place_kill_switch ? "1" : ""
+    PLACE_MIRROR_URL         = var.place_canvas_mirror == null ? "" : "https://github.com/${var.place_canvas_mirror}"
   }, var.place_environment)
 }
 
@@ -154,6 +157,18 @@ resource "aws_secretsmanager_secret_version" "place_db_password" {
   secret_string_wo_version = var.place_db_password_version
 }
 
+# The canvas mirror's credential: an SSH deploy key (private half, OpenSSH
+# format) or a token with write access to that one repository. Terraform
+# creates the secret only; the value goes in by hand and never into state
+# (../README.md, "Mirror the canvas to GitHub").
+resource "aws_secretsmanager_secret" "place_canvas_mirror_key" {
+  count = local.canvas_mirror ? 1 : 0
+
+  name_prefix             = "${local.name}-place-canvas-mirror-key-"
+  description             = "SSH deploy key (private half) or token with write access to github.com/${var.place_canvas_mirror} only, for the canvas mirror sidecar of ${local.name}."
+  recovery_window_in_days = 7
+}
+
 # ---------------------------------------------------------------------------
 # Logs and IAM
 # ---------------------------------------------------------------------------
@@ -204,6 +219,16 @@ data "aws_iam_policy_document" "place_execution" {
     sid       = "ReadDatabasePasswords"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [module.aspen.database_password_secret_arn, aws_secretsmanager_secret.place_db_password[0].arn]
+  }
+
+  dynamic "statement" {
+    for_each = local.canvas_mirror ? [1] : []
+
+    content {
+      sid       = "ReadCanvasMirrorCredential"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [aws_secretsmanager_secret.place_canvas_mirror_key[0].arn]
+    }
   }
 
   dynamic "statement" {
@@ -534,6 +559,33 @@ locals {
   }
 }
 
+locals {
+  # Keeps github.com/<place_canvas_mirror>'s main a copy of the canvas's
+  # main (canvas-mirror.sh). Not essential: when GitHub or the key fails,
+  # place keeps serving and the sidecar's log says why.
+  canvas_mirror_container = {
+    name      = "canvas-mirror"
+    image     = var.place_canvas_mirror_image
+    essential = false
+    dependsOn = [{ containerName = "place", condition = "START" }]
+    command   = ["sh", "-c", file("${path.module}/canvas-mirror.sh")]
+    environment = [
+      { name = "MIRROR_REPO", value = coalesce(var.place_canvas_mirror, "-") },
+      { name = "MIRROR_SOURCE", value = "http://127.0.0.1:${var.place_port}/canvas.git" },
+      { name = "MIRROR_INTERVAL", value = tostring(var.place_canvas_mirror_interval_seconds) },
+    ]
+    secrets = [{ name = "MIRROR_CREDENTIAL", valueFrom = local.canvas_mirror ? aws_secretsmanager_secret.place_canvas_mirror_key[0].arn : "" }]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = local.place ? aws_cloudwatch_log_group.place[0].name : ""
+        awslogs-region        = var.region
+        awslogs-stream-prefix = "canvas-mirror"
+      }
+    }
+  }
+}
+
 resource "aws_ecs_task_definition" "place" {
   count = local.place ? 1 : 0
 
@@ -550,7 +602,10 @@ resource "aws_ecs_task_definition" "place" {
     cpu_architecture        = "X86_64"
   }
 
-  container_definitions = jsonencode([local.create_database, local.place_container])
+  container_definitions = jsonencode(concat(
+    [local.create_database, local.place_container],
+    local.canvas_mirror ? [local.canvas_mirror_container] : [],
+  ))
 }
 
 resource "aws_ecs_service" "place" {

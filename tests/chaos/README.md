@@ -158,7 +158,11 @@ smoke       kill, failover, S3, database and client network faults once each, in
 `s3`, `mixed` and `smoke` need an S3 store; with the local file store they
 refuse to start. In `smoke` each fault takes its turn and keeps it until it
 has injected once; in `mixed` half the steps go to a fault that has not
-injected yet. `smoke` leaves out the compaction kill: workers poll every
+injected yet. In both, an epoch's active phase goes on past `--epoch` while
+a fault has not injected yet, for at most 5 minutes from its start: a
+Postgres failover waits for a new synchronous standby, so two of them can
+use up a 30-second epoch, and the nightly `mixed` run of 2 epochs once
+ended without a kill or a compaction kill. `smoke` leaves out the compaction kill: workers poll every
 5 s and a job takes milliseconds, so a 12-second run cannot count on
 catching one leased (on GitHub's runner it did not). `compaction` and
 `mixed` include it, and fail if it never fires.

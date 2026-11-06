@@ -84,11 +84,26 @@ hgit() {
 }
 mkdir -p "$work/home"
 
+# The newest release listed on kernel.org, trying each mirror for a few
+# rounds (a mirror can fail or stall for minutes; images/git/Dockerfile
+# downloads the tarball the same way). Fails if no mirror lists one.
 latest_git_version() {
   if [[ -n ${GIT_LATEST:-} ]]; then echo "$GIT_LATEST"; return; fi
-  curl -fsSL https://mirrors.edge.kernel.org/pub/software/scm/git/ \
-    | grep -oE 'git-[0-9]+\.[0-9]+\.[0-9]+\.tar\.xz' | sed 's/^git-//; s/\.tar\.xz$//' \
-    | sort -uV | tail -1
+  local round host listing version
+  for round in 1 2 3; do
+    for host in mirrors.edge.kernel.org cdn.kernel.org; do
+      if listing=$(curl -fsSL --connect-timeout 20 --max-time 60 --retry 2 --retry-all-errors \
+          "https://$host/pub/software/scm/git/"); then
+        version=$(grep -oE 'git-[0-9]+\.[0-9]+\.[0-9]+\.tar\.xz' <<<"$listing" \
+          | sed 's/^git-//; s/\.tar\.xz$//' | sort -uV | tail -1)
+        if [[ -n $version ]]; then echo "$version"; return; fi
+      fi
+      echo "round $round: no Git release listing from $host" >&2
+    done
+    ((round < 3)) && sleep $((round * 20))
+  done
+  echo "cannot list Git releases on kernel.org" >&2
+  return 1
 }
 
 git_version_of() {

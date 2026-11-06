@@ -12,7 +12,7 @@ use aspen_core::error::StoreError;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, WriteMultipart};
 use tokio::io::AsyncReadExt;
 
 use crate::local::{changed_during_upload, local_io, not_found, same_size, too_large};
@@ -274,9 +274,6 @@ impl BlobStore for ObjectBlobStore {
             .await
             .map_err(|e| local_io(&format!("reading {}", source.display()), &e))?
             .len();
-        if let Some(existing) = self.head_size(key, &path).await? {
-            return same_size(key, existing, len);
-        }
         let part_size = self.upload.part_size as u64;
         if len <= part_size {
             let bytes = tokio::fs::read(source)
@@ -285,11 +282,42 @@ impl BlobStore for ObjectBlobStore {
             if bytes.len() as u64 != len {
                 return Err(changed_during_upload(source, len, bytes.len() as u64));
             }
-            self.store
-                .put(&path, PutPayload::from(bytes))
-                .await
-                .map_err(|e| backend(key, e))?;
+            // One round trip: a create-only PUT (`If-None-Match: *` on S3)
+            // refuses to replace an existing blob, which is then checked
+            // like before. Asking first with a HEAD cost a second round
+            // trip on every push's three uploads (bench/throughput: about
+            // 20 ms of a 70 ms trunk push). A store without conditional
+            // creates gets the HEAD first.
+            let create = PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            };
+            let payload = PutPayload::from(bytes);
+            match self.store.put_opts(&path, payload.clone(), create).await {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let existing = self.head_size(key, &path).await?.ok_or_else(|| {
+                        StoreError::Unavailable {
+                            reason: format!("{key:?} existed and then did not; retry"),
+                        }
+                    })?;
+                    return same_size(key, existing, len);
+                }
+                Err(object_store::Error::NotImplemented { .. }) => {
+                    if let Some(existing) = self.head_size(key, &path).await? {
+                        return same_size(key, existing, len);
+                    }
+                    self.store
+                        .put(&path, payload)
+                        .await
+                        .map_err(|e| backend(key, e))?;
+                }
+                Err(e) => return Err(backend(key, e)),
+            }
         } else {
+            if let Some(existing) = self.head_size(key, &path).await? {
+                return same_size(key, existing, len);
+            }
             if len.div_ceil(part_size) > S3_MAX_PARTS {
                 return Err(StoreError::LocalIo {
                     reason: format!(

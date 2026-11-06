@@ -111,6 +111,37 @@ push:
   maxObjects: 10000000
   prefetchMemoryBytes: 4294967296
 
+# The background worker: compaction (covers over each ref's versions),
+# commit indexing and garbage collection (deploy/README.md, "Process
+# roles").
+compaction:
+  # Jobs one pod runs at once (ASPEN_COMPACT_WORKERS, 1 to 64).
+  workers: 8
+
+# Run the background worker in its own Deployment of `aspen serve` with
+# ASPEN_ROLE=compact, and the server pods with ASPEN_ROLE=serve, so
+# compaction scales apart from Git and does not compete with pushes for the
+# server pods' CPU. Off: every server pod also runs the worker
+# (ASPEN_ROLE=all). Scale replicaCount on aspen_compaction_backlog: flat
+# under a steady push rate means compaction keeps up
+# (docs/OBSERVABILITY.md, "Compaction backlog").
+compactor:
+  enabled: false
+  replicaCount: 1
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 4Gi}
+  # Repacks run under <spool>/compact: about twice the largest cover's
+  # packs. Node disk, never memory.
+  spoolSizeLimit: 20Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Extra environment for the compactor pods only (the server's extraEnv
+  # is not applied: it may set Git-only settings a compactor refuses).
+  extraEnv: []
+
 # Where pushes are spooled and completed. It must be a real disk, never
 # memory, so the chart offers only node disk (emptyDir) or a generic
 # ephemeral volume from a StorageClass.

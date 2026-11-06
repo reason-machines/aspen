@@ -27,6 +27,12 @@ struct Faults {
     /// Completing a multipart upload fails.
     complete: AtomicBool,
     aborted: AtomicUsize,
+    /// Create-only PUTs are answered `NotImplemented`, as by a store
+    /// without conditional writes.
+    no_create: AtomicBool,
+    /// Requests of each kind that reached the store.
+    heads: AtomicUsize,
+    puts: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -51,6 +57,15 @@ impl fmt::Display for Faulty {
 #[async_trait::async_trait]
 impl ObjectStore for Faulty {
     async fn put_opts(&self, p: &Path, payload: PutPayload, o: PutOptions) -> Result<PutResult> {
+        if self.faults.no_create.load(Ordering::SeqCst)
+            && matches!(o.mode, aspen_blob::object_store::PutMode::Create)
+        {
+            return Err(aspen_blob::object_store::Error::NotImplemented {
+                operation: "create-only put".into(),
+                implementer: "faulty".into(),
+            });
+        }
+        self.faults.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_opts(p, payload, o).await
     }
 
@@ -68,6 +83,9 @@ impl ObjectStore for Faulty {
     async fn get_opts(&self, p: &Path, o: GetOptions) -> Result<GetResult> {
         if o.range.is_some() && !o.head && self.faults.ranged_get.load(Ordering::SeqCst) {
             return Err(injected());
+        }
+        if o.head {
+            self.faults.heads.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.get_opts(p, o).await
     }
@@ -198,4 +216,42 @@ async fn a_failed_multipart_upload_is_aborted() {
         assert_eq!(faults.aborted.load(Ordering::SeqCst), 1, "{fault}");
         assert_eq!(store.size(&key).await.unwrap(), None, "{fault}");
     }
+}
+
+/// A small upload is one create-only PUT, with no HEAD first (each push
+/// uploads three blobs, so a HEAD per blob was a round trip on every push).
+/// An existing blob is still checked: the same size is a success, another
+/// size an error, and a store without conditional creates gets HEAD then
+/// PUT as before.
+#[tokio::test]
+async fn a_small_upload_is_one_create_only_put() {
+    let (store, faults) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("blob");
+    std::fs::write(&file, vec![7u8; 1000]).unwrap();
+    let key = BlobKey::new("repos/1/packs/a.pack").unwrap();
+    assert_eq!(store.upload_file(&key, &file).await.unwrap().size, 1000);
+    assert_eq!(faults.puts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        faults.heads.load(Ordering::SeqCst),
+        0,
+        "no HEAD before the PUT"
+    );
+    // Again: refused by the store, checked with a HEAD, the same size.
+    assert_eq!(store.upload_file(&key, &file).await.unwrap().size, 1000);
+    assert_eq!(faults.heads.load(Ordering::SeqCst), 1);
+    std::fs::write(&file, vec![7u8; 999]).unwrap();
+    assert!(
+        store.upload_file(&key, &file).await.is_err(),
+        "another size is an error"
+    );
+    // Without conditional creates: HEAD, then a plain PUT.
+    faults.no_create.store(true, Ordering::SeqCst);
+    let other = BlobKey::new("repos/1/packs/b.pack").unwrap();
+    let puts = faults.puts.load(Ordering::SeqCst);
+    assert_eq!(store.upload_file(&other, &file).await.unwrap().size, 999);
+    assert_eq!(faults.puts.load(Ordering::SeqCst), puts + 1);
+    let mut read = Vec::new();
+    read.extend(store.read_exact_range(&other, range(0, 999)).await.unwrap());
+    assert_eq!(read, vec![7u8; 999]);
 }

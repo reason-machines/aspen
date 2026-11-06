@@ -127,45 +127,103 @@ pub(crate) async fn register_pack(
     pack.validate()
         .map_err(|e| conflict(format!("pack {}: {e}", pack.checksum)))?;
     store
-        .write(async |tx| {
-            let now = store.now();
-            let record = match find(store, tx, pack.repo, &pack.checksum).await? {
-                Some(existing) => same_or_conflict(existing, pack)?,
-                None => match insert(tx, pack).await? {
-                    Some(id) => {
-                        // After the insert, not before: on Postgres a sweep
-                        // deleting this checksum's old row holds its unique
-                        // index entry, so the insert waits for the sweep to
-                        // commit, and only a statement after it sees the
-                        // sweep's tombstone.
-                        let generation = next_generation(tx, pack).await?;
-                        if generation != PackGeneration::FIRST {
-                            set_generation(tx, id, pack, generation).await?;
-                        }
-                        find(store, tx, pack.repo, &pack.checksum)
-                            .await?
-                            .filter(|r| r.id == id)
-                            .ok_or_else(|| corrupt(format!("pack {id} vanished in its insert")))?
-                    }
-                    // A concurrent registration inserted the row after our
-                    // read and has committed (the insert waited for it).
-                    None => {
-                        let existing = find(store, tx, pack.repo, &pack.checksum)
-                            .await?
-                            .ok_or_else(|| StoreError::Unavailable {
-                                reason: format!(
-                                    "pack {} was registered and removed concurrently",
-                                    pack.checksum
-                                ),
-                            })?;
-                        same_or_conflict(existing, pack)?
-                    }
-                },
-            };
-            touch(tx, record.id, pack.repo, now).await?;
-            Ok(record)
-        })
+        .write(async |tx| register_in(store, tx, pack).await)
         .await
+}
+
+/// [`MetaStore::register_packs`]: every pack in one transaction, each
+/// behind its own savepoint, so a pack the store refuses (a size conflict)
+/// fails alone. Packs are registered in `(repository, checksum)` order, so
+/// two batches that register the same checksums take their unique-index
+/// entries in one order and cannot deadlock. A failed savepoint statement
+/// or `COMMIT` fails the batch as a whole.
+///
+/// [`MetaStore::register_packs`]: aspen_core::meta::MetaStore::register_packs
+pub(crate) async fn register_packs(
+    store: &SqlStore,
+    packs: &[NewPack],
+) -> Result<Vec<Result<PackRecord, StoreError>>, StoreError> {
+    let mut out: Vec<Option<Result<PackRecord, StoreError>>> = vec![None; packs.len()];
+    let mut valid = Vec::with_capacity(packs.len());
+    for (i, pack) in packs.iter().enumerate() {
+        match pack.validate() {
+            Ok(()) => valid.push(i),
+            Err(e) => out[i] = Some(Err(conflict(format!("pack {}: {e}", pack.checksum)))),
+        }
+    }
+    if !valid.is_empty() {
+        valid.sort_by(|&a, &b| {
+            (packs[a].repo, packs[a].checksum.as_bytes())
+                .cmp(&(packs[b].repo, packs[b].checksum.as_bytes()))
+                .then(a.cmp(&b))
+        });
+        let parts = store
+            .write(async |tx| {
+                let mut parts = Vec::with_capacity(valid.len());
+                for &i in &valid {
+                    crate::tx::savepoint(tx).await?;
+                    let result = register_in(store, tx, &packs[i]).await;
+                    match &result {
+                        Ok(_) => crate::tx::release(tx).await?,
+                        Err(_) => crate::tx::rollback_to(tx).await?,
+                    }
+                    parts.push((i, result));
+                }
+                Ok::<_, StoreError>(parts)
+            })
+            .await?;
+        for (i, result) in parts {
+            out[i] = Some(result);
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|o| o.expect("every pack has an outcome"))
+        .collect())
+}
+
+/// The statements of one registration, inside a write transaction.
+async fn register_in(
+    store: &SqlStore,
+    tx: &mut WriteTx,
+    pack: &NewPack,
+) -> Result<PackRecord, StoreError> {
+    let now = store.now();
+    let record = match find(store, tx, pack.repo, &pack.checksum).await? {
+        Some(existing) => same_or_conflict(existing, pack)?,
+        None => match insert(tx, pack).await? {
+            Some(id) => {
+                // After the insert, not before: on Postgres a sweep
+                // deleting this checksum's old row holds its unique
+                // index entry, so the insert waits for the sweep to
+                // commit, and only a statement after it sees the
+                // sweep's tombstone.
+                let generation = next_generation(tx, pack).await?;
+                if generation != PackGeneration::FIRST {
+                    set_generation(tx, id, pack, generation).await?;
+                }
+                find(store, tx, pack.repo, &pack.checksum)
+                    .await?
+                    .filter(|r| r.id == id)
+                    .ok_or_else(|| corrupt(format!("pack {id} vanished in its insert")))?
+            }
+            // A concurrent registration inserted the row after our
+            // read and has committed (the insert waited for it).
+            None => {
+                let existing = find(store, tx, pack.repo, &pack.checksum)
+                    .await?
+                    .ok_or_else(|| StoreError::Unavailable {
+                        reason: format!(
+                            "pack {} was registered and removed concurrently",
+                            pack.checksum
+                        ),
+                    })?;
+                same_or_conflict(existing, pack)?
+            }
+        },
+    };
+    touch(tx, record.id, pack.repo, now).await?;
+    Ok(record)
 }
 
 /// Inserts the row; `None` if a row with the checksum exists.

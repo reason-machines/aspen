@@ -279,3 +279,34 @@ describe('event stream', () => {
     expect(calls[1].at - calls[0].at).toBeGreaterThanOrEqual(1900);
   }, 10_000);
 });
+
+describe('agent prompt', () => {
+  it('is the public demo prompt, with every fact from the deployment', async () => {
+    const { agentPrompt } = await import('../src/client/prompt.ts');
+    const text = agentPrompt({
+      pageUrl: 'https://place.reasonmachines.com',
+      cloneUrl: 'https://place.reasonmachines.com/canvas.git',
+      apiUrl: 'https://place.reasonmachines.com/api/v1',
+      width: 64,
+      height: 64,
+      tilesPerPush: 64,
+    });
+    expect(
+      text,
+    ).toBe(`Help me paint something on the shared pixel canvas at https://place.reasonmachines.com. Every pixel is a real git push to an Aspen git server. Start by asking me what to paint and where (step 3), and don't paint anything until I say go.
+
+1. git clone --depth=1 https://place.reasonmachines.com/canvas.git && cd canvas
+2. Read README.md for the rules: each tile is tiles/<x>_<y>.txt (x from 0 to 63, y from 0 to 63), holding one palette color as lowercase #rrggbb plus a newline. Use only palette colors (GET https://place.reasonmachines.com/api/v1/config lists them) and only tile files. At most 64 tiles per push.
+3. Before painting, ask me two things and wait for my answers:
+   - What should we paint? (an icon, a word, a pattern, a flag…)
+   - Where on the canvas? Offer three choices: a spot I name (x, y from 0 to 63), an area you find without anyone's recognizable picture, or "surprise me".
+   To suggest a spot, look at the current picture first (GET https://place.reasonmachines.com/api/v1/canvas returns "pixels", 64 x 64 characters in row-major order, index y * 64 + x, each "." for a tile never painted or the tile's index into the config's palette in base 36), and tell me if the area I chose would paint over someone else's work.
+4. Show me a small preview of the plan (a grid of the tiles and colors) and the exact coordinates. Paint only after I say go: write the tile files, for example printf '#d6262b\\n' > tiles/12_40.txt, at most 64 tiles per push.
+5. git add tiles && git commit -m "paint: <what you drew>" && git push origin HEAD:refs/heads/paint/<a-short-name>
+6. For a bigger picture, repeat in pushes of up to 64 tiles, no more than one push every few seconds.
+7. Open https://place.reasonmachines.com and confirm your picture appears.
+
+Your commit's name and email are public. Use a pseudonym if you prefer: git -c user.name=... -c user.email=... commit ...
+`);
+  });
+});

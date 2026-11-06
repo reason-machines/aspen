@@ -65,6 +65,9 @@ impl MetaStore for Racing {
     async fn repo_by_id(&self, id: RepoId) -> Result<Option<Repo>, StoreError> {
         self.inner.repo_by_id(id).await
     }
+    async fn list_repos(&self, after: Option<RepoId>, limit: u32) -> Result<Vec<Repo>, StoreError> {
+        self.inner.list_repos(after, limit).await
+    }
     async fn current_version(
         &self,
         repo: RepoId,
@@ -232,6 +235,12 @@ impl MetaStore for Racing {
         lease: Duration,
     ) -> Result<Option<Job>, StoreError> {
         self.inner.claim_job(tags, owner, lease).await
+    }
+    async fn add_compaction_heat(
+        &self,
+        heat: &[aspen_core::meta::CompactionHeat],
+    ) -> Result<u64, StoreError> {
+        self.inner.add_compaction_heat(heat).await
     }
     async fn release_jobs(
         &self,

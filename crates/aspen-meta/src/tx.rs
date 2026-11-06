@@ -128,6 +128,7 @@ impl SqlStore {
         E: From<StoreError>,
     {
         let permit = self.admit_turn().await?;
+        self.count_write_transaction();
         let tx = self
             .connect_in_turn(|| async {
                 match self.dialect() {
@@ -151,4 +152,37 @@ impl SqlStore {
             }
         }
     }
+}
+
+/// A savepoint inside a write transaction (Postgres and SQLite alike),
+/// so one part of a batched transaction (group commit) can be undone
+/// without the rest: [`savepoint`] before the part, then [`release`] if
+/// it succeeded or [`rollback_to`] if it did not. On Postgres an error
+/// aborts the whole transaction until the rollback to the savepoint. If
+/// either statement fails, the caller must fail the whole transaction.
+pub(crate) async fn savepoint(conn: &mut AnyConnection) -> Result<(), StoreError> {
+    sqlx::query("SAVEPOINT aspen_part")
+        .execute(conn)
+        .await
+        .map(drop)
+        .map_err(store_error)
+}
+
+/// Ends the savepoint taken by [`savepoint`], keeping its writes.
+pub(crate) async fn release(conn: &mut AnyConnection) -> Result<(), StoreError> {
+    sqlx::query("RELEASE SAVEPOINT aspen_part")
+        .execute(conn)
+        .await
+        .map(drop)
+        .map_err(store_error)
+}
+
+/// Undoes every write since [`savepoint`] (and frees the locks they
+/// took), then ends the savepoint.
+pub(crate) async fn rollback_to(conn: &mut AnyConnection) -> Result<(), StoreError> {
+    sqlx::query("ROLLBACK TO SAVEPOINT aspen_part")
+        .execute(&mut *conn)
+        .await
+        .map_err(store_error)?;
+    release(conn).await
 }

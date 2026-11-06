@@ -334,10 +334,16 @@ impl PushMetrics {
                 .iter()
                 .map(|(s, d)| (vec![("stage", *s)], d.as_secs_f64())),
         );
+        expo::counter(
+            out,
+            "aspen_push_ancestry_commits_total",
+            "Commits the push path's ancestry walks expanded, summed over pushes (each a commit_index or pack read unless cached within the push).",
+            timings.ancestry_commits,
+        );
         expo::gauge(
             out,
             "aspen_push_prefetch_slots",
-            "Pushes the prefetch gate admits at once (prefetch_memory_bytes / max_prefetch_bytes).",
+            "Pushes the prefetch gate admits at once while each holds its floor (prefetch_memory_bytes / prefetch_floor_bytes).",
             gate.slots as f64,
         );
         expo::gauge(
@@ -364,6 +370,12 @@ impl PushMetrics {
             "Waits for a prefetch slot that gave up (the push got a retryable error).",
             gate.timeouts,
         );
+        expo::counter(
+            out,
+            "aspen_push_prefetch_escalations_total",
+            "Reads of stored packs that needed more than the floor, so their slot grew to the full per-push budget.",
+            gate.escalations,
+        );
     }
 }
 
@@ -386,6 +398,7 @@ pub(crate) struct GateStats {
     pub(crate) peak: usize,
     pub(crate) acquired: u64,
     pub(crate) timeouts: u64,
+    pub(crate) escalations: u64,
 }
 
 #[cfg(test)]

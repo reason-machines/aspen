@@ -19,6 +19,8 @@ gix-utils = { version = "=0.5.2", features = ["progress"] }
 gix-error = "=0.5.2"
 gix-zlib = "=0.4.0"
 crc32fast = "1"
+# O(1) least-recently-used order for the `.idx` cache.
+hashlink = "0.11"
 thiserror.workspace = true
 
 [dev-dependencies]

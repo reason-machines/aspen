@@ -52,7 +52,7 @@ struct Cli {
 }
 
 const SERVE_HELP: &str = "\
-Configuration (environment variables; see deploy/README.md):
+Configuration (environment variables; see site/src/configuration.md):
   ASPEN_LISTEN                 address for Git over HTTP [default: 0.0.0.0:7070]
   ASPEN_PUBLIC_URL             URL clients use, e.g. https://git.example.com
   DATABASE_URL                 postgres://user@host/db (password in PGPASSWORD) or sqlite://path?mode=rwc  (required)
@@ -70,10 +70,36 @@ Configuration (environment variables; see deploy/README.md):
   ASPEN_MAX_PUSH_BYTES         largest pack per push [default: 8589934592]
   ASPEN_MAX_PUSH_OBJECTS       most objects per push [default: 10000000]
   ASPEN_PREFETCH_MEMORY_BYTES  delta-base memory shared by concurrent pushes [default: 4294967296]
+  ASPEN_ROLE                   all|serve|compact: Git and background jobs, Git only, or background jobs only [default: all]
+  ASPEN_COMPACT_WORKERS        background jobs (compaction, commit indexing) run at once [default: 8]
+  ASPEN_MERGE_QUEUE            on|off: land pushes to refs/queue/<trunk>/... on trunk in batches [default: off]
+  ASPEN_MERGE_QUEUE_BATCH      most queue entries one trunk update lands [default: 64]
+  ASPEN_GROUP_COMMIT           on|off: concurrent pushes share metadata transactions [default: off]
+  ASPEN_GROUP_COMMIT_WINDOW_MS how long a group commit batch waits for more pushes [default: 2]
+  ASPEN_GROUP_COMMIT_MAX_BATCH most pushes one group commit transaction takes [default: 64]
+  ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS  seconds outcome refs are kept, 0 for ever [default: 3600]
   ASPEN_MAX_CONCURRENT_FETCHES fetch requests and SSH fetch sessions at once [default: 32]
   ASPEN_MAX_CONCURRENT_PUSHES  push requests and SSH push sessions at once [default: 16]
   ASPEN_MAX_CONCURRENT_STITCHES inline packs stitched at once [default: 32]
-  ASPEN_ADMISSION_QUEUE        requests of each kind waiting for a slot, up to 10 s [default: 64]
+  ASPEN_ADMISSION_QUEUE        requests of each kind waiting for a slot [default: 64]
+  ASPEN_ADMISSION_QUEUE_WAIT_SECS longest wait in that queue [default: 10]
+  ASPEN_PREFETCH_FLOOR_BYTES   prefetch memory each push reserves first [default: 67108864]
+  ASPEN_PREFETCH_PER_PUSH_BYTES most prefetch memory one push may use [default: 4 x ASPEN_MAX_OBJECT_BYTES, >= 1 GiB]
+  ASPEN_PREFETCH_WAIT_SECS     longest wait for prefetch memory [default: 60]
+  ASPEN_PREFETCH_PARALLEL_READS object store reads in flight per push prefetch [default: 64]
+  ASPEN_IDX_CACHE_BYTES        pack index cache shared by pushes [default: 268435456]
+  ASPEN_OBJECT_CACHE_BYTES     delta-base cache shared by pushes, 0 = off [default: 67108864]
+  ASPEN_IDX_WHOLE_MAX_BYTES    largest pack index kept whole; larger ones are sampled [default: 67108864]
+  ASPEN_TRUNK_TREE_CACHE_BYTES trunk's newest trees kept for pushes' diffs, 0 = none [default: 67108864]
+  ASPEN_PUSH_THREADS           threads one push uses to index its pack [default: every core]
+  ASPEN_SYNC_COMMIT_ROWS       commit index rows written in the push's transaction [default: 10000]
+  ASPEN_UPLOAD_PART_BYTES      S3 single-PUT limit and multipart part size [default: 16777216]
+  ASPEN_UPLOAD_CONCURRENCY     multipart parts in flight per upload [default: 4]
+  ASPEN_DB_MAX_CONNECTIONS     metadata database connections [default: 10]
+  ASPEN_DB_ACQUIRE_TIMEOUT_SECS fail a wait for a connection after this long without progress [default: 30]
+  ASPEN_DB_LOCK_TIMEOUT_SECS   longest wait for a row lock, 0 = none [default: 10]
+  ASPEN_DB_STATEMENT_TIMEOUT_SECS longest statement on PostgreSQL, 0 = none [default: 60]
+  ASPEN_COMPACT_IDLE_POLL_MS   how often an idle background worker looks for jobs [default: 5000]
   ASPEN_PACKFILE_URIS          auto|true|false [default: auto: on when URLs can be presigned]
   ASPEN_EXPRESS_SERVE          auto|true|false: serve /-/express [default: auto: when ASPEN_EXPRESS_URLS names this server]
   ASPEN_MIGRATE                apply schema migrations at startup [default: true]
@@ -107,6 +133,10 @@ enum Command {
         /// without covers; pushes still enqueue their jobs.
         #[arg(long)]
         no_background_worker: bool,
+        /// Run the merge queue: pushes to `refs/queue/<trunk>/...` land on
+        /// trunk in batches (`ASPEN_MERGE_QUEUE` for `aspen serve`).
+        #[arg(long)]
+        merge_queue: bool,
     },
     /// Run an express node: serve signed packfile-URI downloads from the
     /// blob store (`ASPEN_BLOB_URL`) through a disk cache. Configured by
@@ -324,7 +354,17 @@ fn main() -> ExitCode {
             data_dir,
             repos,
             no_background_worker,
-        } => ("dev", dev(listen, &data_dir, &repos, !no_background_worker)),
+            merge_queue,
+        } => (
+            "dev",
+            dev(
+                listen,
+                &data_dir,
+                &repos,
+                !no_background_worker,
+                merge_queue,
+            ),
+        ),
         Command::Express { listen } => ("express", express(listen)),
         Command::Healthcheck { url, timeout_secs } => {
             let url = url.unwrap_or_else(|| {
@@ -452,6 +492,7 @@ fn dev(
     data_dir: &Path,
     repos: &[String],
     background_worker: bool,
+    merge_queue: bool,
 ) -> Result<(), BoxError> {
     if !listen.ip().is_loopback() {
         return Err(format!(
@@ -494,6 +535,14 @@ fn dev(
         max_push_bytes: config::DEFAULT_MAX_PUSH_BYTES,
         max_push_objects: u32::try_from(config::DEFAULT_MAX_PUSH_OBJECTS)?,
         prefetch_memory_bytes: config::DEFAULT_PREFETCH_MEMORY_BYTES,
+        tuning: config::Tuning::default(),
+        compact_workers: config::DEFAULT_COMPACT_WORKERS as usize,
+        merge_queue,
+        merge_queue_batch: config::DEFAULT_MERGE_QUEUE_BATCH as usize,
+        group_commit: false,
+        merge_queue_outcome_ttl: Some(std::time::Duration::from_secs(
+            config::DEFAULT_MERGE_QUEUE_OUTCOME_TTL_SECS,
+        )),
         packfile_uris: Switch::Auto,
         express_serve: false,
         migrate: true,
@@ -503,6 +552,7 @@ fn dev(
         // A laptop's loopback listener is private: metrics live beside Git.
         metrics_listen: None,
         metrics_on_git_listener: true,
+        role: config::Role::All,
         background_worker,
         ssh: None,
         // Public upstreams only: `aspen dev` reads no credentials.

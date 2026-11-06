@@ -983,6 +983,15 @@
             "type": "prometheus",
             "uid": "${datasource}"
           }
+        },
+        {
+          "refId": "B",
+          "expr": "max(aspen_compaction_backlog{job=~\"$job\"})",
+          "legendFormat": "compaction backlog (queued + running)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
         }
       ]
     },

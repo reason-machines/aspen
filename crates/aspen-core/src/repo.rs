@@ -195,6 +195,18 @@ impl RepoSettings {
         self
     }
 
+    /// The same settings with `extra` namespaces writable too (ones already
+    /// listed are not repeated). The server adds the merge queue's
+    /// namespaces this way, per request, without changing what is stored.
+    pub fn with_writable(mut self, extra: impl IntoIterator<Item = RefPattern>) -> Self {
+        for p in extra {
+            if !self.writable.contains(&p) {
+                self.writable.push(p);
+            }
+        }
+        self
+    }
+
     /// The writable ref namespaces.
     pub fn writable(&self) -> &[RefPattern] {
         &self.writable

@@ -95,6 +95,9 @@ fn minus(a: Timings, b: Timings) -> Timings {
         hook: a.hook - b.hook,
         upload: a.upload - b.upload,
         commit: a.commit - b.commit,
+        ancestry_commits: a.ancestry_commits - b.ancestry_commits,
+        located: a.located - b.located,
+        changed_entries: a.changed_entries - b.changed_entries,
     }
 }
 

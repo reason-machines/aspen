@@ -10,7 +10,7 @@ use aspen_bench::git::{self, Git};
 use aspen_bench::results::RunResult;
 use aspen_bench::synth::{self, RepoSpec};
 use aspen_bench::target::{self, CommonOpts, Setup};
-use aspen_bench::workloads::{clone, stale, storm, writers};
+use aspen_bench::workloads::{clone, queue, stale, storm, writers};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,38 @@ enum Command {
         /// Leave the benchmark branches on the server.
         #[arg(long)]
         keep_branches: bool,
+    },
+    /// N clients enqueue changes with Aspen's merge queue and wait for each
+    /// to land on main (the server needs ASPEN_MERGE_QUEUE=on).
+    Queue {
+        #[command(flatten)]
+        common: Common,
+        /// Concurrent clients.
+        #[arg(long, default_value_t = 4)]
+        clients: u32,
+        /// Length of the measured phase, in seconds.
+        #[arg(long, default_value_t = 60.0)]
+        duration_secs: f64,
+        /// Bytes of the file each commit rewrites.
+        #[arg(long, default_value_t = 512)]
+        commit_bytes: usize,
+        /// Give up waiting for a change's outcome after this many seconds.
+        #[arg(long, default_value_t = 60.0)]
+        visibility_timeout_secs: f64,
+        /// Pause between two polls of the outcomes, in milliseconds.
+        #[arg(long, default_value_t = 20)]
+        poll_ms: u64,
+        /// What changes touch, as DISJOINT,DIR,FILE percentages: a new file
+        /// of the client's own, a new file in a directory all clients
+        /// share, or a rewrite of a file all clients edit (only these can
+        /// conflict).
+        #[arg(long, default_value = "70,25,5")]
+        overlap: queue::Overlap,
+        /// After the run, check every landed commit with stock git (re-merge
+        /// with `git merge-tree --write-tree`, compare trees, `git fsck
+        /// --strict`); any mismatch fails the run (exit status 3).
+        #[arg(long)]
+        verify_landed: bool,
     },
     /// M jobs fetch the same new commit at once, for several rounds.
     FetchStorm {
@@ -292,6 +324,27 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             workload(&common, |setup, params| writers::run(setup, &opts, params))
         }
+        Command::Queue {
+            common,
+            clients,
+            duration_secs,
+            commit_bytes,
+            visibility_timeout_secs,
+            poll_ms,
+            overlap,
+            verify_landed,
+        } => {
+            let opts = queue::QueueOpts {
+                clients,
+                duration: secs(duration_secs, "--duration-secs")?,
+                commit_bytes,
+                visibility_timeout: secs(visibility_timeout_secs, "--visibility-timeout-secs")?,
+                poll: Duration::from_millis(poll_ms),
+                overlap,
+                verify_landed,
+            };
+            workload(&common, |setup, params| queue::run(setup, &opts, params))
+        }
         Command::FetchStorm {
             common,
             jobs,
@@ -423,9 +476,14 @@ fn workload(
         }
         None => println!("{json}"),
     }
-    Ok(if common.fail_on_errors && result.errors.count > 0 {
-        ExitCode::from(3)
-    } else {
-        ExitCode::SUCCESS
-    })
+    // A failed verification of what landed fails the run whatever the
+    // error policy (`queue --verify-landed`).
+    let verify_failed = result.counts.get("verify_failed").copied().unwrap_or(0) > 0;
+    Ok(
+        if verify_failed || (common.fail_on_errors && result.errors.count > 0) {
+            ExitCode::from(3)
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }

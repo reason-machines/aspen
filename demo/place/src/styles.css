@@ -117,6 +117,25 @@ a {
   flex-wrap: wrap;
 }
 
+.gh-mark {
+  display: inline-flex;
+  align-self: center;
+  color: var(--ink);
+  border-radius: var(--radius);
+}
+
+.gh-mark:hover {
+  color: var(--ink-2);
+}
+
+.gh-mark svg {
+  display: block;
+}
+
+.masthead-links[hidden] {
+  display: none;
+}
+
 .wordmark {
   margin: 0;
   font-size: clamp(2.4rem, 5vw, 3.4rem);
@@ -158,11 +177,6 @@ a {
 .dash-link:hover {
   background: var(--ink);
   color: var(--ground);
-}
-
-.dash-none {
-  color: var(--ink-2);
-  font-size: 0.9rem;
 }
 
 /* Layout -------------------------------------------------------------- */
@@ -663,12 +677,12 @@ fieldset {
 .steps li {
   counter-increment: step;
   position: relative;
-  padding-left: 28px;
+  padding-left: 0;
   margin-bottom: 10px;
 }
 
 .steps li::before {
-  content: counter(step);
+  content: none;
   position: absolute;
   left: 0;
   top: 1px;
@@ -739,6 +753,48 @@ fieldset {
 
 .format li {
   margin-bottom: 4px;
+}
+
+/* Agent prompt -------------------------------------------------------- */
+
+.agent-copy {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.btn-copy-prompt {
+  background: var(--ink);
+  color: var(--ground);
+}
+
+.copy-status {
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+.prompt-text {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--code);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.masthead-links {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 /* Swarm --------------------------------------------------------------- */
@@ -895,7 +951,8 @@ fieldset {
 @media (max-width: 899px) {
   .masthead {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: auto 1fr auto;
+    column-gap: 12px;
     align-items: center;
     padding-top: 14px;
   }
@@ -904,13 +961,18 @@ fieldset {
     display: contents;
   }
 
-  .wordmark {
+  .gh-mark {
     grid-column: 1;
     grid-row: 1;
   }
 
-  .masthead-links {
+  .wordmark {
     grid-column: 2;
+    grid-row: 1;
+  }
+
+  .masthead-links {
+    grid-column: 3;
     grid-row: 1;
   }
 
@@ -946,5 +1008,168 @@ fieldset {
 
   .btn-swarm::after {
     transition: width 500ms linear;
+  }
+}
+
+/* One screen on desktop: the page never scrolls; the feed scrolls inside. */
+@media (min-width: 900px) {
+  body {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .layout {
+    flex: 1;
+    min-height: 0;
+    align-items: stretch;
+    padding-bottom: 16px;
+  }
+
+  .rail {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .panel.feed {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .panel.feed .feed-list {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+  }
+}
+
+.panel {
+  padding: 14px 0 14px;
+}
+
+.paint-hint {
+  margin: 10px 0 8px;
+  font-size: 0.88rem;
+  color: var(--ink-2);
+}
+
+.agent-copy {
+  margin-top: 4px;
+}
+
+.steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The palette sits beside the canvas, like a paint app's toolbar. */
+.board {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.board .plat {
+  flex: 1;
+  min-width: 0;
+}
+
+.board .palette-set {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.board .palette {
+  margin: 0;
+}
+
+@media (min-width: 900px) {
+  .board {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .board .palette-set {
+    padding-top: 18px;
+  }
+
+  .board .palette {
+    grid-template-columns: repeat(2, 34px);
+    gap: 8px;
+  }
+
+  .board .swatch {
+    min-height: 34px;
+  }
+}
+
+/* Desktop: the stage shrinks to the canvas, and the whole group is centered. */
+@media (min-width: 900px) {
+  .layout {
+    grid-template-columns: max-content clamp(320px, 28vw, 400px);
+    justify-content: center;
+    column-gap: 40px;
+  }
+}
+
+/* Terminal commands: plain, one per line, selectable, no copy button. */
+.cmd-plain {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  font: 0.8rem / 1.6 var(--code);
+  /* Long lines (a clone URL, git remote add) wrap rather than clip. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.steps .step-label {
+  margin: 0 0 6px;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+/* Middle widths: the rail gives up room so the canvas stays large. */
+@media (min-width: 900px) and (max-width: 1279px) {
+  .layout {
+    grid-template-columns: max-content clamp(260px, 26vw, 330px);
+    column-gap: 24px;
+  }
+}
+
+/* Phones: a compact palette row, not full-width swatches. */
+@media (max-width: 899px) {
+  .board .palette {
+    grid-template-columns: repeat(8, 32px);
+    gap: 6px;
+  }
+
+  .board .swatch {
+    min-height: 32px;
+  }
+
+  .statline {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+}
+
+/* Short desktop windows: the rail scrolls on its own and the feed keeps a usable height. */
+@media (min-width: 900px) {
+  .rail {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .panel.feed {
+    min-height: 220px;
   }
 }

@@ -312,6 +312,76 @@ async fn compaction_end_to_end_with_stock_git() {
     assert_eq!(report.packs_written, 0, "{report:?}");
 }
 
+/// Invariant: several workers draining one backlog at once (what `aspen
+/// serve` runs with `ASPEN_COMPACT_WORKERS` above 1, and what several
+/// instances always did) build exactly the covers one worker builds, every
+/// job runs once, and a clone through them is complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_workers_build_the_same_covers() {
+    let s = Server::start_with(
+        |c| c.cover_layout = CoverLayout::new(FANOUT).unwrap(),
+        ForcePolicy::Branches,
+    )
+    .await;
+    let w = s.clone_dir("w");
+    for i in 1..=64u32 {
+        w.commit(
+            &format!("f{}.txt", i % 5),
+            &format!("version {i}\n{}\n", "x".repeat(i as usize)),
+            &format!("commit {i}"),
+        );
+        let (ok, out) = push(&w, &s.url(), &["main"]).await;
+        assert!(ok, "push {i}: {out}");
+    }
+    let mut workers = tokio::task::JoinSet::new();
+    for k in 0..4 {
+        let mut worker = Worker::new(compactor(&s), WorkerOptions::new(format!("worker-{k}")));
+        workers.spawn(async move {
+            let mut done = 0;
+            while let Some(outcome) = worker.run_one().await.unwrap() {
+                match outcome {
+                    JobOutcome::Done { .. } => done += 1,
+                    JobOutcome::Failed { error, .. } => panic!("a compact job failed: {error}"),
+                }
+            }
+            done
+        });
+    }
+    let mut done = 0;
+    while let Some(n) = workers.join_next().await {
+        done += n.unwrap();
+    }
+    assert_eq!(done, 16, "each of the 16 jobs ran exactly once");
+    let covers = s.meta.covers(s.repo.id, &main_ref()).await.unwrap();
+    let per_level = |l: u8| covers.iter().filter(|c| c.level.get() == l).count();
+    assert_eq!((per_level(1), per_level(2), per_level(3)), (16, 4, 1));
+    for c in &covers {
+        let pack = c.pack.unwrap_or_else(|| panic!("{c:?} has a pack"));
+        let row = &s.pack_rows(&[pack]).await[0];
+        s.verify_stored(row);
+        let mut union = BTreeSet::<ObjectId>::new();
+        for r in s.pack_rows(&range_packs(&s, c).await).await {
+            union.extend(s.pack_objects(&r));
+        }
+        assert_eq!(
+            s.pack_objects(row),
+            union,
+            "{c:?} holds its versions' objects"
+        );
+    }
+    let parent = Work {
+        path: s.dir.path().to_owned(),
+        home: s.home.clone(),
+    };
+    git(&parent, &["clone", "-q", &s.url(), "full"]).await;
+    let full = Work {
+        path: s.dir.path().join("full"),
+        home: s.home.clone(),
+    };
+    git(&full, &["fsck", "--strict", "--no-dangling"]).await;
+    assert_eq!(full.rev("origin/main"), w.rev("main"));
+}
+
 /// Invariants for plain-URL branch pushes (issue #203):
 /// - a range of fast-forwards gets a cover with a chain, since each such
 ///   push also depends on the branch's version it searched, and an
@@ -573,4 +643,93 @@ async fn the_index_commits_job_writes_the_rest_of_a_large_push() {
             .unwrap();
         assert_eq!(row.committer_time, time, "{hex}");
     }
+}
+
+/// Compaction heat, end to end with stock git: when compaction has a
+/// backlog, a ref that clients fetch has its `compact` jobs claimed before
+/// older jobs of a ref nobody fetches. Without the heat (main before
+/// `MetaStore::add_compaction_heat`), the claim takes the oldest job: the
+/// cold ref's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetched_refs_compact_jobs_are_claimed_first() {
+    let s = Server::start_with(
+        |c| c.cover_layout = CoverLayout::new(FANOUT).unwrap(),
+        ForcePolicy::Branches,
+    )
+    .await;
+    let w = s.clone_dir("w");
+    w.commit("base.txt", "base\n", "base");
+    let (ok, out) = push(&w, &s.url(), &["main"]).await;
+    assert!(ok, "{out}");
+    // `cold` gets its 4th version, and so its compact job, first.
+    for branch in ["cold", "hot"] {
+        w.git(&["checkout", "-q", "-b", branch, "main"]);
+        for i in 1..=FANOUT {
+            w.commit(&format!("{branch}.txt"), &format!("{branch} {i}\n"), branch);
+            let (ok, out) = push(&w, &s.url(), &[branch]).await;
+            assert!(ok, "{out}");
+        }
+    }
+    let job_of = async |branch: &str| {
+        let v = s.live(&format!("refs/heads/{branch}")).await;
+        assert_eq!(v.seq.get(), FANOUT);
+        v.id
+    };
+    let (cold, hot) = (job_of("cold").await, job_of("hot").await);
+    let priority = async |version: aspen_core::id::RefVersionId| -> i64 {
+        use sqlx::Row as _;
+        sqlx::query("SELECT priority FROM jobs WHERE kind = 'compact' AND ref_version_id = $1")
+            .bind(version.get())
+            .fetch_one(s.meta.pool())
+            .await
+            .unwrap()
+            .get("priority")
+    };
+    assert_eq!((priority(cold).await, priority(hot).await), (0, 0));
+
+    // A client clones `hot` alone: it is sent hot's four push packs.
+    let before = metric(&s, "aspen_fetch_uncompacted_versions_total").await;
+    let parent = Work {
+        path: s.dir.path().to_owned(),
+        home: s.home.clone(),
+    };
+    git(
+        &parent,
+        &[
+            "clone",
+            "-q",
+            "--single-branch",
+            "-b",
+            "hot",
+            &s.url(),
+            "reader",
+        ],
+    )
+    .await;
+    let sent = metric(&s, "aspen_fetch_uncompacted_versions_total").await - before;
+    assert!(sent >= FANOUT, "{sent} versions sent as push packs");
+    // The heat is written off the fetch's path, within a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while priority(hot).await == 0 {
+        assert!(std::time::Instant::now() < deadline, "no heat recorded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(priority(cold).await, 0, "nobody fetched cold");
+
+    let mut order = Vec::new();
+    while let Some(job) = s
+        .meta
+        .claim_job(
+            &[aspen_core::meta::JobTag::Compact],
+            "test",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    {
+        if let aspen_core::meta::JobKind::Compact { version } = job.kind {
+            order.push(version);
+        }
+    }
+    assert_eq!(order, vec![hot, cold], "the fetched ref's job first");
 }

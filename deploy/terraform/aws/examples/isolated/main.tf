@@ -83,6 +83,8 @@ module "aspen" {
   enable_cdn   = var.enable_cdn
   fargate_spot = var.fargate_spot
 
+  compactor_count = var.compactor_count
+
   db_deletion_protection = var.db_deletion_protection
   bucket_force_destroy   = var.bucket_force_destroy
 

@@ -124,6 +124,18 @@ names the value to fix.
 {{- if and .Values.metrics.networkPolicy.enabled (not .Values.metrics.networkPolicy.from) -}}
 {{- fail "metrics.networkPolicy.from is required when metrics.networkPolicy.enabled: the peers (your Prometheus) that may scrape the metrics port; without any, a NetworkPolicy rule would admit every source" -}}
 {{- end -}}
+{{- $workers := int64 (.Values.compaction.workers | default 0) -}}
+{{- if or (lt $workers 1) (gt $workers 64) -}}
+{{- fail "compaction.workers must be 1 to 64 (ASPEN_COMPACT_WORKERS)" -}}
+{{- end -}}
+{{- if and .Values.compactor.enabled (lt (int64 .Values.compactor.replicaCount) 1) -}}
+{{- fail "compactor.replicaCount must be at least 1 when compactor.enabled: the server pods run ASPEN_ROLE=serve, so nothing else would compact" -}}
+{{- end -}}
+{{- range .Values.compactor.extraEnv -}}
+{{- if and (regexMatch $secretish (.name | default "")) (hasKey . "value") -}}
+{{- fail (printf "compactor.extraEnv %s looks like a secret: use valueFrom.secretKeyRef, not a plain value" .name) -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.spool.ephemeralVolume.enabled (not .Values.spool.ephemeralVolume.storageClassName) -}}
 {{- fail "spool.ephemeralVolume.storageClassName is required when spool.ephemeralVolume.enabled" -}}
 {{- end -}}

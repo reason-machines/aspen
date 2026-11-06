@@ -66,6 +66,12 @@ variable "fargate_spot" {
   default     = false
 }
 
+variable "compactor_count" {
+  description = "Tasks of a separate compaction service (ASPEN_ROLE=compact); 0 runs compaction in the Git tasks."
+  type        = number
+  default     = 0
+}
+
 variable "db_deletion_protection" {
   description = "Protect the database from deletion."
   type        = bool

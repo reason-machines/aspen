@@ -75,6 +75,90 @@ impl Remote {
     }
 }
 
+impl Remote {
+    /// The refs under `prefixes` (oid, name), from one protocol v2 `ls-refs`
+    /// request whose body (from [`ls_refs_request`]) is the file `body`.
+    /// Sent with `curl`: `git ls-remote <url> <ref>` sends no `ref-prefix`,
+    /// so the server would list every ref of the repository. The
+    /// credential goes to curl on stdin, never in its arguments.
+    pub fn ls_refs(&self, body: &Path) -> Result<Vec<(String, String)>, String> {
+        let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut config = format!(
+            "url = \"{}/git-upload-pack\"\nheader = \"Git-Protocol: version=2\"\n\
+             header = \"Content-Type: application/x-git-upload-pack-request\"\n\
+             header = \"Accept: application/x-git-upload-pack-result\"\n\
+             data-binary = \"@{}\"\nsilent\nshow-error\nfail\n",
+            quote(self.url.trim_end_matches('/')),
+            quote(&body.to_string_lossy()),
+        );
+        if let Some(h) = &self.auth_header {
+            config.push_str(&format!("header = \"Authorization: {}\"\n", quote(h)));
+        }
+        let mut child = Command::new("curl")
+            .args(["-K", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawning curl: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(config.as_bytes())
+                .map_err(|e| format!("writing to curl: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("waiting for curl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "ls-refs failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut refs = Vec::new();
+        let mut rest = &out.stdout[..];
+        while rest.len() >= 4 {
+            let len = std::str::from_utf8(&rest[..4])
+                .ok()
+                .and_then(|h| usize::from_str_radix(h, 16).ok())
+                .ok_or("ls-refs: a malformed pkt-line")?;
+            if len < 4 {
+                rest = &rest[4..];
+                continue;
+            }
+            if len > rest.len() {
+                return Err("ls-refs: a truncated answer".to_owned());
+            }
+            let line = String::from_utf8_lossy(&rest[4..len]);
+            if let Some((oid, name)) = line.trim_end().split_once(' ') {
+                refs.push((
+                    oid.to_owned(),
+                    name.split(' ').next().unwrap_or(name).to_owned(),
+                ));
+            }
+            rest = &rest[len..];
+        }
+        Ok(refs)
+    }
+}
+
+/// The body of a protocol v2 `ls-refs` request for the refs under
+/// `prefixes`.
+pub fn ls_refs_request(prefixes: &[&str]) -> Vec<u8> {
+    fn pkt(out: &mut Vec<u8>, line: &str) {
+        out.extend_from_slice(format!("{:04x}{line}", line.len() + 4).as_bytes());
+    }
+    let mut out = Vec::new();
+    pkt(&mut out, "command=ls-refs\n");
+    out.extend_from_slice(b"0001");
+    for p in prefixes {
+        pkt(&mut out, &format!("ref-prefix {p}\n"));
+    }
+    out.extend_from_slice(b"0000");
+    out
+}
+
 /// The URL with any user information replaced, for error messages.
 pub fn redact(url: &str) -> String {
     match Remote::parse(url) {

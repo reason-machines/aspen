@@ -22,10 +22,10 @@ use aspen_core::id::{
 };
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
-    CommitLookup, CommitOutcome, CommitRow, Cover, CoverChain, JobEvent, JobKind, JobState, JobTag,
-    MAX_JOB_ATTEMPTS, MetaStore, NewCommit, NewCover, NewJob, PackTombstone, PushCommit,
-    RefListQuery, RefWrite, SeqRange, ShallowDepth, ShallowRecorded, VerifiedRange, VersionJob,
-    VersionJobKind, have_tip_seqs,
+    CommitLookup, CommitOutcome, CommitRow, CompactionHeat, Cover, CoverChain, JobEvent, JobKind,
+    JobState, JobTag, MAX_JOB_ATTEMPTS, MAX_JOB_HEAT, MetaStore, NewCommit, NewCover, NewJob,
+    PackTombstone, PushCommit, RefListQuery, RefWrite, SeqRange, ShallowDepth, ShallowRecorded,
+    VerifiedRange, VersionJob, VersionJobKind, have_tip_seqs,
 };
 use aspen_core::name::{RefName, RefPattern, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackGeneration, PackOrigin, entry_table_len};
@@ -76,6 +76,10 @@ const CASES: &[(&str, CaseFn)] = cases![
     concurrent_pushers_lose_exactly_once_per_round,
     free_running_pushers_build_one_gap_free_chain,
     an_atomic_push_is_all_or_nothing,
+    a_group_commit_isolates_each_push_in_one_transaction,
+    a_group_registration_isolates_each_pack_in_one_transaction,
+    concurrent_group_commits_over_shared_refs_never_deadlock,
+    a_group_commit_whose_transaction_fails_commits_no_push,
     the_database_refuses_a_version_that_is_not_the_expected_child,
     commit_rows_resolve_in_order_and_are_never_overwritten,
     packs_register_idempotently_and_read_back_exactly,
@@ -91,6 +95,7 @@ const CASES: &[(&str, CaseFn)] = cases![
     the_mirror_ledger_is_a_compare_and_swap,
     enqueue_is_idempotent_per_kind_and_target,
     claims_take_the_earliest_due_job_and_are_fenced,
+    heat_raises_the_queued_compact_jobs_fetches_wait_on,
     the_store_follows_the_job_state_machine,
     dead_jobs_are_requeued_as_new_jobs,
     release_gives_back_only_the_owners_jobs_of_the_kinds_asked,
@@ -660,6 +665,369 @@ async fn free_running_pushers_build_one_gap_free_chain(c: Ctx) {
     }
     let tips: BTreeSet<_> = chain.iter().filter_map(|v| v.value.tip()).collect();
     assert_eq!(tips.len(), 49, "every push landed exactly once");
+}
+
+/// Group commit (`commit_pushes`): every push of a batch runs in one
+/// transaction (exactly one more write transaction), and each push keeps
+/// its own compare-and-swap. A push that loses (to another push of the same
+/// batch, or to an older version), a malformed push and a push naming a
+/// pack that no longer exists each write nothing and get their own answer;
+/// an atomic push whose second write loses is undone as a whole; the rest
+/// commit, with their commit rows and jobs.
+async fn a_group_commit_isolates_each_push_in_one_transaction(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    let main1 = advance(s, repo, MAIN, oid(1), p).await;
+    let a1 = advance(s, repo, "refs/heads/a", oid(2), p).await;
+    let a2 = advance(s, repo, "refs/heads/a", oid(3), p).await;
+    let before = counts(s).await;
+    let tx_before = s.write_transactions();
+
+    let mut first = live(MAIN, Some(main1.id), oid(10), p);
+    first.commits.push(NewCommit {
+        commit: oid(10),
+        parents: vec![oid(1)],
+        committer_time: 7,
+    });
+    first.jobs.push(VersionJob {
+        kind: VersionJobKind::IndexCommits,
+        run_after: UnixMicros(0),
+    });
+    let batch = vec![
+        // 0: wins main.
+        PushCommit {
+            repo,
+            writes: vec![first],
+        },
+        // 1: expects the same version of main as 0, in the same batch.
+        PushCommit {
+            repo,
+            writes: vec![live(MAIN, Some(main1.id), oid(11), p)],
+        },
+        // 2: a stale expectation of `a`.
+        PushCommit {
+            repo,
+            writes: vec![live("refs/heads/a", Some(a1.id), oid(12), p)],
+        },
+        // 3: malformed (no writes).
+        PushCommit {
+            repo,
+            writes: Vec::new(),
+        },
+        // 4: names a pack that does not exist (garbage-collected).
+        PushCommit {
+            repo,
+            writes: vec![live(
+                "refs/heads/b",
+                None,
+                oid(13),
+                PackId::new(1_000_000).unwrap(),
+            )],
+        },
+        // 5: atomic; `0c` (created first: it sorts before `a`) must be
+        // undone when `a` loses.
+        PushCommit {
+            repo,
+            writes: vec![
+                live("refs/heads/0c", None, oid(14), p),
+                live("refs/heads/a", Some(a1.id), oid(15), p),
+            ],
+        },
+        // 6: creates a new ref.
+        PushCommit {
+            repo,
+            writes: vec![live("refs/heads/d", None, oid(16), p)],
+        },
+    ];
+    let out = s.commit_pushes(&batch).await.expect("the batch commits");
+    assert_eq!(
+        s.write_transactions() - tx_before,
+        1,
+        "one write transaction for the batch"
+    );
+    assert_eq!(out.len(), batch.len());
+    let won = match &out[0] {
+        Ok(CommitOutcome::Committed(v)) => v[0].clone(),
+        other => panic!("push 0: {other:?}"),
+    };
+    assert_eq!(
+        (won.seq, won.parent),
+        (main1.seq.next().unwrap(), Some(main1.id))
+    );
+    assert_eq!(
+        out[1],
+        Ok(CommitOutcome::CasLost {
+            name: rn(MAIN),
+            current: Some(won.id),
+        })
+    );
+    assert_eq!(
+        out[2],
+        Ok(CommitOutcome::CasLost {
+            name: rn("refs/heads/a"),
+            current: Some(a2.id),
+        })
+    );
+    assert!(is_conflict(out[3].clone()), "push 3: {:?}", out[3]);
+    assert!(
+        matches!(&out[4], Err(e) if e.is_pack_swept()),
+        "push 4: {:?}",
+        out[4]
+    );
+    assert_eq!(
+        out[5],
+        Ok(CommitOutcome::CasLost {
+            name: rn("refs/heads/a"),
+            current: Some(a2.id),
+        })
+    );
+    let made = match &out[6] {
+        Ok(CommitOutcome::Committed(v)) => v[0].clone(),
+        other => panic!("push 6: {other:?}"),
+    };
+
+    // Only pushes 0 and 6 wrote: two versions, one new ref row, push 0's
+    // commit row and job.
+    let after = counts(s).await;
+    assert_eq!(
+        [
+            after[0] - before[0],
+            after[1] - before[1],
+            after[2] - before[2],
+            after[3] - before[3]
+        ],
+        [2, 1, 1, 1]
+    );
+    assert_eq!(s.current_version(repo, &rn(MAIN)).await.unwrap(), Some(won));
+    assert_eq!(
+        s.current_version(repo, &rn("refs/heads/a")).await.unwrap(),
+        Some(a2)
+    );
+    for gone in ["refs/heads/b", "refs/heads/0c"] {
+        assert_eq!(
+            s.current_version(repo, &rn(gone)).await.unwrap(),
+            None,
+            "{gone}"
+        );
+    }
+    assert_eq!(
+        s.current_version(repo, &rn("refs/heads/d")).await.unwrap(),
+        Some(made)
+    );
+}
+
+/// Group registration (`register_packs`): one write transaction; new packs
+/// are registered, a pack already registered comes back as its row, the
+/// same checksum twice in one batch is one row, and a registration the
+/// store refuses (different sizes for a known checksum, or a malformed
+/// pack) fails alone.
+async fn a_group_registration_isolates_each_pack_in_one_transaction(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let known = s.register_pack(&push_pack(repo, 1)).await.unwrap();
+    let mut resized = push_pack(repo, 1);
+    resized.size += 1;
+    let mut malformed = push_pack(repo, 9);
+    malformed.object_count = 0;
+    let tx_before = s.write_transactions();
+    let packs_before = count(s, "packs").await;
+    let out = s
+        .register_packs(&[
+            push_pack(repo, 3),
+            resized,
+            push_pack(repo, 1),
+            malformed,
+            push_pack(repo, 2),
+            push_pack(repo, 3),
+        ])
+        .await
+        .expect("the batch commits");
+    assert_eq!(s.write_transactions() - tx_before, 1);
+    let ok = |i: usize| out[i].clone().unwrap_or_else(|e| panic!("pack {i}: {e}"));
+    assert!(is_conflict(out[1].clone()), "pack 1: {:?}", out[1]);
+    assert!(is_conflict(out[3].clone()), "pack 3: {:?}", out[3]);
+    assert_eq!(ok(2), known);
+    assert_eq!(ok(0), ok(5), "one checksum, one row");
+    assert_ne!(ok(0).id, ok(4).id);
+    assert_eq!(count(s, "packs").await - packs_before, 2);
+    for i in [0, 4] {
+        assert_eq!(
+            s.packs(&[ok(i).id]).await.unwrap(),
+            vec![ok(i)],
+            "pack {i} reads back"
+        );
+    }
+}
+
+/// Batches that run at once over the same refs, each listing its pushes
+/// in a different order, finish without a deadlock (the store orders a
+/// batch's pushes by ref name) or any storage error, and every ref's
+/// history stays one gap-free chain holding every push exactly once.
+async fn concurrent_group_commits_over_shared_refs_never_deadlock(c: Ctx) {
+    const REFS: usize = 6;
+    const TASKS: u32 = 6;
+    const ROUNDS: u32 = 6;
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    let names: Vec<String> = (0..REFS).map(|i| format!("refs/heads/r{i}")).collect();
+    let mut handles = Vec::new();
+    for t in 0..TASKS {
+        let (s, names) = (s.clone(), names.clone());
+        handles.push(tokio::spawn(async move {
+            let mut landed = 0u32;
+            for round in 0..ROUNDS {
+                // Every ref once, in an order of this task's own, retried
+                // until each lands.
+                let mut left: Vec<usize> = (0..REFS).collect();
+                left.rotate_left((t as usize + round as usize) % REFS);
+                if t % 2 == 1 {
+                    left.reverse();
+                }
+                let mut attempt = 0u32;
+                while !left.is_empty() {
+                    let mut batch = Vec::new();
+                    for &r in &left {
+                        let current = s
+                            .current_version(repo, &rn(&names[r]))
+                            .await
+                            .unwrap()
+                            .map(|v| v.id);
+                        let tip = oid_n(t * 1_000_000 + round * 10_000 + attempt * 100 + r as u32);
+                        batch.push(PushCommit {
+                            repo,
+                            writes: vec![live(&names[r], current, tip, p)],
+                        });
+                    }
+                    let out = s
+                        .commit_pushes(&batch)
+                        .await
+                        .expect("no batch fails under contention");
+                    let mut still = Vec::new();
+                    for (&r, o) in left.iter().zip(out) {
+                        match o.expect("no storage error under contention") {
+                            CommitOutcome::Committed(_) => landed += 1,
+                            CommitOutcome::CasLost { .. } => still.push(r),
+                        }
+                    }
+                    left = still;
+                    attempt += 1;
+                }
+            }
+            landed
+        }));
+    }
+    let deadline = Duration::from_secs(120);
+    let mut landed = 0;
+    for h in handles {
+        landed += tokio::time::timeout(deadline, h)
+            .await
+            .expect("no batch hangs")
+            .unwrap();
+    }
+    assert_eq!(landed, TASKS * ROUNDS * REFS as u32);
+    for name in &names {
+        let current = s.current_version(repo, &rn(name)).await.unwrap().unwrap();
+        let n = u64::from(TASKS * ROUNDS);
+        assert_eq!(current.seq.get(), n, "{name}");
+        let seqs: Vec<Seq> = (1..=n).map(|k| Seq::new(k).unwrap()).collect();
+        let chain = s.versions_by_seq(repo, &rn(name), &seqs).await.unwrap();
+        assert_eq!(chain.len() as u64, n, "{name}");
+        for pair in chain.windows(2) {
+            assert_eq!(pair[1].parent, Some(pair[0].id), "{name}");
+        }
+    }
+}
+
+/// When a batch's transaction cannot commit, no push of it is reported
+/// committed and none of its writes land. On Postgres a deferred
+/// constraint trigger refuses one push's commit row at `COMMIT`, after
+/// every savepoint was released: the whole batch must fail. SQLite has no
+/// deferred triggers, so there the trigger refuses the row in its
+/// statement, inside the push's own savepoint: that push alone fails and
+/// the others commit.
+async fn a_group_commit_whose_transaction_fails_commits_no_push(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let p = pack(s, repo, 1).await;
+    let main1 = advance(s, repo, MAIN, oid(1), p).await;
+    let poison = oid(0x66);
+    match s.dialect() {
+        Dialect::Postgres => {
+            for stmt in [
+                format!(
+                    "CREATE FUNCTION refuse_poison() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                     BEGIN IF NEW.commit_oid = '\\x{}'::bytea THEN \
+                     RAISE EXCEPTION 'refused at commit'; END IF; RETURN NULL; END $$",
+                    poison
+                ),
+                "CREATE CONSTRAINT TRIGGER refuse_poison AFTER INSERT ON commit_index \
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_poison()"
+                    .to_owned(),
+            ] {
+                sqlx::query(AssertSqlSafe(stmt))
+                    .execute(s.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        Dialect::Sqlite => {
+            // SQLite has no deferred triggers: refuse in the statement, and
+            // check below that the push's savepoint isolates it instead.
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE TRIGGER refuse_poison BEFORE INSERT ON commit_index \
+                 WHEN NEW.commit_oid = X'{poison}' BEGIN SELECT RAISE(ABORT, 'refused'); END"
+            )))
+            .execute(s.pool())
+            .await
+            .unwrap();
+        }
+    }
+    let before = counts(s).await;
+    let mut poisoned = live("refs/heads/p", None, poison, p);
+    poisoned.commits.push(NewCommit {
+        commit: poison,
+        parents: Vec::new(),
+        committer_time: 1,
+    });
+    let batch = vec![
+        PushCommit {
+            repo,
+            writes: vec![live(MAIN, Some(main1.id), oid(2), p)],
+        },
+        PushCommit {
+            repo,
+            writes: vec![poisoned],
+        },
+        PushCommit {
+            repo,
+            writes: vec![live("refs/heads/q", None, oid(3), p)],
+        },
+    ];
+    let out = s.commit_pushes(&batch).await;
+    match s.dialect() {
+        Dialect::Postgres => {
+            assert!(out.is_err(), "a failed COMMIT fails the batch: {out:?}");
+            assert_eq!(counts(s).await, before, "nothing of the batch landed");
+            assert_eq!(
+                s.current_version(repo, &rn(MAIN)).await.unwrap(),
+                Some(main1)
+            );
+        }
+        Dialect::Sqlite => {
+            // The refusal is a statement error inside the push's own
+            // savepoint: that push alone fails, the others commit.
+            let out = out.expect("the batch commits");
+            assert!(matches!(out[0], Ok(CommitOutcome::Committed(_))), "{out:?}");
+            assert!(out[1].is_err(), "{out:?}");
+            assert!(matches!(out[2], Ok(CommitOutcome::Committed(_))), "{out:?}");
+            assert_eq!(
+                s.current_version(repo, &rn("refs/heads/p")).await.unwrap(),
+                None
+            );
+        }
+    }
 }
 
 /// An atomic push is one transaction: if any write loses, the writes that
@@ -1332,6 +1700,97 @@ fn new_job(repo: RepoId, kind: JobKind, run_after: i64) -> NewJob {
         kind,
         run_after: UnixMicros(run_after),
     }
+}
+
+/// Compaction heat (`add_compaction_heat`) raises exactly the queued
+/// `compact` jobs of the named ref at or after `from`, and a claim takes the
+/// hottest due job first, then the oldest; jobs no fetch asked for keep
+/// oldest-first order, and heat never overflows the column.
+async fn heat_raises_the_queued_compact_jobs_fetches_wait_on(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/heat").await.id;
+    let other = new_repo(s, "acme/other").await.id;
+    let p = pack(s, repo, 1).await;
+    let q = pack(s, other, 2).await;
+    let mut main = Vec::new();
+    for i in 0..3u8 {
+        main.push(advance(s, repo, MAIN, oid(10 + i), p).await);
+    }
+    let topic = advance(s, repo, "refs/heads/topic", oid(20), p).await;
+    let elsewhere = advance(s, other, "refs/heads/topic", oid(30), q).await;
+    // Oldest first: main v1 (run_after 100), main v2 (200), main v3 (300),
+    // topic (400), the other repository's topic (500), and an index job on
+    // topic (50) that heat never touches.
+    let compact = |v: &RefVersion| JobKind::Compact { version: v.id };
+    let ids = s
+        .enqueue_jobs(&[
+            new_job(repo, compact(&main[0]), 100),
+            new_job(repo, compact(&main[1]), 200),
+            new_job(repo, compact(&main[2]), 300),
+            new_job(repo, compact(&topic), 400),
+            new_job(other, compact(&elsewhere), 500),
+            new_job(repo, JobKind::IndexCommits { version: topic.id }, 50),
+        ])
+        .await
+        .unwrap();
+    let heat = |repo, name: &str, from: u64, heat| CompactionHeat {
+        repo,
+        name: rn(name),
+        from: Seq::new(from).unwrap(),
+        heat,
+    };
+    // Fetches of topic in `repo` and of main from v2 on.
+    let raised = s
+        .add_compaction_heat(&[
+            heat(repo, "refs/heads/topic", 1, 5),
+            heat(repo, MAIN, 2, 3),
+            heat(repo, "refs/heads/missing", 1, 9),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        raised, 3,
+        "topic, main v2 and main v3; not v1, not the other repository"
+    );
+    assert_eq!(s.add_compaction_heat(&[]).await.unwrap(), 0);
+    c.set_time(1_000);
+    let tags = [JobTag::Compact, JobTag::IndexCommits];
+    let mut order = Vec::new();
+    while let Some(job) = s
+        .claim_job(&tags, "w", Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        order.push(job.id);
+    }
+    assert_eq!(
+        order,
+        vec![ids[3], ids[1], ids[2], ids[5], ids[0], ids[4]],
+        "hottest first (topic 5, main v2 and v3 3), then oldest due"
+    );
+    // A running job is not raised; the column saturates instead of
+    // overflowing.
+    assert_eq!(
+        s.add_compaction_heat(&[heat(repo, "refs/heads/topic", 1, 1)])
+            .await
+            .unwrap(),
+        0
+    );
+    let v4 = advance(s, repo, MAIN, oid(14), p).await;
+    s.enqueue_jobs(&[new_job(repo, compact(&v4), 0)])
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        s.add_compaction_heat(&[heat(repo, MAIN, 1, u64::MAX)])
+            .await
+            .unwrap();
+    }
+    let top: i64 = sqlx::query("SELECT MAX(priority) AS p FROM jobs")
+        .fetch_one(s.pool())
+        .await
+        .unwrap()
+        .get("p");
+    assert_eq!(top, i64::try_from(MAX_JOB_HEAT).unwrap());
 }
 
 /// One job that is not done per kind and target: enqueueing again returns
