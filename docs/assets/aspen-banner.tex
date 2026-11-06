@@ -1,0 +1,112 @@
+\documentclass[border=0pt]{standalone}
+\usepackage{fontspec}
+\setmainfont{Geist-Regular.ttf}[Path=./]
+\newfontfamily\mono{GeistMono-Regular.ttf}[Path=./]
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,calc,arrows.meta}
+
+\definecolor{ink}{HTML}{141413}
+\definecolor{paper}{HTML}{FBFAF7}
+\definecolor{line}{HTML}{E7E4DC}
+\definecolor{muted}{HTML}{6B6A66}
+\definecolor{hexw}{HTML}{FFFFFF}
+\definecolor{pA}{HTML}{D6262B}
+\definecolor{pB}{HTML}{3690EA}
+\definecolor{pC}{HTML}{F2C14E}
+\definecolor{pD}{HTML}{2E9E5B}
+
+% Banner: 24 cm x 10.25 cm, rendered at 200 dpi (about 1890 x 807 px).
+\newcommand\R{1.42}          % hex circumradius
+\pgfmathsetmacro\W{sqrt(3)*\R}
+\pgfmathsetmacro\V{1.5*\R}
+
+\tikzset{
+  hex/.style={regular polygon, regular polygon sides=6, shape border rotate=30,
+              minimum size=2*\R cm, inner sep=0pt, draw=line, line width=0.9pt},
+  hexfill/.style={hex, fill=hexw, draw=line},
+}
+
+% \hexat{col}{row} gives the centre of a pointy-top hex in the grid (odd rows offset).
+\newcommand\hexat[2]{({14.9 + (#1)*\W + mod(#2,2)*\W/2}, {11.0 - (#2)*\V})}
+
+\begin{document}
+\begin{tikzpicture}
+  \clip (0,0) rectangle (24,10.25);
+  \fill[paper] (0,0) rectangle (24,10.25);
+
+  % empty grid
+  \foreach \c in {0,...,4} \foreach \r in {0,...,6}
+    \node[hex] at \hexat{\c}{\r} {};
+
+  % filled cells
+  \node[hexfill] (h1) at \hexat{1}{1} {};
+  \node[hexfill] (h2) at \hexat{2}{1} {};
+  \node[hexfill] (h3) at \hexat{0}{2} {};
+  \node[hex, fill=ink, draw=ink] (h4) at \hexat{1}{2} {};
+  \node[hexfill] (h5) at \hexat{2}{3} {};
+  \node[hexfill] (h6) at \hexat{1}{4} {};
+  \node[hexfill] (h7) at \hexat{1}{3} {};
+
+  % 1. git branch glyph
+  \begin{scope}[shift={(h1.center)}, line width=2.2pt, draw=ink]
+    \draw (-0.35,-0.55) -- (-0.35,0.55);
+    \draw (-0.35,-0.15) .. controls (-0.35,0.15) and (0.35,0.0) .. (0.35,0.35);
+    \fill[ink] (-0.35,-0.55) circle (0.13) (-0.35,0.55) circle (0.13);
+    \fill[hexw] (0.35,0.42) circle (0.13); \draw (0.35,0.42) circle (0.13);
+  \end{scope}
+
+  % 2. pixel canvas (place)
+  \begin{scope}[shift={($(h2.center)+(-0.48,-0.48)$)}]
+    \foreach \x/\y/\col in {0/0/pA,1/0/ink,2/0/pC,0/1/pB,1/1/pA,2/1/pD,0/2/pC,1/2/pB,2/2/ink}
+      \fill[\col] (\x*0.33,\y*0.33) rectangle ++(0.29,0.29);
+  \end{scope}
+
+  % 3. stacked packs (levels)
+  \begin{scope}[shift={(h3.center)}, line width=1.6pt]
+    \foreach \i/\w in {0/1.1,1/0.8,2/0.5}
+      \draw[ink, fill=hexw, rounded corners=1.5pt] (-\w/2,-0.45+\i*0.33) rectangle ++(\w,0.24);
+  \end{scope}
+
+  % 4. Reason mark (white bars on the ink hex)
+  \begin{scope}[shift={(h4.center)}, line width=7pt, draw=paper, line cap=round]
+    \draw (-0.24,0.32) -- (-0.24,-0.18);
+    \draw (0.24,0.32) -- (0.24,-0.18);
+  \end{scope}
+
+  % 5. database cylinder
+  \begin{scope}[shift={(h5.center)}, line width=1.8pt, draw=ink]
+    \draw (-0.42,0.38) -- (-0.42,-0.38) arc[start angle=180,end angle=360,x radius=0.42,y radius=0.14] -- (0.42,0.38);
+    \draw (0,0.38) ellipse[x radius=0.42,y radius=0.14];
+    \draw (-0.42,0.0) arc[start angle=180,end angle=360,x radius=0.42,y radius=0.14];
+  \end{scope}
+
+  % 6. object storage bucket
+  \begin{scope}[shift={(h6.center)}, line width=1.8pt, draw=ink]
+    \draw (-0.45,0.32) -- (-0.32,-0.42) -- (0.32,-0.42) -- (0.45,0.32);
+    \draw (0,0.32) ellipse[x radius=0.45,y radius=0.12];
+  \end{scope}
+
+  % 7. merge arrows (compaction)
+  \begin{scope}[shift={(h7.center)}, line width=2pt, draw=ink, -{Latex[length=5pt]}]
+    \draw (-0.45,0.4) -- (-0.05,0.02);
+    \draw (0.45,0.4) -- (0.05,0.02);
+    \draw (0,-0.05) -- (0,-0.5);
+  \end{scope}
+
+  % left: lockup, headline, credit
+  \node[anchor=west, inner sep=0] (mk) at (1.55,8.55) {\includegraphics[height=0.62cm]{reason-mark.png}};
+  \node[anchor=west, inner sep=0, font=\fontsize{19}{19}\selectfont, text=ink] at ([xshift=0.19cm]mk.east) {Reason};
+
+  \node[anchor=west, align=left, inner sep=0, text=ink,
+        font=\fontsize{40}{45}\selectfont\addfontfeatures{LetterSpace=-3.5}]
+    at (1.5,5.55) {Git for a thousand\\agents at once.};
+
+  \node[anchor=west, align=left, inner sep=0, text=muted, font=\fontsize{14.5}{19}\selectfont]
+    at (1.55,2.85) {Aspen: a self-hostable Git server. Packs in object storage,\\branches in Postgres, plain {\mono git} on the wire.};
+
+  \node[anchor=west, inner sep=0, text=muted, font=\mono\fontsize{11}{11}\selectfont\addfontfeatures{LetterSpace=18}]
+    at (1.57,1.25) {AFTER OPENAI'S PANDO \(\cdot\) APACHE-2.0 \(\cdot\) PRE-ALPHA};
+\end{tikzpicture}
+\end{document}

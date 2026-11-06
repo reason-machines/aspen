@@ -1,5 +1,7 @@
 # Aspen
 
+![Aspen: Git for a thousand agents at once.](docs/assets/aspen-banner.png)
+
 Aspen is a Git server you run yourself, built for repositories that hundreds
 of agents, CI jobs and people push to and fetch from at the same time. It
 speaks plain Git over HTTP and SSH, so stock `git` works with no client
@@ -13,17 +15,16 @@ PostgreSQL, and runs on one machine or on any cloud.
 > verified.
 
 **Live demo:** <https://place.reasonmachines.com>, a shared pixel canvas
-where every brush stroke is a `git push`. The deployment is in progress, so
-the demo may not be live yet.
-Clone the canvas shallow:
+where every brush stroke is a `git push`
+([mirror on GitHub](https://github.com/reason-machines/place-canvas)):
 
 ```bash
-git clone --depth=1 https://place.reasonmachines.com/canvas.git
+git clone https://place.reasonmachines.com/canvas.git
 ```
 
-A full clone fetches every stroke's whole `tiles/` tree: Aspen's compaction
-merges packs but does not compute deltas yet, so full clones of the canvas
-are much larger and slower than shallow ones until it does.
+Inspired by OpenAI's
+"[Scaling Git at OpenAI](https://openai.com/index/scaling-git-at-openai/)",
+which describes their internal Git service, Pando.
 
 ## Why
 
@@ -48,6 +49,16 @@ Pando ("[Scaling Git at OpenAI](https://openai.com/index/scaling-git-at-openai/)
   The server never builds a pack per client.
 - **Small packs are merged in the background** in levels, like an LSM tree,
   so the number of packs a fetch needs grows logarithmically.
+
+## How it works
+
+![How a push and a fetch flow through Aspen](docs/assets/architecture.png)
+
+A push is verified, completed into a self-contained pack and uploaded to
+object storage; then one compare-and-swap moves that branch's tip in the
+metadata store. A fetch asks the metadata store which stored packs cover what
+the client wants, and the stitcher streams them as one pack or hands out
+packfile URIs for a CDN. Compaction merges small packs in the background.
 
 It runs with one binary, PostgreSQL and any S3-compatible bucket, or with
 SQLite and a local directory on one machine. Mirror mode puts Aspen in front
