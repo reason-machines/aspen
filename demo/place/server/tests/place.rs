@@ -253,18 +253,19 @@ async fn every_tile_rule_is_enforced_through_git_push_and_a_refused_push_stores_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_value() {
-    // TILES.md's worked example with a cap of 4 tiles per push.
+    // TILES.md's worked example with a cap of 4 tiles per push, on a
+    // branch outside `paint/` so its step 3 force-push is allowed.
     let app = App::start(|c| c.rules.tiles_per_push = 4).await;
     let w = app.clone_work("ada").await;
     let t0 = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
     w.paint(&[(0, 0, RED), (1, 0, RED), (2, 0, RED)], "A1");
-    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await.0);
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/ada"]).await.0);
     // The merger moves trunk meanwhile.
     app.place.merge_once().await.unwrap().unwrap();
     // A2 on A1: the branch is not advertised, so git sends a zero old
     // value; the server excludes its stored tip A1, so 2 tiles count.
     w.paint(&[(3, 0, RED), (4, 0, RED)], "A2");
-    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/ada"]).await;
     assert!(ok, "counted A1 again: {out}");
     // A3 alone paints 5 tiles: refused.
     w.paint(
@@ -277,7 +278,7 @@ async fn a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_valu
         ],
         "A3",
     );
-    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/ada"]).await;
     assert!(
         !ok && out.contains("this push changes 5 tiles; the limit is 4"),
         "{out}"
@@ -294,13 +295,153 @@ async fn a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_valu
         "B1",
     );
     let (ok, out) = w
-        .push(&["-o", "force", &app.url(), "+HEAD:refs/heads/paint/ada"])
+        .push(&["-o", "force", &app.url(), "+HEAD:refs/heads/ada"])
         .await;
     assert!(ok, "{out}");
     let canvas = app.get("/api/v1/canvas").await;
     let overlay = canvas["branches"].as_array().unwrap();
     // A2's two tiles (still unmerged) and B1's four, newest per position.
     assert_eq!(overlay[0]["tiles"].as_array().unwrap().len(), 6);
+}
+
+/// Invariant: a Git client can create and fast-forward a `paint/`
+/// branch, but cannot delete it or rewrite it, however it asks (`-o
+/// force`, `--force` through the branch URL, a rewind to an ancestor); the
+/// refusal tells it to push to a new branch, and the branch is untouched.
+/// The server's own handling of `paint/` branches (merging, expiry's
+/// delete) is not affected, and other branches keep Aspen's policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paint_branches_only_move_forward_for_git_clients() {
+    let app = App::start(|c| c.branch_ttl = Duration::from_millis(300)).await;
+    let bob = "refs/heads/paint/bob";
+    let w = app.clone_work("bob").await;
+    let t0 = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let a1 = w.paint(&[(0, 0, RED)], "A1");
+    let (ok, out) = w.push(&[&app.url(), &format!("HEAD:{bob}")]).await;
+    assert!(ok, "creation refused: {out}");
+    let a2 = w.paint(&[(1, 0, RED)], "A2");
+    let (ok, out) = w.push(&[&app.url(), &format!("HEAD:{bob}")]).await;
+    assert!(ok, "fast-forward refused: {out}");
+    assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]));
+
+    // Someone else's rewrite of the branch, on T0.
+    let m = app.clone_work("mallory").await;
+    m.git(&["reset", "-q", "--hard", &t0]);
+    let b1 = m.paint(&[(5, 5, BLUE)], "B1");
+    let scoped = format!("{}/-/{bob}", app.url());
+    let forward = "paint/ branches only move forward";
+    let attempts: [(&str, Vec<String>); 3] = [
+        (
+            "-o force",
+            vec![
+                "-o".into(),
+                "force".into(),
+                app.url(),
+                format!("+HEAD:{bob}"),
+            ],
+        ),
+        (
+            "--force through the branch URL",
+            vec!["--force".into(), scoped.clone(), format!("HEAD:{bob}")],
+        ),
+        (
+            "a rewind to an ancestor",
+            vec![
+                "-o".into(),
+                "force".into(),
+                app.url(),
+                format!("+{a1}:{bob}"),
+            ],
+        ),
+    ];
+    for (what, args) in &attempts {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ok, out) = m.push(&args).await;
+        assert!(!ok, "{what} accepted: {out}");
+        assert!(
+            out.contains(forward) && out.contains("push your history to a new branch"),
+            "{what}: {out}"
+        );
+        assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "{what}");
+    }
+    // Without `-o force`, Aspen's own ref-update rule (spike S2) refuses
+    // a delete or a rewrite of a branch this client was not shown, before
+    // the place hook is asked; the branch is untouched either way.
+    let plain: [(&str, Vec<String>); 2] = [
+        ("a plain delete", vec![app.url(), format!(":{bob}")]),
+        (
+            "a plain --force",
+            vec!["--force".into(), app.url(), format!("HEAD:{bob}")],
+        ),
+    ];
+    for (what, args) in &plain {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ok, out) = m.push(&args).await;
+        assert!(!ok, "{what} accepted: {out}");
+        assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "{what}");
+    }
+    let deletes: [(&str, Vec<String>); 2] = [
+        (
+            "a delete with -o force",
+            vec!["-o".into(), "force".into(), app.url(), format!(":{bob}")],
+        ),
+        (
+            "--delete through the branch URL",
+            vec!["--delete".into(), scoped.clone(), bob.into()],
+        ),
+    ];
+    for (what, args) in &deletes {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ok, out) = m.push(&args).await;
+        assert!(!ok, "{what} accepted: {out}");
+        assert!(
+            out.contains("paint/ branches cannot be deleted") && out.contains("new branch"),
+            "{what}: {out}"
+        );
+        assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "{what}");
+    }
+
+    // The rewrite goes to a new branch instead.
+    let (ok, out) = m.push(&[&app.url(), "HEAD:refs/heads/paint/mallory"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        app.tip("refs/heads/paint/mallory").await.as_deref(),
+        Some(&b1[..])
+    );
+    // Outside `paint/`, a delete is still Aspen's ordinary policy.
+    let (ok, out) = m.push(&[&app.url(), "HEAD:refs/heads/scratch"]).await;
+    assert!(ok, "{out}");
+    let (ok, out) = m
+        .push(&["-o", "force", &app.url(), ":refs/heads/scratch"])
+        .await;
+    assert!(ok, "{out}");
+    assert_eq!(app.tip("refs/heads/scratch").await, None);
+
+    // The merger folds both paint/ branches into main, and expiry deletes
+    // them through receive-pack as before.
+    app.place.merge_once().await.unwrap().expect("a merge");
+    let check = app.clone_work("check").await;
+    for (path, color) in [
+        ("tiles/0_0.txt", RED),
+        ("tiles/1_0.txt", RED),
+        ("tiles/5_5.txt", BLUE),
+    ] {
+        assert_eq!(
+            std::fs::read(check.path.join(path)).unwrap(),
+            format!("{color}\n").as_bytes(),
+            "{path}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Both paint/ branches, and `scratch`, which the delete above left
+    // to expiry to forget.
+    assert_eq!(app.place.expire_once().await.unwrap(), 3);
+    assert_eq!(app.tip(bob).await, None);
+    assert_eq!(app.tip("refs/heads/paint/mallory").await, None);
+    assert_eq!(app.get("/api/v1/branches").await["branches"], json!([]));
+    // A name expiry freed can be created again.
+    let (ok, out) = w.push(&[&app.url(), &format!("HEAD:{bob}")]).await;
+    assert!(ok, "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

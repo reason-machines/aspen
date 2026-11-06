@@ -18,8 +18,4 @@ ecr_repository_arns = [
 # aspen_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen:v0.1.0"
 # place_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/aspen-place:v0.1.0"
 
-# First start with the swarm and ambient agents stopped; an operator
-# releases the kill switch once the dashboards are watched.
-place_kill_switch = true
-
 enable_ssh = false

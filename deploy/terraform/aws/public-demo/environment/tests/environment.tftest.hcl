@@ -277,6 +277,14 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
     )
     error_message = "The demo's place pool must have 64 connections."
   }
+  # The kill switch lives in place's memory: an env var that engages it at
+  # start would leave the public demo stopped after every restart.
+  assert {
+    condition = alltrue([
+      for e in jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment : e.name != "PLACE_KILL_SWITCH"
+    ])
+    error_message = "place must start with its kill switch released: no PLACE_KILL_SWITCH in its environment."
+  }
   assert {
     condition = (
       module.aspen.database_size.instance_class == "db.m7g.2xlarge" &&

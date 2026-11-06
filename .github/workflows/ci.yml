@@ -190,6 +190,8 @@ jobs:
           PG_BIN="$PG_BIN" sh aws/public-demo/environment/tests/create-database.test.sh
       - name: public demo smoke.sh keeps the token off git's command line
         run: sh aws/public-demo/tests/smoke.test.sh
+      - name: public demo canvas-mirror.sh pushes as soon as place answers after a start
+        run: sh aws/public-demo/environment/tests/canvas-mirror.test.sh
       - name: tflint
         env:
           GITHUB_TOKEN: ${{ github.token }}   # plugin download rate limit

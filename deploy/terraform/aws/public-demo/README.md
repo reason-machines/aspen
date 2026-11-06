@@ -276,9 +276,11 @@ Every line must say `ok`. Then, by hand:
 ### 8. The public demo
 
 The same steps with `demo.tfvars` and `demo.backend.hcl` (`terraform init
--reconfigure -backend-config=demo.backend.hcl`). `demo.tfvars.example` starts
-`place` with its kill switch engaged; release it through the API once the
-smoke test passes and someone is watching the budget. Making the demo
+-reconfigure -backend-config=demo.backend.hcl`). `place` starts with its
+kill switch released, on its first start and after every restart. Until
+someone watches the budget, apply with `place_running = false`, or engage
+the switch through the API (see [Operate it](#operate-it)) right after the
+task starts. Making the demo
 public (linking it anywhere) waits for the launch gate in docs/PLAN.md
 section 7.
 
@@ -293,10 +295,10 @@ two do not idle at $230 together.
   new one starts, so the page is down for about a minute; that is the price
   of never running two merger bots at once.
   The live demo's `demo.tfvars` and `demo.backend.hcl` are kept by the
-  maintainers, outside the repository. They keep `place_kill_switch = true`, so
-  every deploy starts `place` with the kill switch engaged: release it with
-  the operator token (`{"engaged": false}` to `/api/v1/admin/kill-switch`)
-  once the new task is up.
+  maintainers, outside the repository. A restart starts `place` with its kill
+  switch released, so a deploy needs no operator step afterwards; the
+  environment has no setting that starts it engaged (one did, and every
+  deploy left the public demo stopped until someone released it).
 - **Mirror the canvas to GitHub.** Set `place_canvas_mirror = "owner/name"`
   (an existing, empty repository) and apply. Put a credential with write
   access to that repository only into the secret the
@@ -306,15 +308,20 @@ two do not idle at $230 together.
   a fine-grained token with Contents read/write on that repository alone.
   `aws secretsmanager put-secret-value --secret-id <arn> --secret-string file://cred`,
   delete the local copy, and force a new deployment of the place service.
-  The `canvas-mirror` sidecar fetches `main` from aspen-place at start and
-  every `place_canvas_mirror_interval_seconds` (900) and pushes it when it
+  The `canvas-mirror` sidecar fetches `main` from aspen-place as soon as
+  place answers after a start (it asks every 5 seconds until then, for at
+  most one interval) and then every
+  `place_canvas_mirror_interval_seconds` (900), and pushes it when it
   moved, forced, so the mirror follows `main` when place starts its
   history again (`PLACE_HISTORY_MAX_BYTES`, or
   `/api/v1/admin/reset-history`); its
   log stream (`canvas-mirror/...` in the place log group) says when a push
   fails.
 - **Stop the demo** without tearing it down: engage the kill switch (API),
-  or set `place_running = false` and apply, which stops the task.
+  or set `place_running = false` and apply, which stops the task. The kill
+  switch lives in the task's memory, so a restart or deploy releases it;
+  engage it again afterwards, or use `place_running = false` for a stop
+  that lasts.
 - **When a budget alert fires:** look at Cost Explorer by service first.
   - CloudFront: set `enable_cdn = false` in the environment's `.tfvars` and
     apply. That removes the distribution, so CloudFront stops serving and

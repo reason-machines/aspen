@@ -13,6 +13,18 @@ pub const TRUNK_REF: &str = "refs/heads/main";
 /// visitor's branch only ever moves through that visitor's session.
 pub const RESERVED_PREFIXES: [&str; 3] = ["visitors/", "agent/", "swarm/"];
 
+/// Branches under this prefix (after `refs/heads/`) only move forward
+/// for Git clients: they may be created and fast-forwarded, never deleted
+/// or rewritten, because anyone may push to any of them.
+pub const FORWARD_ONLY_PREFIX: &str = "paint/";
+
+/// Whether a Git client's update of `name` must be a creation or a
+/// fast-forward ([`FORWARD_ONLY_PREFIX`]).
+pub fn forward_only(name: &str) -> bool {
+    name.strip_prefix("refs/heads/")
+        .is_some_and(|short| short.starts_with(FORWARD_ONLY_PREFIX))
+}
+
 /// The only file mode a tile may have.
 pub const TILE_MODE: u32 = 0o100644;
 

@@ -105,8 +105,16 @@ muts = [
   HIST + ["clones_and_branches_from_before_a_reset"]),
  ("P25 the merger never starts main's history again", [(PLACE, "        if max == 0 || self.with_state(|s| s.main.history.bytes) < max {", "        if true || self.with_state(|s| s.main.history.bytes) < max {")],
   HIST + ["a_full_clone_stays_within_the_history_limit"]),
- ("P26 a restart forgets the history's size", [(PLACE, "                    }, |h| h.grow(0)),", "                    }, |_| History::root(tip, 0)),")],
+ ("P26 a restart forgets the history's size", [(PLACE, "                        |h| h.grow(0),\n", "                        |_| History::root(tip, 0),\n")],
   HIST + ["clones_and_branches_from_before_a_reset"]),
+ # The hook's walk of a push built on an earlier main stays bounded.
+ ("P27 unreadable IDs are not charged to the boundary walk", [(HOOK, "                    spent += 1;\n                    match objects.read(*id).await? {", "                    match objects.read(*id).await? {")],
+  ["-p", "aspen-place", "--lib", "the_boundary_walk_stays_within_its_budget_on_a_wide_generation"]),
+ ("P28 the boundary walk asks about a whole generation at once", [(HOOK, "let n = queue.len().min(budget - spent).min(CLASSIFY_BATCH);", "let n = queue.len();"),
+                                                                (HOOK, "                if spent + queue.len() >= budget {\n                    break;\n                }\n", "")],
+  ["-p", "aspen-place", "--lib", "the_boundary_walk_stays_within_its_budget_on_a_wide_generation"]),
+ ("P29 the hook walks the whole range before looking for an earlier main", [(HOOK, "let probe = PROBE_COMMITS.min(max_commits);", "let probe = max_commits;")],
+  ["-p", "aspen-place", "--lib", "a_push_on_an_earlier_main_costs_the_same_whatever_its_length"]),
 ]
 
 only = sys.argv[1:]
