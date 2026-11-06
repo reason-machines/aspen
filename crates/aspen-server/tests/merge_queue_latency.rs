@@ -117,6 +117,7 @@ struct Harness {
     url: String,
     home: std::path::PathBuf,
     queue: MergeQueue<SqlStore, Slow>,
+    svc: Arc<aspen_server::receive::ReceivePack<SqlStore, Slow>>,
     reads: Arc<AtomicU64>,
 }
 
@@ -141,11 +142,11 @@ impl Harness {
         cfg.thread_limit = Some(2);
         cfg.merge_queue = true;
         cfg.sync_commit_rows = sync_commit_rows;
-        let server = aspen_server::Server::new(
-            meta.clone(),
-            blobs.clone(),
-            aspen_server::ServerConfig::new(MaxObjectBytes::new(64 * MIB).unwrap()),
-        )
+        let server = aspen_server::Server::new(meta.clone(), blobs.clone(), {
+            let mut c = aspen_server::ServerConfig::new(MaxObjectBytes::new(64 * MIB).unwrap());
+            c.metrics_on_git_listener = true;
+            c
+        })
         .with_receive_pack(cfg)
         .unwrap();
         let svc = server.receive_pack().unwrap().clone();
@@ -188,8 +189,9 @@ impl Harness {
             })
             .await;
         }
-        let queue = MergeQueue::new(svc, QueueConfig::default());
+        let queue = MergeQueue::new(svc.clone(), QueueConfig::default());
         Self {
+            svc,
             dir,
             url,
             home,
@@ -337,4 +339,110 @@ async fn push_prepared(home: &Path, url: &str, clients: Vec<(std::path::PathBuf,
     for t in tasks {
         t.await;
     }
+}
+
+/// Regression: a queued change's objects (commit, new trees, blobs) are
+/// read with one read of its whole pack, not one read per object and tree
+/// level; trunk's trees and the trees the worker wrote stay cached between
+/// batches. Before, a batch read about three times per entry, each read a
+/// blob-store round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_change_costs_one_blob_read() {
+    let h = Harness::start(10_000).await;
+    h.time_batch(vec!["warm".into()]).await;
+    let names: Vec<String> = (0..32).map(|i| format!("r{i}")).collect();
+    enqueue(&h.clients(), &h.home, &h.url, &names).await;
+    let reads = h.reads.load(Ordering::Relaxed);
+    let (_, report) = h.land().await;
+    assert_eq!(report.merged, 32, "{report:?}");
+    let reads = h.reads.load(Ordering::Relaxed) - reads;
+    assert!(
+        reads <= 32 + 8,
+        "landing 32 queued changes read the blob store {reads} times"
+    );
+}
+
+/// How fast the worker drains a backlog of `PROFILE_N` queued changes
+/// (default 1000) in batches of `PROFILE_BATCH` (default 64), over the
+/// slow blob store, with stage times (exploration; run with `--ignored
+/// --nocapture`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn profile_a_large_batch() {
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (n, batch) = (env("PROFILE_N", 1000), env("PROFILE_BATCH", 64));
+    let mut h = Harness::start(10_000).await;
+    h.queue = MergeQueue::new(
+        h.svc.clone(),
+        QueueConfig {
+            batch,
+            ..QueueConfig::default()
+        },
+    );
+    h.time_batch(vec!["warm".into()]).await;
+    enqueue_many(&h, n).await;
+    let before = metrics(&h.url);
+    let (took, report) = h.land().await;
+    let after = metrics(&h.url);
+    eprintln!(
+        "{n} changes in batches of {batch}: {took:?}, {:.0} merged/s, {report:?}",
+        report.merged as f64 / took.as_secs_f64()
+    );
+    for (k, v) in &after {
+        if k.starts_with("aspen_queue_stage") || k.starts_with("aspen_push_stage") {
+            eprintln!(
+                "{k} {:.1} ms",
+                1e3 * (v - before.get(k).copied().unwrap_or(0.0))
+            );
+        }
+    }
+}
+
+/// Enqueues `n` changes, each a new file on trunk's tip, with one push.
+async fn enqueue_many(h: &Harness, n: usize) {
+    let (dir, home, url) = (h.clients().join("many"), h.home.clone(), h.url.clone());
+    blocking(move || {
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&home, &dir, &["init", "-q", "--bare"]);
+        git(&home, &dir, &["fetch", "-q", &url, "main:main"]);
+        let mut stream = String::new();
+        for i in 0..n {
+            let data = format!("change {i}\n");
+            stream.push_str(&format!(
+                "commit refs/heads/e{i}\ncommitter B <b@x> 1800000000 +0000\ndata 2\nc\nfrom main\nM 100644 inline many/f{i}.txt\ndata {}\n{data}\n",
+                data.len()
+            ));
+        }
+        let mut cmd = isolated_git(&home);
+        cmd.current_dir(&dir)
+            .args(["fast-import", "--quiet"])
+            .stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(stream.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+        git(&home, &dir, &["push", "-q", &url, "refs/heads/e*:refs/queue/main/e*"]);
+    })
+    .await;
+}
+
+fn metrics(url: &str) -> std::collections::BTreeMap<String, f64> {
+    let base = url.trim_end_matches("/demo.git");
+    let out = std::process::Command::new("curl")
+        .args(["-s", &format!("{base}/-/metrics")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            l.rsplit_once(' ')
+                .and_then(|(k, v)| Some((k.to_owned(), v.parse().ok()?)))
+        })
+        .collect()
 }

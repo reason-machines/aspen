@@ -564,6 +564,16 @@ where
         &self.meta
     }
 
+    /// The blob store (the merge queue reads queued packs whole).
+    pub(crate) fn blobs(&self) -> &B {
+        &self.blobs
+    }
+
+    /// The largest object any step inflates.
+    pub(crate) fn max_object_bytes(&self) -> u64 {
+        self.config.max_object_bytes.get()
+    }
+
     /// Whether `a` is an ancestor of (or equal to) `b`, answered exactly
     /// from `commit_index` and the packs of `versions`' closures (which
     /// must reach both commits), the way a push's commit check answers it.

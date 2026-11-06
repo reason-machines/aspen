@@ -96,6 +96,7 @@ that the dashboard and alert rules use only these names.
 | `aspen_queue_wait_seconds_total` | counter | Seconds from enqueue to the outcome landing, summed over entries; divide by merged + rejected for the mean wait |
 | `aspen_queue_ancestry_commits_total` | counter | Commits the merge queue's ancestry walks expanded: base searches that trunk's recent first-parent chain (kept per repository by each worker) did not answer, each a commit-index or pack read. Near zero in steady state; a steady rate means entries based on commits off trunk's first-parent line, or a trunk moved by direct pushes |
 | `aspen_queue_outcomes_expired_total` | counter | Merge-queue outcome refs deleted after `ASPEN_MERGE_QUEUE_OUTCOME_TTL_SECS` |
+| `aspen_queue_stage_seconds_total{stage}` | counter | Time the merge queue spent building and landing batches, by stage: `list` (pending entries and trunk), `trunk` (trunk's closure, chain and tree), `prepare` (entries' packs, commits, bases, changes), `trunk_trees`, `place` (conflicts, new trees and commits), `outcomes`, `pack`, `push` (the atomic in-process push). Divide by `aspen_queue_batches_total` for a batch's cost |
 | `aspen_push_prefetch_slots_in_use` | gauge | Slots held now |
 | `aspen_push_prefetch_slots_peak` | gauge | Most slots held at once since the process started |
 | `aspen_push_prefetch_slots_acquired_total` | counter | Slots granted |
