@@ -54,6 +54,12 @@ export interface BranchOverlay {
 export interface CanvasSnapshot {
   /** Sequence number of the last event this snapshot includes. */
   seq: number;
+  /**
+   * The server instance whose event feed `seq` counts. Pass it to `GET
+   * /events` with `after`: a cursor from another instance's feed gets a
+   * `resync`.
+   */
+  instance?: string;
   /** Every push with `seq <= mergedThroughSeq` is part of main. */
   mergedThroughSeq: number;
   mainCommit: string;
@@ -195,6 +201,8 @@ export interface SwarmEvent {
 export interface ResyncEvent {
   type: 'resync';
   seq: number;
+  /** The instance whose feed `seq` counts. */
+  instance?: string;
   at: string;
 }
 

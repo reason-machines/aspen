@@ -113,6 +113,11 @@ fn config() -> Result<PlaceConfig, String> {
         var("PLACE_CLONE_URL").unwrap_or_else(|| format!("https://place.{domain}/canvas.git")),
     );
     c.mirror_url = var("PLACE_MIRROR_URL");
+    // Above any earlier task's feed (PlaceConfig::first_seq): a backstop for
+    // clients that send no `instance` with their cursor.
+    c.first_seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     c.dashboard_url = match var("PLACE_DASHBOARD_URL").as_deref() {
         Some("none") => None,
         Some(u) => Some(u.to_owned()),

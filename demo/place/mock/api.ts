@@ -166,7 +166,7 @@ export function createMockApi(options: Partial<MockOptions> & { clock?: boolean;
     });
     res.write('retry: 2000\n\n');
     const write = (e: PlaceEvent) => res.write(formatEvent(e));
-    const sub = sim.subscribe(after, write);
+    const sub = sim.subscribe(after, write, url.searchParams.get('instance'));
     if (sub.ok) for (const e of sub.backlog) write(e);
     else write(sub.resync);
     streams.add(res);

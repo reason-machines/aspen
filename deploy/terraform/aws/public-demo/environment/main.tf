@@ -96,6 +96,10 @@ locals {
     }
   }
 
+  # Aspen's task count, here so place.tf's quota check sums the same number
+  # the module runs.
+  aspen_desired_count = 1
+
   place_cpu                = coalesce(var.place_cpu, local.sizing[var.environment].place_cpu)
   place_memory             = coalesce(var.place_memory, local.sizing[var.environment].place_memory)
   place_db_max_connections = coalesce(var.place_db_max_connections, local.sizing[var.environment].place_db_max_connections)
@@ -153,6 +157,7 @@ module "aspen" {
   container_image       = var.aspen_image
   ecr_repository_arns   = var.ecr_repository_arns
   container_cpu         = var.aspen_cpu
+  desired_count         = local.aspen_desired_count
   container_memory      = var.aspen_memory
   container_environment = local.aspen_environment
   fargate_spot          = var.fargate_spot

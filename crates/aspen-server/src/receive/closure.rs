@@ -51,6 +51,15 @@
 //! `the_sweep_never_deletes_a_referenced_pack` in aspen-meta's store
 //! suite). So the difference costs packs, never objects.
 //!
+//! **A pack a `rewrite_pack` job replaced** (reason-machines/aspen#10). The
+//! one change of a committed pack ID: the job moves every version, cover
+//! and shallow recording naming a pack that broke base-first to its
+//! base-first rewrite, a new pack with the same objects. This cache may
+//! keep the old ID for the life of the process, so a push may search the
+//! old pack. That stays correct: the job's own `jobs` row keeps naming the
+//! old pack, so the sweep never deletes it, and base lookups resolve
+//! objects by ID, which a forward base does not affect.
+//!
 //! **Cost.** With compaction keeping up, a push reads the version it builds
 //! on and the covers (with their pack rows) of the blocks that became
 //! complete since it last looked, and nothing else; its search set holds at

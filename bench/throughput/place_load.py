@@ -34,6 +34,7 @@ class Config:
     run: str = "aspen-load"
     max_inflight: int = 128
     max_lag_seconds: float = 1
+    use_env_proxy: bool = False
 
     def validate(self):
         if not 0 <= self.worker < self.workers <= 128:
@@ -114,6 +115,8 @@ def refusal_reason(status, data):
     if not isinstance(message, str):
         message = ""
     reason = "http_" + str(status)
+    if status in (429, 503) and isinstance(data, dict) and data.get("_retry_after") is False:
+        reason += ":no_retry_after"
     if status == 429:
         if "place is at its limit" in message:
             return reason + ":global_ceiling"
@@ -132,12 +135,17 @@ async def post_json(http, url, body, token=None):
             raw = await response.content.readexactly(65537)
         except asyncio.IncompleteReadError as error:
             raw = error.partial
-        if len(raw) > 65536:
-            return response.status, None
-        try:
-            return response.status, json.loads(raw)
-        except (ValueError, UnicodeError):
-            return response.status, None
+        data = None
+        if len(raw) <= 65536:
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeError):
+                data = None
+        if response.status in (429, 503):
+            # Refusals above the ceiling must say when to retry; record whether this one did.
+            data = data if isinstance(data, dict) else {}
+            data["_retry_after"] = response.headers.get("Retry-After") is not None
+        return response.status, data
 
 
 class Runner:
@@ -273,6 +281,7 @@ def parse_args(argv=None):
                                 ("max-lag-seconds", float, 1)):
         parser.add_argument("--" + name, type=kind, default=os.getenv("ASPEN_LOAD_" + name.upper().replace("-", "_"), default))
     parser.add_argument("--execute", action="store_true", help="send traffic; never enabled from the environment")
+    parser.add_argument("--use-env-proxy", action="store_true", help="honour HTTPS_PROXY (sandboxed control hosts)")
     parser.add_argument("--acknowledge-persona-impact", action="store_true",
                         help="acknowledge that execution above 500 total offers/s may pause personas; not authorization")
     args = parser.parse_args(argv)
@@ -289,7 +298,7 @@ async def execute(config):
 
     timeout = aiohttp.ClientTimeout(total=config.request_timeout, connect=min(5, config.request_timeout), ceil_threshold=1000)
     connector = aiohttp.TCPConnector(limit=config.max_inflight)
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=False) as http:
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=config.use_env_proxy) as http:
         return await Runner(config, http).run()
 
 

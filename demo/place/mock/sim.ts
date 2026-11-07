@@ -130,6 +130,8 @@ export class PlaceSim {
   private mainCommit: string;
   private seq = 0;
   private mergedThroughSeq = 0;
+  /** This mock server's feed (`CanvasSnapshot.instance`). */
+  readonly instance = Math.random().toString(16).slice(2, 10);
   private readonly pending: PendingPush[] = [];
   private readonly branches = new Map<string, BranchState>();
   private readonly sessions = new Map<string, SessionState>();
@@ -273,6 +275,7 @@ export class PlaceSim {
     for (const v of this.main) pixels += v === UNSET ? '.' : v.toString(36);
     return {
       seq: this.seq,
+      instance: this.instance,
       mergedThroughSeq: this.mergedThroughSeq,
       mainCommit: this.mainCommit,
       width: this.opts.width,
@@ -507,16 +510,21 @@ export class PlaceSim {
 
   /**
    * Subscribes to events after `after`. Returns the missed events to send
-   * first, or a resync event when they are no longer in the backlog.
+   * first, or a resync event when they are no longer in the backlog or
+   * `instance` names another server's feed.
    */
-  subscribe(after: number | null, listener: (e: PlaceEvent) => void): Subscription {
+  subscribe(after: number | null, listener: (e: PlaceEvent) => void, instance: string | null = null): Subscription {
     this.listeners.add(listener);
     const unsubscribe = () => this.listeners.delete(listener);
+    const resync = (): Subscription => ({
+      ok: false,
+      resync: { type: 'resync', seq: this.seq, instance: this.instance, at: iso(this.opts.now()) },
+      unsubscribe,
+    });
+    if (after !== null && instance !== null && instance !== this.instance) return resync();
     if (after === null || after >= this.seq) return { ok: true, backlog: [], unsubscribe };
     const oldest = this.log.length > 0 ? this.log[0].seq : this.seq + 1;
-    if (after < oldest - 1) {
-      return { ok: false, resync: { type: 'resync', seq: this.seq, at: iso(this.opts.now()) }, unsubscribe };
-    }
+    if (after < oldest - 1) return resync();
     return { ok: true, backlog: this.log.filter((e) => e.seq > after), unsubscribe };
   }
 

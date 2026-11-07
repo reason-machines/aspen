@@ -222,6 +222,11 @@ pub struct Branch {
     /// Every tile of `head`'s tree, when the server wrote `head` itself
     /// (it builds the next commit on it without reading Git).
     pub full: Option<Arc<Vec<u8>>>,
+    /// Found in the store at start, not pushed through this instance: it
+    /// is not expired before this time (ms), since another instance (the
+    /// old task of a start-first deploy) may still hold its pending tiles
+    /// and paint on it. 0 for every branch this instance wrote.
+    pub listed_until_ms: u64,
 }
 
 /// A push the merger bot has not folded into `main` yet.
@@ -330,6 +335,10 @@ pub struct State {
     pub swarm: Swarm,
     /// Its limits.
     pub swarm_limits: SwarmLimits,
+    /// This instance's feed: random per process, in the snapshot. A client
+    /// that subscribes naming another instance's feed gets a `resync`
+    /// ([`Self::subscribe`]), since its `seq` means nothing here.
+    pub instance: String,
     log: VecDeque<Arc<Event>>,
     backlog: usize,
     tx: broadcast::Sender<Arc<Event>>,
@@ -375,10 +384,21 @@ impl State {
             kill: KillSwitch::default(),
             swarm: Swarm::default(),
             swarm_limits,
+            instance: String::new(),
             log: VecDeque::new(),
             backlog,
             tx,
         }
+    }
+
+    /// Starts this instance's event numbers after `first` (a fresh state
+    /// starts at 0). Two instances side by side (a start-first deploy)
+    /// usually number their feeds from different points; a client that
+    /// names the `instance` its cursor came from is resynced on a mismatch
+    /// regardless ([`Self::subscribe`]).
+    pub fn start_seq_at(&mut self, first: u64) {
+        self.seq = first;
+        self.merged_through = first;
     }
 
     fn emit(&mut self, kind: &'static str, now: u64, body: impl FnOnce(u64) -> Value) -> u64 {
@@ -401,18 +421,27 @@ impl State {
         seq
     }
 
-    /// A subscriber for events after `after` (`None`: from the live edge).
-    pub fn subscribe(&self, after: Option<u64>, now: u64) -> Subscription {
+    /// A subscriber for events after `after` (`None`: from the live edge)
+    /// of the feed `instance` names (`None`: a client that does not say;
+    /// its `after` is taken as this feed's).
+    pub fn subscribe(&self, after: Option<u64>, instance: Option<&str>, now: u64) -> Subscription {
         let rx = self.tx.subscribe();
         let Some(after) = after else {
             return Subscription::Backlog(Vec::new(), rx);
         };
         let oldest = self.log.front().map_or(self.seq + 1, |e| e.seq);
-        if after > self.seq || after + 1 < oldest {
+        let foreign = instance.is_some_and(|i| i != self.instance);
+        if foreign || after > self.seq || after + 1 < oldest {
             let event = Arc::new(Event {
                 seq: self.seq,
                 kind: "resync",
-                json: json!({ "type": "resync", "seq": self.seq, "at": iso(now) }).to_string(),
+                json: json!({
+                    "type": "resync",
+                    "seq": self.seq,
+                    "instance": self.instance,
+                    "at": iso(now),
+                })
+                .to_string(),
             });
             return Subscription::Resync(event, rx);
         }
@@ -443,10 +472,12 @@ impl State {
                 updated_ms: now,
                 deleted: false,
                 full: None,
+                listed_until_ms: 0,
             });
         b.actor = actor.clone();
         b.head = head;
         b.updated_ms = now;
+        b.listed_until_ms = 0;
         b.deleted = false;
         b.full = full;
         for t in &tiles {
@@ -476,18 +507,32 @@ impl State {
     }
 
     /// The next merge: every pending push replayed onto `main`'s tiles in
-    /// sequence order (the higher sequence number wins a tile). `None`
-    /// when nothing is pending.
-    pub fn plan_merge(&self) -> Option<MergePlan> {
+    /// sequence order (the higher sequence number wins a tile), except an
+    /// ambient agent's (`agent/`) tile over one people painted in the last
+    /// [`HUMAN_MEMORY_MS`] as of `now`, which is dropped: agents never paint
+    /// over people, and during a start-first deploy a person's tile can
+    /// reach this instance (merged by the other one, [`crate::place::Place::follow_main`])
+    /// after an agent's push to it is already pending here. `None` when
+    /// nothing is pending.
+    pub fn plan_merge(&self, now: u64) -> Option<MergePlan> {
         let last = self.pending.last()?;
         let mut pixels = (*self.main.pixels).clone();
         let mut branches = Vec::new();
         let (mut people, mut sprites) = (BTreeSet::new(), BTreeSet::new());
+        let fresh_people = |i: usize| {
+            self.human_tiles
+                .get(&i)
+                .is_some_and(|at| at.saturating_add(HUMAN_MEMORY_MS) > now)
+        };
         for p in &self.pending {
+            let agent = p.branch.starts_with("agent/");
             for t in &p.tiles {
                 let i = self.rules.index(t.x, t.y);
+                if agent && fresh_people(i) {
+                    continue;
+                }
                 pixels[i] = t.color;
-                if p.branch.starts_with("agent/") {
+                if agent {
                     sprites.insert(i);
                 } else if !p.branch.starts_with("swarm/") {
                     people.insert(i);
@@ -541,6 +586,43 @@ impl State {
                 "branches": plan.branches,
             })
         })
+    }
+
+    /// `main` was reloaded at `commit` with `pixels` after another writer
+    /// moved it (the other instance of a start-first deploy, an operator):
+    /// emits a `merge` event with every tile whose color changed, so
+    /// subscribers' canvases follow. Nothing pending here merged, so
+    /// `throughSeq` stays. Returns the event's `seq`, or `None` when no
+    /// tile changed.
+    pub fn follow(&mut self, commit: ObjectId, before: &[u8], now: u64) -> Option<u64> {
+        let w = self.rules.width as usize;
+        let changed: Vec<Tile> = self
+            .main
+            .pixels
+            .iter()
+            .zip(before)
+            .enumerate()
+            .filter(|(_, (new, old))| new != old)
+            .map(|(i, (&color, _))| Tile {
+                x: (i % w) as u32,
+                y: (i / w) as u32,
+                color,
+            })
+            .collect();
+        if changed.is_empty() {
+            return None;
+        }
+        let through = self.merged_through;
+        let rules = self.rules.clone();
+        let palette = &rules.palette;
+        Some(self.emit("merge", now, |_| {
+            json!({
+                "commit": commit.to_string(),
+                "throughSeq": through,
+                "tiles": tiles_json(&changed, palette),
+                "branches": Vec::<String>::new(),
+            })
+        }))
     }
 
     /// Records `people`'s and `sprites`' tiles as painted at `at` (ms),
@@ -611,6 +693,14 @@ impl State {
             .collect()
     }
 
+    /// Drops `branch`'s cached full canvas, so the next server paint on it
+    /// reads its tip from the store (after a push on it was refused).
+    pub fn forget_full(&mut self, branch: &str) {
+        if let Some(b) = self.branches.get_mut(branch) {
+            b.full = None;
+        }
+    }
+
     /// `branch` was deleted in Git. It leaves the page now if all its
     /// tiles merged, otherwise once they have.
     pub fn branch_deleted(&mut self, branch: &str, now: u64) {
@@ -649,7 +739,9 @@ impl State {
                 } else {
                     ttl_ms
                 };
-                b.overlay.is_empty() && (b.deleted || b.updated_ms + ttl <= now)
+                b.overlay.is_empty()
+                    && b.listed_until_ms <= now
+                    && (b.deleted || b.updated_ms + ttl <= now)
             })
             .map(|(n, b)| (n.clone(), b.head, b.deleted))
             .collect()
@@ -677,6 +769,7 @@ impl State {
             .collect();
         json!({
             "seq": self.seq,
+            "instance": self.instance,
             "mergedThroughSeq": self.merged_through,
             "mainCommit": self.main.commit.to_string(),
             "width": self.rules.width,
@@ -922,7 +1015,7 @@ mod tests {
         let names =
             |v: Vec<(String, ObjectId, bool)>| v.into_iter().map(|e| e.0).collect::<Vec<_>>();
         assert!(s.expirable(600_000, 1_000).is_empty(), "nothing merged yet");
-        let plan = s.plan_merge().unwrap();
+        let plan = s.plan_merge(0).unwrap();
         s.apply_merge(ObjectId::from_bytes([9; 20]), plan, 1_000);
         assert_eq!(names(s.expirable(600_000, 1_000)), ["agent/wren-12"]);
         assert_eq!(
@@ -952,7 +1045,7 @@ mod tests {
             2,
         );
         assert!(a < b);
-        let plan = s.plan_merge().unwrap();
+        let plan = s.plan_merge(0).unwrap();
         assert_eq!(plan.through, b);
         // The higher sequence number wins tile 1.
         assert_eq!(&plan.pixels[..2], &[5, 7]);
@@ -990,16 +1083,22 @@ mod tests {
             );
         }
         // Backlog keeps the last 3 (seq 3..=5).
-        match s.subscribe(Some(2), 9) {
+        match s.subscribe(Some(2), None, 9) {
             Subscription::Backlog(b, _) => {
                 assert_eq!(b.iter().map(|e| e.seq).collect::<Vec<_>>(), [3, 4, 5]);
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(s.subscribe(Some(1), 9), Subscription::Resync(..)));
+        assert!(matches!(
+            s.subscribe(Some(1), None, 9),
+            Subscription::Resync(..)
+        ));
         // A seq from the future (a client of an earlier server run).
-        assert!(matches!(s.subscribe(Some(6), 9), Subscription::Resync(..)));
-        match s.subscribe(Some(5), 9) {
+        assert!(matches!(
+            s.subscribe(Some(6), None, 9),
+            Subscription::Resync(..)
+        ));
+        match s.subscribe(Some(5), None, 9) {
             Subscription::Backlog(b, mut rx) => {
                 assert!(b.is_empty());
                 s.record_push(
@@ -1014,6 +1113,100 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A cursor from another instance's feed is never read as this one's,
+    /// even when its number falls inside this feed's backlog.
+    #[test]
+    fn a_cursor_naming_another_instance_is_told_to_resync() {
+        let mut s = state();
+        s.instance = "new".into();
+        for i in 0..3u8 {
+            s.record_push(
+                "a",
+                Actor::git("a"),
+                ObjectId::from_bytes([i; 20]),
+                vec![tile(0, 1)],
+                None,
+                1,
+            );
+        }
+        match s.subscribe(Some(2), Some("old"), 9) {
+            Subscription::Resync(e, _) => {
+                let v: Value = serde_json::from_str(&e.json).unwrap();
+                assert_eq!(v["instance"], "new");
+                assert_eq!(v["seq"], 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            s.subscribe(Some(2), Some("new"), 9),
+            Subscription::Backlog(b, _) if b.len() == 1
+        ));
+        assert_eq!(s.snapshot(0)["instance"], "new");
+    }
+
+    /// An agent's pending tile over a person's fresh one is dropped from the
+    /// merge; a person's or a swarm agent's is not, and a stale person's
+    /// tile no longer protects.
+    #[test]
+    fn merges_drop_agent_tiles_over_fresh_people_tiles() {
+        let mut s = state();
+        let now = HUMAN_MEMORY_MS * 2;
+        s.remember(&[0, 1], &[], now - 1);
+        s.remember(&[2], &[], now - HUMAN_MEMORY_MS);
+        let id = ObjectId::from_bytes([2; 20]);
+        s.record_push(
+            "agent/a-1",
+            Actor::agent("a"),
+            id,
+            vec![tile(0, 3), tile(2, 3), tile(3, 3)],
+            None,
+            now,
+        );
+        s.record_push(
+            "swarm/b",
+            Actor::agent("b"),
+            id,
+            vec![tile(1, 4)],
+            None,
+            now,
+        );
+        let plan = s.plan_merge(now).unwrap();
+        assert_eq!(plan.pixels[0], UNSET, "the person's tile stays");
+        assert_eq!(plan.pixels[1], 4, "swarm agents are not ambient agents");
+        assert_eq!(plan.pixels[2], 3, "a stale person's tile does not protect");
+        assert_eq!(plan.pixels[3], 3);
+        assert_eq!(plan.sprites, [2, 3]);
+        assert!(plan.changed.iter().all(|t| t.x != 0));
+    }
+
+    /// Following a `main` another writer moved emits one `merge` event
+    /// with the tiles that changed, and none when no tile did.
+    #[test]
+    fn following_main_emits_the_changed_tiles() {
+        let mut s = state();
+        s.start_seq_at(10);
+        let mut rx = match s.subscribe(Some(10), None, 0) {
+            Subscription::Backlog(_, rx) => rx,
+            other => panic!("{other:?}"),
+        };
+        let before = (*s.main.pixels).clone();
+        let mut pixels = before.clone();
+        pixels[5] = 2;
+        let commit = ObjectId::from_bytes([3; 20]);
+        s.main.commit = commit;
+        s.main.pixels = Arc::new(pixels);
+        assert_eq!(s.follow(commit, &before, 1), Some(11));
+        let e = rx.try_recv().unwrap();
+        assert_eq!(e.kind, "merge");
+        let v: Value = serde_json::from_str(&e.json).unwrap();
+        assert_eq!(v["throughSeq"], 10);
+        assert_eq!(v["tiles"].as_array().unwrap().len(), 1);
+        assert_eq!(v["tiles"][0]["x"], 1);
+        assert_eq!(v["tiles"][0]["y"], 1);
+        let same = (*s.main.pixels).clone();
+        assert_eq!(s.follow(commit, &same, 2), None);
     }
 
     #[test]

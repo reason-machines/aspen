@@ -17,7 +17,15 @@
 # 3. a MIRROR_START_RETRY that is not a positive number of seconds is
 #    reported and replaced by 5, and the wait still ends once place answers;
 # 4. a place that accepts the request and never answers (here a `git` that
-#    sleeps) cannot hold the wait: each ask is cut off after 10 seconds.
+#    sleeps) cannot hold the wait: each ask is cut off after 10 seconds;
+# 5. when another place task's mirror pushed an earlier main of place's
+#    (two tasks overlap during a start-first deploy), the lease is taken
+#    over and place's main is mirrored on the next run, not left refused
+#    until a restart; a main that is not place's stays untouched;
+# 6. the same after place starts main's history again (a root commit
+#    naming the main it replaced): a main another task's mirror pushed from
+#    before the reset is still place's, and place's new main is mirrored
+#    over it; a main from someone else's root is still left alone.
 #
 # Needs git, pkill and timeout.
 set -eu
@@ -148,3 +156,101 @@ start_sidecar stalled 3 "$dir/stalled-place.git" 1 "$dir/stalled-place.git"
 wait_for 25 grep -Eqs "canvas-mirror: place still does not answer at $dir/stalled-place.git after [0-9]+s" "$dir/stalled.log" ||
   fail "a stalled place held the wait past its interval"
 echo "ok: a stalled place cannot hold the wait"
+
+# 5. Another task's mirror pushes over this sidecar's lease; the interval is
+#    2 seconds.
+start_sidecar overlap 2 "$dir/overlap-place.git"
+make_place "$dir/overlap-place.git"
+work="$dir/work-overlap-place.git"
+# commit <text>: a commit on the work tree's main, not pushed anywhere yet.
+commit() {
+  (
+    cd "$work"
+    printf '%s\n' "$1" > tile
+    "$real_git" -c user.name=place -c user.email=place@example.com commit --quiet -am "$1"
+  )
+  "$real_git" -C "$work" rev-parse HEAD
+}
+# to_place <commit>: moves place's main there.
+to_place() {
+  "$real_git" -C "$work" push --quiet "$dir/overlap-place.git" "$1:refs/heads/main"
+}
+first=$("$real_git" --git-dir="$dir/overlap-place.git" rev-parse refs/heads/main)
+wait_for 20 grep -qs "canvas-mirror: pushed main $first" "$dir/overlap.log" ||
+  fail "the first main was not mirrored"
+# The other task's mirror pushes a main of place's this sidecar never
+# fetched (it goes to GitHub only), then place's main moves past it: this
+# sidecar's next run finds GitHub's main is not its lease, whatever the
+# timing.
+other=$(commit other)
+"$real_git" -C "$work" push --quiet --force "$dir/overlap-github.git" "$other:refs/heads/main"
+last=$(commit last)
+to_place "$last"
+wait_for 20 grep -qs "canvas-mirror: pushed main $last" "$dir/overlap.log" ||
+  fail "after another mirror pushed an earlier main of place's, place's main was not mirrored"
+[ "$(github_main "$dir/overlap-github.git")" = "$last" ] || fail "GitHub's main is not place's latest main"
+grep -qs "is an earlier main of place's" "$dir/overlap.log" || fail "taking over the lease was not logged"
+# A main that is not place's (someone else's root commit) is never pushed over.
+foreign="$dir/work-foreign"
+"$real_git" init --quiet "$foreign"
+(
+  cd "$foreign"
+  printf 'foreign\n' > tile
+  "$real_git" add tile
+  "$real_git" -c user.name=x -c user.email=x@example.com commit --quiet -m foreign
+  "$real_git" push --quiet --force "$dir/overlap-github.git" HEAD:refs/heads/main
+)
+theirs=$(github_main "$dir/overlap-github.git")
+after=$(commit after)
+to_place "$after"
+wait_for 20 grep -qs "push of $after to example/place-canvas failed" "$dir/overlap.log" ||
+  fail "the push over a foreign main was not refused"
+sleep 3
+[ "$(github_main "$dir/overlap-github.git")" = "$theirs" ] || fail "a foreign main was pushed over"
+echo "ok: a lease another place task's mirror moved is taken over; a foreign main is not"
+
+# 6. Another task's mirror pushes B from place's history, then place
+#    starts its history again from root C ("Start the canvas again from
+#    main at B"); the interval is 2 seconds.
+start_sidecar reset 2 "$dir/reset-place.git"
+make_place "$dir/reset-place.git"
+work="$dir/work-reset-place.git"
+place="$dir/reset-place.git"
+a=$("$real_git" --git-dir="$place" rev-parse refs/heads/main)
+wait_for 20 grep -qs "canvas-mirror: pushed main $a" "$dir/reset.log" ||
+  fail "the first main was not mirrored before the reset"
+# B: place's next main, which only the other mirror pushes to GitHub
+# before place starts again past it. Place keeps B (the earlier history
+# stays in its repository); a ref stands in for that here.
+b=$(commit b)
+"$real_git" -C "$work" push --quiet "$place" "$b:refs/history/b"
+"$real_git" -C "$work" push --quiet --force "$dir/reset-github.git" "$b:refs/heads/main"
+# C: a root commit with B's canvas, as place writes at a reset.
+c=$(
+  cd "$work"
+  tree=$("$real_git" rev-parse "$b^{tree}")
+  printf 'Start the canvas again from main at %s\n\nThe canvas is unchanged.\n' "$b" |
+    "$real_git" -c user.name=place -c user.email=place@example.com commit-tree "$tree"
+)
+"$real_git" -C "$work" push --quiet --force "$place" "$c:refs/heads/main"
+wait_for 20 grep -qs "canvas-mirror: pushed main $c" "$dir/reset.log" ||
+  fail "after a history reset over another mirror's main, place's main was not mirrored"
+[ "$(github_main "$dir/reset-github.git")" = "$c" ] || fail "GitHub's main is not place's main after the reset"
+# A foreign root is still left alone, even when place has reset since.
+f=$(
+  cd "$work"
+  printf 'Start the canvas again from main at nothing\n' |
+    "$real_git" -c user.name=x -c user.email=x@example.com commit-tree "$("$real_git" rev-parse "$c^{tree}")"
+)
+"$real_git" -C "$work" push --quiet --force "$dir/reset-github.git" "$f:refs/heads/main"
+d=$(
+  cd "$work"
+  printf 'Start the canvas again from main at %s\n' "$c" |
+    "$real_git" -c user.name=place -c user.email=place@example.com commit-tree "$("$real_git" rev-parse "$c^{tree}")"
+)
+"$real_git" -C "$work" push --quiet --force "$place" "$d:refs/heads/main"
+wait_for 20 grep -qs "push of $d to example/place-canvas failed" "$dir/reset.log" ||
+  fail "the push over a foreign main after a reset was not refused"
+sleep 3
+[ "$(github_main "$dir/reset-github.git")" = "$f" ] || fail "a foreign main was pushed over after a reset"
+echo "ok: a lease moved before a history reset is taken over; a foreign main is not"

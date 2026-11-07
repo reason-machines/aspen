@@ -3,7 +3,7 @@
  * event stream, error mapping, quotas, the swarm and its kill switch.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ApiError } from '../src/client/api.ts';
+import { ApiError, createPlaceClient } from '../src/client/api.ts';
 import { CanvasStore } from '../src/client/store.ts';
 import type { PlaceEvent } from '../src/shared/contract.ts';
 import { type Harness, startMock, waitFor } from './helpers.ts';
@@ -179,9 +179,17 @@ describe('place client against the mock', () => {
     for (let i = 0; i < 6; i++)
       h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: i, y: 0, color: red }]);
     let resyncs = 0;
+    let streams = 0;
     const seen: PlaceEvent[] = [];
     const ctl = new AbortController();
-    const done = h.client.events({
+    const client = createPlaceClient({
+      baseUrl: h.baseUrl,
+      fetch: (input, init) => {
+        if (String(input).includes('/events')) streams++;
+        return fetch(input, init);
+      },
+    });
+    const done = client.events({
       after: 1,
       signal: ctl.signal,
       onEvent: (e) => seen.push(e),
@@ -191,9 +199,91 @@ describe('place client against the mock', () => {
       },
     });
     await waitFor(() => resyncs === 1, 3000, 'resync');
+    // Paint only once the second stream is open, or its event may land
+    // before that stream subscribes and be folded into the snapshot.
+    await waitFor(() => streams >= 2, 3000, 'second stream');
+    await new Promise((r) => setTimeout(r, 200));
     h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: 9, y: 0, color: red }]);
     await waitFor(() => seen.length === 1, 3000, 'live event after resync');
     expect(seen[0].seq).toBe(7);
+    ctl.abort();
+    await done;
+  });
+
+  it('resyncs a client whose cursor belongs to another server instance, then streams with the new one', async () => {
+    const s = await h.client.createSession();
+    h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: 0, y: 0, color: red }]);
+    const snap = await h.client.canvas();
+    expect(snap.instance).toBe(h.api.sim.instance);
+    const urls: string[] = [];
+    const fetchSpy: typeof fetch = (input, init) => {
+      urls.push(String(input));
+      return fetch(input, init);
+    };
+    const client = createPlaceClient({ baseUrl: h.baseUrl, fetch: fetchSpy });
+    let resyncs = 0;
+    const seen: PlaceEvent[] = [];
+    const ctl = new AbortController();
+    const done = client.events({
+      // A cursor inside this feed's range, from another instance's feed.
+      after: snap.seq - 1,
+      instance: 'another-task',
+      signal: ctl.signal,
+      onEvent: (e) => seen.push(e),
+      onResync: async () => {
+        resyncs++;
+        const c = await client.canvas();
+        return { seq: c.seq, instance: c.instance };
+      },
+    });
+    await waitFor(() => resyncs === 1, 3000, 'resync');
+    expect(seen).toEqual([]);
+    // Paint only once the second stream is open, or its event may land
+    // before that stream subscribes and be folded into the snapshot.
+    await waitFor(() => urls.filter((u) => u.includes('/events')).length >= 2, 3000, 'second stream');
+    await new Promise((r) => setTimeout(r, 200));
+    h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: 1, y: 0, color: red }]);
+    await waitFor(() => seen.length === 1, 3000, 'live event after resync');
+    expect(seen[0].seq).toBe(snap.seq + 1);
+    const streams = urls.filter((u) => u.includes('/events'));
+    expect(streams[0]).toContain('instance=another-task');
+    expect(streams[1]).toContain(`instance=${snap.instance}`);
+    ctl.abort();
+    await done;
+  });
+
+  it('a resync callback returning only a seq drops the stale instance instead of resyncing forever', async () => {
+    const s = await h.client.createSession();
+    h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: 0, y: 0, color: red }]);
+    const snap = await h.client.canvas();
+    const urls: string[] = [];
+    const fetchSpy: typeof fetch = (input, init) => {
+      urls.push(String(input));
+      return fetch(input, init);
+    };
+    const client = createPlaceClient({ baseUrl: h.baseUrl, fetch: fetchSpy });
+    let resyncs = 0;
+    const seen: PlaceEvent[] = [];
+    const ctl = new AbortController();
+    const done = client.events({
+      after: snap.seq - 1,
+      instance: 'old',
+      signal: ctl.signal,
+      onEvent: (e) => seen.push(e),
+      onResync: async () => {
+        resyncs++;
+        return (await client.canvas()).seq;
+      },
+    });
+    const streams = () => urls.filter((u) => u.includes('/events'));
+    await waitFor(() => streams().length >= 2, 3000, 'second stream');
+    await new Promise((r) => setTimeout(r, 200));
+    h.api.sim.recordPush(s.branch, { kind: 'agent', label: 'a' }, [{ x: 1, y: 0, color: red }]);
+    await waitFor(() => seen.length === 1, 3000, 'live event after resync');
+    expect(resyncs).toBe(1);
+    expect(streams()).toHaveLength(2);
+    expect(streams()[0]).toContain('instance=old');
+    expect(streams()[1]).not.toContain('instance=');
     ctl.abort();
     await done;
   });
