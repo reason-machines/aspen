@@ -730,7 +730,9 @@ fn stream_age(max: Duration) -> Duration {
 }
 
 /// `GET /events`: the backlog after `after` (or `Last-Event-ID`), then
-/// live events.
+/// live events. With `instance` (the snapshot's) naming another instance's
+/// feed, a `resync` instead: a client that moved to another task during a
+/// start-first deploy never reads its old cursor against this feed.
 ///
 /// Each stream holds a slot of `Place::event_streams` (capped per client
 /// address and in all; more get 429) until it ends, and ends between 90%
@@ -747,6 +749,14 @@ async fn events<M, B>(
         q.split('&')
             .filter_map(|kv| kv.split_once('='))
             .find(|(k, _)| *k == "after")
+            .map(|(_, v)| v.to_owned())
+    });
+    // The feed the client's `after` belongs to (`instance` from the
+    // snapshot): another instance's is answered with a `resync`.
+    let instance = request.uri().query().and_then(|q| {
+        q.split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == "instance")
             .map(|(_, v)| v.to_owned())
     });
     let header_after = headers
@@ -783,12 +793,11 @@ async fn events<M, B>(
         }
     };
     let ends = tokio::time::Instant::now() + stream_age(place.config.event_stream_max_age);
-    let sub = place
-        .shared
-        .state
-        .lock()
-        .expect("not poisoned")
-        .subscribe(after, now_ms());
+    let sub = place.shared.state.lock().expect("not poisoned").subscribe(
+        after,
+        instance.as_deref(),
+        now_ms(),
+    );
     let (first, rx, mut last) = match sub {
         Subscription::Backlog(events, rx) => {
             let last = events.last().map_or(after.unwrap_or(0), |e| e.seq);

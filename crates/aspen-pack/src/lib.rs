@@ -14,6 +14,7 @@
 //! | [`graph`] | Every object's references by `.idx` position, and the reachability walk behind the per-write split | push path step 2, B1 |
 //! | [`subset`] | Writes a pack holding a subset of a completed pack's entries (undeltifying deltas whose base is left out) plus extra full objects | push path, B1 per-write packs |
 //! | [`repack`] | Writes one pack from several stored packs: keep-first union (or a kept subset), base-first, delta depth capped by undeltifying | compaction, C1; shallow packs, C8 |
+//! | [`rewrite`] | Rewrites one stored pack base-first, for the `rewrite_pack` repair job, and verifies the result | fetch path step 4, S1 |
 //! | [`shallow`] | The object set of an exact shallow pack: the wants, the region's commits and everything their trees reach | fetch path step 5, C8 |
 //! | [`verify`] | Checks the three invariants on any pack file (ingest output, compaction output, stitched packs) | S1 item 6 |
 //! | [`idx`], [`entries`], [`header`] | `.idx` v2 parse and write, the entry-table header walk, entry header codecs | |
@@ -38,6 +39,7 @@ pub mod idx;
 pub mod ingest;
 pub mod locate;
 pub mod repack;
+pub mod rewrite;
 pub mod sampled;
 pub mod scan;
 pub mod shallow;

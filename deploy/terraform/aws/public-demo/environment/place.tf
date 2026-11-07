@@ -11,11 +11,16 @@
 # non-essential init container that creates the role and database
 # (create-database.sh) gets the master password.
 #
-# It keeps the canvas, the merge queue and the event feed in memory and
-# must run as exactly one instance, never two at once, also not during a
-# deploy (demo/place/server/README.md, "Limits of this version"). So the
-# service stops the old task before it starts the new one, and on SIGTERM
-# aspen-place runs its last merge before exiting.
+# It keeps the canvas, the merge queue and the event feed in memory, so it
+# runs as one task. A deploy starts the new task beside the old one and stops
+# the old one once the new one passes its health check, so the page stays up
+# (docs/PLAN.md decisions log, "place deploys start-first"). The two overlap
+# for about a minute, which aspen-place tolerates: every write to `main` and
+# to a branch is a compare-and-swap in the shared database, a merge or paint
+# that loses one reloads and tries again, and on SIGTERM the old task runs
+# its last merge (retried onto the new task's `main`) before exiting
+# (demo/place/server/README.md, "Limits of this version"). Each task's
+# sidecar mirrors only `main`s that grow from the one it last pushed.
 
 locals {
   place = var.place_image != null
@@ -445,15 +450,25 @@ resource "aws_lb_target_group" "place" {
   protocol    = "HTTP"
   port        = var.place_port
 
-  # Short: the old task must be gone before the new one starts, and every
-  # second here is a second the demo is down during a deploy.
+  # Short: a deploy stops the old task only after this, and its own drain
+  # (PLACE_SHUTDOWN_DRAIN_SECONDS) ends the long event streams anyway.
   deregistration_delay = 15
 
-  # Frequent, so a new task takes traffic soon after it listens: during a
-  # deploy there is no other place task, and the load balancer answers 503
-  # until this one passes a check. A running task is marked unhealthy only
-  # after 6 failed checks in a row, and with every registered target
-  # unhealthy the load balancer sends to them anyway.
+  # Each task numbers its own event feed (aspen-place's first_seq), so a
+  # browser whose snapshot and event stream reach different tasks while two
+  # overlap in a start-first deploy is told to resync, again and again. A
+  # short cookie keeps a browser on one task for the overlap; Git clients
+  # keep no cookie and need none (every write is a compare-and-swap).
+  stickiness {
+    type            = "lb_cookie"
+    enabled         = true
+    cookie_duration = 300
+  }
+
+  # Frequent, so a new task takes traffic soon after it listens and a
+  # deploy does not hold two 16 vCPU tasks longer than it must. A running
+  # task is marked unhealthy only after 6 failed checks in a row, and with
+  # every registered target unhealthy the load balancer sends to them anyway.
   health_check {
     path                = "/api/v1/config"
     matcher             = "200"
@@ -651,9 +666,13 @@ resource "aws_ecs_service" "place" {
     container_port   = var.place_port
   }
 
-  # Exactly one instance, never two: stop the old task, then start the new.
-  deployment_minimum_healthy_percent = 0
-  deployment_maximum_percent         = 100
+  # One task, started before the old one stops: a deploy keeps serving
+  # (stop-first gave about two minutes of 503s per deploy). The account's
+  # Fargate vCPU quota must hold two place tasks at once; the
+  # place_deploy_fits_fargate_quota check below warns when it does not, and
+  # then the new task cannot start and the deploy rolls back.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
   health_check_grace_period_seconds  = 60
   enable_execute_command             = true
   enable_ecs_managed_tags            = true
@@ -665,4 +684,36 @@ resource "aws_ecs_service" "place" {
   }
 
   depends_on = [aws_lb_listener_rule.place, aws_iam_role_policy.place_execution, aws_secretsmanager_secret_version.place_db_password]
+}
+
+# A deploy rolls each service over start-first (place here, Aspen in the
+# root module's compute.tf; this environment runs no compactor), and one
+# apply can roll both at once, so for about a minute every service runs twice its desired count.
+# Fargate refuses a task past the account's On-Demand vCPU quota
+# (L-3032A538, 30 by default in a new account); a new place task that cannot
+# start rolls the deploy back. This sum holds because the account runs only
+# this environment (docs/PLAN.md decisions log, "place deploys
+# start-first"); Spot tasks count against a separate quota and are left out.
+locals {
+  ondemand_vcpu_units = 2 * (
+    (var.place_running ? 1 : 0) * local.place_cpu +
+    (var.fargate_spot ? 0 : local.aspen_desired_count * var.aspen_cpu)
+  )
+}
+
+check "place_deploy_fits_fargate_quota" {
+  # Scoped here, so a plan whose role cannot read Service Quotas
+  # (servicequotas:GetServiceQuota) warns instead of failing.
+  data "aws_servicequotas_service_quota" "fargate_vcpu" {
+    service_code = "fargate"
+    quota_code   = "L-3032A538"
+  }
+
+  assert {
+    condition = !(local.place && var.place_running) || try(
+      data.aws_servicequotas_service_quota.fargate_vcpu.value * 1024 >= local.ondemand_vcpu_units,
+      false
+    )
+    error_message = "The account's Fargate On-Demand vCPU quota (L-3032A538) is below, or could not be read as, what a start-first deploy of every service at once needs: ${local.ondemand_vcpu_units / 1024} vCPU (twice each service's desired count). Request an increase in Service Quotas before deploying place, or the new task cannot start and the deploy rolls back."
+  }
 }

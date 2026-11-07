@@ -60,7 +60,7 @@ affect when refusals start. Existing visitors consume the same ceiling, while
 internal painters/merges have their own policies. Do not raise server limits to
 make the benchmark pass. Other API refusals and client-side loss stay visible.
 
-**Live load is postponed; the full 600 offers/s test has not been executed.**
+**Update 2026-11-07: the live test ran with personas on at the maintainers' request; see the item 10 result row in docs/PLAN.md. The paragraph below is the earlier rationale.**
 Personas must run uninterrupted for 20 hours and then remain running permanently.
 A sustained hold above approximately 500 offers/s risks persona backoff: once
 all external traffic exceeds the actual 550/s ceiling, it can drain the bucket
@@ -158,6 +158,14 @@ in uppercase with underscores. Examples are `ASPEN_LOAD_WORKER`,
 `--execute` and `--acknowledge-persona-impact` deliberately have no
 environment-variable equivalents.
 Use `python3 bench/throughput/place_load.py --help` for all options.
+
+## Stock-Git load, monitor and EC2 launcher (item 10)
+
+- `git_load.py`: the same open-loop schedule as `place_load.py`, each offer one `git push` of a new one-tile commit to the worker's own `paint/` lane branch (each lane at most 30 pushes a minute). It clones `--depth 1`, records `ng` reasons (the ceiling's `place is at its limit ... retry in 1 s`) and HTTP refusals without `Retry-After`, and checks each lane's last acknowledged commit at the end in two ways: the ref advertisement (`git ls-remote`) names it as the lane's tip (for a retired lane, the branch must still exist), and a fresh repository that fetches the lane branches two commits deep holds that commit and its tree. Earlier acknowledged commits on a lane are covered only as ancestors of it, not checked one by one. Either check failing sets `fatal: verification_failed` (exit 2) and fails `aggregate.py`'s `complete`. A push that timed out or failed in transport may have landed, so its lane takes no more offers (`lane_retired_outcome_unknown`); a definite refusal (an `ng`, `429` or `503`) keeps the lane, and the lane's index is reset to its tip after any push that did not become the tip. Same result shape; aggregate it separately (`--expected-workers` = git workers).
+- `monitor.py`: polls the page, `/api/v1/canvas` and `canvas.svg`, holds one `/api/v1/events` stream, and reports merge lag from the feed's own timestamps. A `resync` drops pushes still waiting for a merge and sets `merge_lag_seconds.complete` to false; the longest silence includes the time before the first and after the last event.
+- `launch_ec2.py`: starts the generator on EC2 and controls it through one private S3 bucket. See its docstring for the account checks and the `launch`, `go`, `watch`, `teardown` and `reap` commands. `tools/mutants.py` removes each review fix from a scratch copy of this directory and checks that a test fails (no network).
+- `results/item10-2026-11-07/`: the raw files behind the item 10 result.
+- `place_load.py` now reports a `429`/`503` without a `Retry-After` header as `...:no_retry_after`.
 
 ## Results and aggregation
 

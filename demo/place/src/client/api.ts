@@ -80,12 +80,19 @@ export type StreamState =
 export interface EventStreamOptions {
   /** Resume after this sequence number; null starts at the live edge. */
   after: number | null;
+  /**
+   * The feed `after` belongs to (the snapshot's `instance`). The server
+   * answers a cursor from another instance's feed with a `resync`, so a
+   * client that lands on another task during a deploy never reads its old
+   * `seq` against the new feed.
+   */
+  instance?: string | null;
   onEvent: (e: PlaceEvent) => void;
   /**
    * Called on a `resync` event. Reload the canvas snapshot and resolve with
    * its `seq`; the stream resumes after it.
    */
-  onResync: () => Promise<number>;
+  onResync: () => Promise<number | { seq: number; instance?: string | null }>;
   onState?: (s: StreamState) => void;
   signal: AbortSignal;
 }
@@ -151,13 +158,17 @@ export function createPlaceClient({
   async function events(opts: EventStreamOptions): Promise<void> {
     const { signal, onEvent, onResync, onState } = opts;
     let after = opts.after;
+    let instance = opts.instance ?? null;
     let attempt = 0;
     let serverRetry: number | null = null;
     while (!signal.aborted) {
       let resync = false;
       try {
         onState?.({ state: 'connecting' });
-        const query = after === null ? '' : `?after=${after}`;
+        const query =
+          after === null
+            ? ''
+            : `?after=${after}${instance === null ? '' : `&instance=${encodeURIComponent(instance)}`}`;
         const res = await fetchImpl(`${base}/events${query}`, { headers: { Accept: 'text/event-stream' }, signal });
         if (!res.ok || !res.body) {
           // A refused stream (429 when too many are open) says when to retry.
@@ -192,7 +203,16 @@ export function createPlaceClient({
           await reader.cancel().catch(() => {});
         }
         if (resync) {
-          after = await onResync();
+          const next = await onResync();
+          if (typeof next === 'number') {
+            // A bare seq names no instance: drop the old one, or every
+            // reconnect would carry it and be resynced again forever.
+            after = next;
+            instance = null;
+          } else {
+            after = next.seq;
+            instance = next.instance ?? null;
+          }
           continue;
         }
         throw new Error('Event stream ended');

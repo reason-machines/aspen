@@ -1,7 +1,8 @@
 //! Aspen's compactor (node C1): the cover skip list over each ref's version
-//! history, compaction packs, garbage collection of orphaned packs, and the
+//! history, compaction packs, garbage collection of orphaned packs, the
 //! `index_commits` job (commit index rows for large pushes; see
-//! [`Compactor::index_version`]).
+//! [`Compactor::index_version`]) and the `rewrite_pack` job (repairs a
+//! stored pack that is not base-first; see [`Compactor::rewrite_pack`]).
 //!
 //! Every push stores level-0 packs ([`aspen_core::pack`]). A fetch of many
 //! versions would send one pack per version, so the compactor lays
@@ -67,7 +68,8 @@
 //! [`Compactor::compact_through`] builds every cover of a ref up to a
 //! version, for repositories that predate the compactor. The same worker
 //! runs `index_commits` jobs, which a push enqueues for a write with more
-//! commits than it indexes itself.
+//! commits than it indexes itself, and `rewrite_pack` jobs, which the fetch
+//! path enqueues when a stored pack it stitches has a delta before its base.
 //!
 //! # Cost
 //!
@@ -83,6 +85,7 @@
 mod build;
 mod gc;
 mod index;
+mod rewrite;
 mod shallow;
 mod worker;
 
@@ -97,6 +100,7 @@ use aspen_pack::{LayoutError, MaxInflatedBytes, MaxObjectBytes};
 pub use build::{CompactReport, Compactor};
 pub use gc::{GcMetrics, GcReport};
 pub use index::IndexReport;
+pub use rewrite::{RewriteReport, RewriteSkipped};
 pub use shallow::{ShallowBuild, ShallowSpec};
 pub use worker::{JobOutcome, JobReport, Worker, WorkerOptions};
 

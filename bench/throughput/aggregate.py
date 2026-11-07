@@ -96,6 +96,34 @@ def percentiles(histogram):
     return values
 
 
+def verification_summary(records):
+    """Sum stock-git read-back checks; a worker whose check failed fails the run.
+
+    Advertised-tip checks (the ref advertisement names the acknowledged tip) and
+    fetched-object checks (a fresh fetch holds the commit and its tree) are kept
+    apart. Results from before the split carry `read_back_*` fields, which were
+    advertised-tip checks only.
+    """
+    summary = {"workers_checked": 0, "failed_workers": [],
+               "advertised": {"checked": 0, "tip_matches": 0}, "fetched": {"checked": 0, "commits_present": 0}}
+    for row in records:
+        check = row.get("verification")
+        if check is None and ("read_back_branches" in row or "read_back" in row):
+            ok = row.get("read_back") != "failed" and row.get("read_back_tip_matches") == row.get("read_back_branches")
+            check = {"status": "ok" if ok else "failed:advertised",
+                     "advertised": {"checked": row.get("read_back_branches", 0), "tip_matches": row.get("read_back_tip_matches", 0)}}
+        if check is None or check.get("status") == "not_run":
+            continue
+        summary["workers_checked"] += 1
+        if check.get("status") != "ok":
+            summary["failed_workers"].append(row["worker"])
+        for kind, fields in (("advertised", ("checked", "tip_matches")), ("fetched", ("checked", "commits_present"))):
+            for field in fields:
+                summary[kind][field] += check.get(kind, {}).get(field, 0)
+    summary["failed_workers"].sort()
+    return summary
+
+
 def merge(results, expected_workers=12):
     by_worker = {}
     for result in results:
@@ -124,6 +152,7 @@ def merge(results, expected_workers=12):
     merged = {}
     fatals = sorted(row["worker"] for row in records if row.get("fatal"))
     unfinished = sorted(row["worker"] for row in records if row.get("scheduling_finished") is False)
+    verification = verification_summary(records)
     for phase, seconds in (("ramp", ramp), ("hold", hold)):
         counts, skipped, failures, histogram = Counter(), Counter(), Counter(), Counter()
         for row in records:
@@ -157,7 +186,8 @@ def merge(results, expected_workers=12):
     return {"schema": "aspen-place-load-aggregate-v1", "run": records[0]["run"],
             "start": records[0]["start"], "workers": sorted(by_worker), "missing_workers": missing,
             "failed_workers": fatals, "unfinished_workers": unfinished,
-            "complete": not (missing or fatals or unfinished),
+            "complete": not (missing or fatals or unfinished or verification["failed_workers"]),
+            "verification": verification,
             "hold_target_offers_per_second": rate * expected_workers, "phases": merged,
             "success_latency_ms": percentiles(all_hist),
             "max_schedule_lag_ms": max(row.get("max_schedule_lag_ms", row.get("counts", {}).get("max_schedule_lag_ms", 0)) for row in records),

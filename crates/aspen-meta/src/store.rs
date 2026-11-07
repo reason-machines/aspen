@@ -11,8 +11,8 @@ use aspen_core::id::{
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
     CommitLookup, CommitOutcome, CommitRow, Cover, CurrentVersion, Job, JobEvent, JobTag, Lease,
-    MetaStore, NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery,
-    ShallowDepth, ShallowRecorded, Statements, SweepBatch,
+    MetaStore, NewCover, NewJob, PackReferences, PackTombstone, PushCommit, RefChanges, RefCursor,
+    RefListQuery, ShallowDepth, ShallowRecorded, Statements, SweepBatch,
 };
 use aspen_core::name::{RefName, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackRecord};
@@ -1212,6 +1212,14 @@ impl MetaStore for SqlStore {
         limit: u32,
     ) -> Result<u64, StoreError> {
         crate::shallow::evict_shallow_packs(self, superseded_after, unused_after, limit).await
+    }
+
+    async fn pack_references(&self, pack: PackId) -> Result<PackReferences, StoreError> {
+        crate::replace::pack_references(self, pack).await
+    }
+
+    async fn replace_pack(&self, old: PackId, new: PackId) -> Result<PackReferences, StoreError> {
+        crate::replace::replace_pack(self, old, new).await
     }
 
     async fn enqueue_jobs(&self, jobs: &[NewJob]) -> Result<Vec<JobId>, StoreError> {

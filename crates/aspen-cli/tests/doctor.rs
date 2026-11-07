@@ -304,6 +304,61 @@ fn requeue_replaces_a_dead_job_with_a_fresh_one() {
     assert!(!out.contains("dead job"), "{out}");
 }
 
+/// The job `requeue` makes is claimed and run by the production worker
+/// (`aspen-compact`'s [`Worker`] with its default options, what `aspen
+/// serve` runs under `ASPEN_ROLE` `all` or `compact`): its attempt
+/// advances and it completes (reason-machines/aspen#10, where a requeued
+/// `rewrite_pack` stayed queued at attempt 0 because no worker claimed the
+/// kind). The pack here is named by nothing, so the repair has nothing to
+/// do and finishes without writing.
+#[test]
+fn a_requeued_rewrite_pack_is_claimed_and_run_by_the_worker() {
+    use aspen_compact::{
+        CompactConfig, Compactor, JobOutcome, JobReport, RewriteReport, RewriteSkipped, Worker,
+        WorkerOptions,
+    };
+    use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
+
+    let db = Db::new();
+    let dead = db.rewrite_job(1);
+    db.kill(dead);
+    let (code, out, err) = run(&mut aspen(
+        &db.url,
+        &["--json", "requeue", &dead.get().to_string()],
+    ));
+    assert_eq!(code, Some(0), "{err}");
+    let fresh = JobId::new(json(&out)["requeued"]["id"].as_i64().unwrap()).unwrap();
+    // The binary enqueued the job by the real clock; bring the test
+    // store's clock there, so the job is due.
+    db.time.store(UnixMicros::now().0 + 1, Ordering::SeqCst);
+
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = aspen_blob::LocalBlobStore::open(dir.path().join("blobs")).unwrap();
+    let config = CompactConfig::new(
+        dir.path(),
+        MaxObjectBytes::new(1 << 20).unwrap(),
+        MaxInflatedBytes::new(1 << 24).unwrap(),
+    );
+    let mut worker = Worker::new(
+        Compactor::new(db.store.clone(), blobs, config),
+        WorkerOptions::new("doctor-test"),
+    );
+    let outcome = db.rt.block_on(worker.run_one()).unwrap();
+    assert_eq!(
+        outcome,
+        Some(JobOutcome::Done {
+            job: fresh,
+            report: JobReport::Rewrite(RewriteReport::Skipped(RewriteSkipped::Unreferenced)),
+        })
+    );
+    assert_eq!(db.state(fresh), JobState::Done);
+    let job = db.rt.block_on(db.store.job(fresh)).unwrap().unwrap();
+    assert_eq!(job.attempts, 1, "claimed once");
+    let (code, out, _) = run(&mut aspen(&db.url, &[]));
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "No jobs are queued, running or dead.\n");
+}
+
 /// `resolve` marks the dead job done and enqueues nothing.
 #[test]
 fn resolve_marks_a_dead_job_done_without_new_work() {

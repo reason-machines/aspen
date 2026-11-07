@@ -32,7 +32,7 @@ The alerts that page all mean stored data needs a person:
 | Alert | What it means | What to do |
 |---|---|---|
 | `AspenDeadJobs` | A background job failed 10 times and stopped retrying | [Dead jobs](#dead-jobs) below |
-| `AspenStoredPackNotBaseFirst` | A stored pack has a delta before its base; fetches that use it fail | A `rewrite_pack` job is queued automatically; check that it does not die |
+| `AspenStoredPackNotBaseFirst` | A stored pack has a delta before its base; fetches that use it fail | A `rewrite_pack` job is queued automatically, and the background worker (`ASPEN_ROLE` `all` or `compact`) rewrites the pack base-first and points every version that named it at the rewrite; fetches succeed once it is done. Check with `aspen doctor jobs` that it runs and does not die |
 | `AspenStoreCorruption` | A blob does not match its database row (missing, short, wrong checksum) | Check the bucket object of the pack named in the error log against its `packs` row |
 | `AspenExpressCorruptPack` | An express node read a pack that does not hash to the checksum in its key | As above; the express node streams it but never caches it |
 
@@ -48,11 +48,13 @@ it yet, so add a rule if you run mirrors in `async` mode.
 
 Indexing large pushes, compaction, mirror pushes and pack repairs run as
 jobs in the database. A job that fails or loses its lease 10 times is parked
-as `dead`, and nothing retries it.
+as `dead`, and nothing retries it. The background worker (`ASPEN_ROLE`
+`all` or `compact`) runs every kind but mirror pushes, which mirror mode
+runs; with no such process, jobs stay queued and the queue-lag alert fires.
 
 ```bash
 aspen doctor jobs                 # counts per kind and state, and every dead job with its last error
-aspen doctor jobs requeue <id>    # after fixing the cause: run it again as a fresh job
+aspen doctor jobs requeue <id>    # after fixing the cause: a fresh job, which the worker runs
 aspen doctor jobs resolve <id>    # the work was done some other way: mark it done
 ```
 

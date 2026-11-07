@@ -162,6 +162,13 @@ pub struct PlaceConfig {
     pub client_addr: aspen_server::access::ClientAddr,
     /// Engage the kill switch at start.
     pub kill_switch: bool,
+    /// The event feed's first `seq` is one past this. The binary sets the
+    /// start time in ms, so a task started later usually numbers above an
+    /// earlier one. Clients that name the feed's `instance` with their
+    /// cursor are resynced on any mismatch whatever the numbers
+    /// ([`crate::state::State::subscribe`]); this only helps those that do
+    /// not.
+    pub first_seq: u64,
 }
 
 impl PlaceConfig {
@@ -217,6 +224,7 @@ impl PlaceConfig {
             agent_concurrency: 16,
             client_addr: aspen_server::access::ClientAddr::Peer,
             kill_switch: false,
+            first_seq: 0,
         }
     }
 
@@ -561,6 +569,12 @@ pub struct Place<M, B> {
     /// False while [`Place::run`]'s [`Place::rebuild_memory`] is still
     /// reading recent paint from `main`'s merge commits.
     memory_ready: std::sync::atomic::AtomicBool,
+    /// The newest `main` commit whose merges' memory of people's and
+    /// sprites' tiles is in the state ([`Self::remember_main_until`] walked
+    /// down from it), `None` before the first walk. Separate from the
+    /// canvas's `main.commit`: a reload advances the canvas before the walk,
+    /// and a walk that fails is retried from here on the next follow.
+    remembered: Mutex<Option<ObjectId>>,
     /// Locked inside `shared.state` by [`Place::start_swarm`]; never lock
     /// `shared.state` while holding it.
     pub(crate) sessions: Mutex<crate::api::Sessions>,
@@ -618,6 +632,8 @@ pub fn shared(
     };
     let mut state = State::new(rules.clone(), main, config.swarm, config.event_backlog);
     state.kill.engaged = config.kill_switch;
+    state.start_seq_at(config.first_seq);
+    state.instance = format!("{:016x}", Rng::new().next());
     Arc::new(Shared {
         repo: repo.id,
         rules,
@@ -754,6 +770,7 @@ where
             ambient: Mutex::new(ambient),
             personas: Mutex::new(personas),
             memory_ready: std::sync::atomic::AtomicBool::new(true),
+            remembered: Mutex::new(None),
             sessions: Mutex::new(sessions),
             event_streams,
             operators,
@@ -847,6 +864,53 @@ where
         }
     }
 
+    /// Catches up with a `main` another writer moved (the other task of a
+    /// start-first deploy, an operator): reloads the canvas and remembers
+    /// the people's and sprites' tiles of the merges since the `main` this
+    /// instance knew, so its personas keep off fresh human paint. The
+    /// merger runs it on every tick; a no-op while `main` is where it was.
+    pub async fn follow_main(&self) -> Result<(), PlaceError> {
+        let _guard = self.merge_lock.lock().await;
+        self.follow_main_locked().await
+    }
+
+    async fn follow_main_locked(&self) -> Result<(), PlaceError> {
+        let known = self.with_state(|s| s.main.commit);
+        let current = self
+            .meta
+            .current_version(self.repo.id, &Self::trunk())
+            .await?
+            .and_then(|v| v.value.tip());
+        if current != Some(known) {
+            self.reload_main().await?;
+        }
+        self.catch_up_memory().await
+    }
+
+    /// Reloads `main` after another writer moved it and tells subscribers
+    /// which tiles changed ([`State::follow`]). The memory of its merges is
+    /// read by [`Self::catch_up_memory`].
+    async fn reload_main(&self) -> Result<(), PlaceError> {
+        let before = self.with_state(|s| s.main.pixels.clone());
+        self.load_main().await?;
+        self.with_state(|s| {
+            let commit = s.main.commit;
+            s.follow(commit, &before, now_ms());
+        });
+        Ok(())
+    }
+
+    /// Remembers the people's and sprites' tiles of every merge on stored
+    /// `main` since the last commit remembered (all of
+    /// [`MEMORY_WALK`] before the first), and records its tip as
+    /// remembered. A no-op when nothing moved.
+    async fn catch_up_memory(&self) -> Result<(), PlaceError> {
+        let stop = *self.remembered.lock().expect("not poisoned");
+        let tip = self.remember_main_until(stop).await?;
+        *self.remembered.lock().expect("not poisoned") = tip;
+        Ok(())
+    }
+
     async fn load_main(&self) -> Result<(), PlaceError> {
         let trunk = Self::trunk();
         let current = self.meta.current_version(self.repo.id, &trunk).await?;
@@ -935,7 +999,9 @@ where
                     };
                     let actor = actor_for(short);
                     // Restarted branches count as just updated, so a
-                    // restart never deletes one early.
+                    // restart never deletes one early, and none is expired
+                    // for LISTED_BRANCH_GRACE: the old task of a start-first
+                    // deploy may still hold its tiles and paint on it.
                     s.branches.insert(
                         short.to_owned(),
                         crate::state::Branch {
@@ -945,6 +1011,7 @@ where
                             updated_ms: now,
                             deleted: false,
                             full: None,
+                            listed_until_ms: now + LISTED_BRANCH_GRACE_MS,
                         },
                     );
                 }
@@ -1202,7 +1269,13 @@ where
             (Report::Ok, None) => Err(PlaceError::Corrupt(
                 "the push committed without the hook seeing it".into(),
             )),
-            (Report::Rejected(r), _) => Err(PlaceError::Refused(r)),
+            (Report::Rejected(r), _) => {
+                // The branch moved under us (another instance painted it,
+                // during a start-first deploy): the next paint reads its
+                // tip from the store instead of retrying on a stale one.
+                self.with_state(|s| s.forget_full(branch));
+                Err(PlaceError::Refused(r))
+            }
         }
     }
 
@@ -1211,7 +1284,7 @@ where
     /// `None` when nothing was pending.
     pub async fn merge_once(&self) -> Result<Option<u64>, PlaceError> {
         let _guard = self.merge_lock.lock().await;
-        let (plan, main) = self.with_state(|s| (s.plan_merge(), s.main.clone()));
+        let (plan, main) = self.with_state(|s| (s.plan_merge(now_ms()), s.main.clone()));
         let Some(plan) = plan else { return Ok(None) };
         let mut pb = PackBuilder::default();
         let mut message = format!(
@@ -1242,14 +1315,25 @@ where
             )
             .await?
         {
-            Report::Ok => Ok(Some(self.with_state(|s| {
-                s.main.history = history;
-                s.apply_merge(commit, plan, now_ms())
-            }))),
+            Report::Ok => {
+                // This merge's memory goes into the state below: when the
+                // memory was up to date with the `main` it builds on, it
+                // still is.
+                {
+                    let mut r = self.remembered.lock().expect("not poisoned");
+                    if *r == Some(main.commit) {
+                        *r = Some(commit);
+                    }
+                }
+                Ok(Some(self.with_state(|s| {
+                    s.main.history = history;
+                    s.apply_merge(commit, plan, now_ms())
+                })))
+            }
             Report::Rejected(r) => {
                 // `main` moved under us (an operator, another instance):
                 // start again from what is stored.
-                self.load_main().await?;
+                self.follow_main_locked().await?;
                 Err(PlaceError::Refused(r))
             }
         }
@@ -1334,7 +1418,7 @@ where
         let main = self.with_state(|s| s.main.clone());
         if version.value.tip() != Some(main.commit) {
             // `main` moved under us: start again from what is stored.
-            self.load_main().await?;
+            self.follow_main_locked().await?;
             return Err(PlaceError::Refused("main moved; try again".into()));
         }
         // An orphan commit's pack holds everything it reaches: the
@@ -1398,8 +1482,16 @@ where
         match crate::git::parse_report(&out.response) {
             Report::Ok => {}
             Report::Rejected(r) => {
-                self.load_main().await?;
+                self.follow_main_locked().await?;
                 return Err(PlaceError::Refused(r));
+            }
+        }
+        // The root carries the memory the state holds: still up to date
+        // when it was with the `main` it replaced.
+        {
+            let mut r = self.remembered.lock().expect("not poisoned");
+            if *r == Some(main.commit) {
+                *r = Some(commit);
             }
         }
         self.with_state(|s| {
@@ -1529,17 +1621,32 @@ where
     /// commits, walking back from the tip, so a restart does not let
     /// ambient agents paint over them. Bounded to [`MEMORY_WALK`] commits.
     pub async fn rebuild_memory(&self) -> Result<(), PlaceError> {
+        // Not under the merge lock, so a long walk never holds up merges;
+        // remembering twice is harmless.
+        self.catch_up_memory().await
+    }
+
+    /// [`Self::rebuild_memory`]'s walk, stopping before `stop` (a commit
+    /// already remembered) as well. Returns the tip it walked down from.
+    async fn remember_main_until(
+        &self,
+        stop: Option<ObjectId>,
+    ) -> Result<Option<ObjectId>, PlaceError> {
         let trunk = Self::trunk();
         let Some(version) = self.meta.current_version(self.repo.id, &trunk).await? else {
-            return Ok(());
+            return Ok(None);
         };
-        let Some(mut at) = version.value.tip() else {
-            return Ok(());
+        let Some(tip) = version.value.tip() else {
+            return Ok(None);
         };
+        let mut at = tip;
         let now_s = now_ms() / 1000;
         let window_s = crate::state::HUMAN_MEMORY_MS / 1000;
         let rules = self.shared.rules.clone();
         for _ in 0..MEMORY_WALK {
+            if Some(at) == stop {
+                break;
+            }
             let Some((ObjectKind::Commit, data)) =
                 self.svc.read_object(self.repo.id, version.id, at).await?
             else {
@@ -1556,7 +1663,7 @@ where
                 None => break,
             }
         }
-        Ok(())
+        Ok(Some(tip))
     }
 
     /// Runs the merger bot, branch expiry, the ambient agents and the
@@ -1590,6 +1697,9 @@ where
             tokio::select! {
                 () = &mut shutdown => break,
                 _ = merge.tick() => {
+                    if let Err(e) = self.follow_main().await {
+                        eprintln!("place: reading main failed: {e}");
+                    }
                     let now = tokio::time::Instant::now();
                     let (prompt, pending) = self.with_state(|s| {
                         let prompt = s.pending.iter().any(|p| !p.branch.starts_with(AMBIENT_PREFIX));
@@ -1621,8 +1731,50 @@ where
                 _ = agents.tick() => self.agents_tick(),
             }
         }
-        if let Err(e) = self.merge_once().await {
-            eprintln!("place: final merge failed: {e}");
+        self.final_merge().await;
+    }
+
+    /// The merge at shutdown ([`Self::run`] runs it last): merges what is
+    /// pending, trying again when another instance moved `main` first.
+    pub async fn final_merge(&self) {
+        // During a start-first deploy the next instance's merger also moves
+        // `main`, so this merge can lose the compare-and-swap. `merge_once`
+        // reloads `main` when refused and keeps what is pending, so another
+        // try replays the same pushes onto the new `main`. Pushes this
+        // instance accepted live only in its memory: the next instance lists
+        // their branches with nothing pending and never merges them.
+        // A refused try has already reloaded `main` and pushes again at
+        // once, so it loses only to a merge landing in that instant; the
+        // other task's merger runs every few seconds. A short jittered pause
+        // keeps two tasks shutting down together from retrying in step.
+        for attempt in 1..=FINAL_MERGE_ATTEMPTS {
+            match self.merge_once().await {
+                Ok(_) => return,
+                Err(PlaceError::Refused(r)) if attempt < FINAL_MERGE_ATTEMPTS => {
+                    eprintln!("place: final merge refused ({r}); trying again on the new main");
+                    let pause = 50 + self.rng.lock().expect("not poisoned").below(201);
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                }
+                Err(e) => {
+                    eprintln!("place: final merge failed: {e}");
+                    break;
+                }
+            }
+        }
+        // Their tiles stay on their branches, which the next instance keeps
+        // for LISTED_BRANCH_GRACE but does not merge: name them for an
+        // operator (a push of the same tiles merges them).
+        let stranded = self.with_state(|s| {
+            let mut b: Vec<String> = s.pending.iter().map(|p| p.branch.clone()).collect();
+            b.dedup();
+            b
+        });
+        if !stranded.is_empty() {
+            eprintln!(
+                "place: pushes on {} left unmerged at shutdown: {}",
+                stranded.len(),
+                stranded.join(", ")
+            );
         }
     }
 
@@ -1930,6 +2082,16 @@ pub fn parse_memory(commit: &[u8], rules: &Rules) -> (Option<u64>, Vec<usize>, V
     }
     (time, people, sprites)
 }
+
+/// How many times the merge at shutdown runs when another instance's merge
+/// moved `main` first (a start-first deploy). Each refused try reloads
+/// `main`, so a second try normally lands.
+const FINAL_MERGE_ATTEMPTS: u32 = 5;
+
+/// How long a branch found in the store at start is kept from expiry
+/// ([`crate::state::Branch::listed_until_ms`]): longer than the overlap of
+/// a start-first deploy, so the old task's branches outlive it.
+const LISTED_BRANCH_GRACE_MS: u64 = 10 * 60 * 1000;
 
 /// The most `main` commits [`Place::rebuild_memory`] reads.
 pub const MEMORY_WALK: usize = 2000;

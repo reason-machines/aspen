@@ -2743,3 +2743,432 @@ async fn one_address_may_push_many_branches_at_once_under_the_default_limits() {
         );
     }
 }
+
+/// Two instances on one store at once, as during a start-first ECS deploy
+/// (docs/PLAN.md decisions log, "place deploys start-first"). The old
+/// instance's last merge loses the race for `main` to the new one's merger
+/// and must still land its own pending pushes; a server paint on a branch
+/// the other instance moved must not stay refused. The test helpers never
+/// run [`Place::run`], so neither instance's background merger or expiry
+/// runs: every merge here is the one the test calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_overlapping_lose_no_paint() {
+    use aspen_place::place::PlaceError;
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    let tile = |x, color| [Tile { x, y: 0, color }];
+    // The old instance paints a branch: pending in its memory only.
+    old.place
+        .paint("agent/old", Actor::agent("old"), &tile(1, 5), "")
+        .await
+        .unwrap();
+    // The new instance starts beside it and lists that branch with
+    // nothing pending, then paints and merges its own stroke: `main` moves
+    // under the old instance.
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    new.place
+        .paint("agent/new", Actor::agent("new"), &tile(2, 12), "")
+        .await
+        .unwrap();
+    new.place.merge_once().await.unwrap().unwrap();
+
+    // The old instance's last merge is refused once (stale `main`), then
+    // lands on the new `main`.
+    old.place.final_merge().await;
+    assert!(
+        old.place.with_state(|s| s.pending.is_empty()),
+        "the old instance's last merge landed"
+    );
+    let main = new.clone_work("check").await;
+    assert_eq!(
+        main.git(&["show", "HEAD:tiles/1_0.txt"]).trim(),
+        RED,
+        "the old instance's pending tile reached main"
+    );
+    assert_eq!(
+        main.git(&["show", "HEAD:tiles/2_0.txt"]).trim(),
+        BLUE,
+        "the new instance's tile stayed on main"
+    );
+
+    // Both paint one branch: the old instance's cached tip goes stale. Its
+    // first paint is refused; the next reads the tip from the store and
+    // lands, on top of the new instance's stroke.
+    new.place
+        .paint("agent/old", Actor::agent("old"), &tile(3, 12), "")
+        .await
+        .unwrap();
+    let refused = old
+        .place
+        .paint("agent/old", Actor::agent("old"), &tile(4, 5), "")
+        .await;
+    assert!(
+        matches!(refused, Err(PlaceError::Refused(_))),
+        "a paint on a stale tip is refused, not failed: {refused:?}"
+    );
+    let painted = old
+        .place
+        .paint("agent/old", Actor::agent("old"), &tile(4, 5), "")
+        .await
+        .expect("a refused paint does not leave a stale tip cached");
+    let w = new.clone_work("branch").await;
+    w.run(&["fetch", "-q", &new.url(), "refs/heads/agent/old"])
+        .await;
+    assert_eq!(
+        w.git(&["rev-parse", "FETCH_HEAD"]).trim(),
+        painted.commit.to_string()
+    );
+    assert_eq!(w.git(&["show", "FETCH_HEAD:tiles/3_0.txt"]).trim(), BLUE);
+    assert_eq!(w.git(&["show", "FETCH_HEAD:tiles/4_0.txt"]).trim(), RED);
+}
+
+/// During the overlap the new instance follows the old one's merges: its
+/// canvas and its memory of people's tiles include what the old one merged,
+/// so its personas keep off fresh human paint. Without catching up, the new
+/// instance only learns of them when its own merge is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_new_instance_follows_the_old_ones_merges_into_its_memory() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    // A person paints through the old instance, which merges it.
+    old.place
+        .paint(
+            "visitors/ada",
+            Actor::visitor("ada"),
+            &[Tile {
+                x: 5,
+                y: 1,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    old.place.merge_once().await.unwrap().unwrap();
+    let i = 16 + 5; // (5, 1) on the tests' 16-wide canvas
+    assert!(!new.place.with_state(|s| s.human_tiles.contains_key(&i)));
+
+    new.place.follow_main().await.unwrap();
+    let (pixel, remembered, main) = new.place.with_state(|s| {
+        (
+            s.main.pixels[i],
+            s.human_tiles.contains_key(&i),
+            s.main.commit,
+        )
+    });
+    assert_eq!(
+        pixel, 5,
+        "the new instance's canvas has the old one's merge"
+    );
+    assert!(remembered, "the new instance remembers the person's tile");
+    assert_eq!(main, old.place.with_state(|s| s.main.commit));
+    // Its personas' protected tiles include it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        new.place
+            .with_state(|s| s.protected_tiles(now))
+            .contains(&i)
+    );
+    // Nothing moved since: following again is a no-op.
+    new.place.follow_main().await.unwrap();
+}
+
+/// A branch the new instance found at start is not expired during the
+/// overlap, even an `agent/` one with nothing pending (which this instance
+/// would otherwise delete at once): the old instance may still paint on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branches_found_at_start_outlive_the_overlap() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    old.place
+        .paint(
+            "agent/old",
+            Actor::agent("old"),
+            &[Tile {
+                x: 1,
+                y: 0,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    assert_eq!(new.place.expire_once().await.unwrap(), 0);
+    assert!(
+        new.place
+            .with_state(|s| s.branches.contains_key("agent/old"))
+    );
+    // The old instance's next paint on it lands.
+    old.place
+        .paint(
+            "agent/old",
+            Actor::agent("old"),
+            &[Tile {
+                x: 2,
+                y: 0,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+}
+
+/// Feeds of two instances side by side are numbered from different points
+/// (`first_seq`), so a client that moves from one to the other with the
+/// `seq` it last saw gets a `resync`, never a silent gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_moving_to_another_instance_is_told_to_resync() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |c| c.first_seq = 1_000).await;
+    let new = App::start_in(path, Some(dir), |c| c.first_seq = 2_000).await;
+    for x in 0..3 {
+        old.place
+            .paint(
+                "agent/old",
+                Actor::agent("old"),
+                &[Tile { x, y: 0, color: 5 }],
+                "",
+            )
+            .await
+            .unwrap();
+    }
+    let seen = old.get("/api/v1/canvas").await["seq"].as_u64().unwrap();
+    assert_eq!(seen, 1_003);
+    new.place
+        .paint(
+            "agent/new",
+            Actor::agent("new"),
+            &[Tile {
+                x: 9,
+                y: 0,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    // Old -> new: below the new feed's start.
+    let mut s = new.events(&format!("?after={seen}"), &[]).await;
+    let e = s.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e.kind, "resync", "{e:?}");
+    assert_eq!(e.data["seq"].as_u64(), Some(2_001));
+    // New -> old: past the old feed's end.
+    let mut s = old.events("?after=2001", &[]).await;
+    assert_eq!(s.next(Duration::from_secs(5)).await.unwrap().kind, "resync");
+}
+
+/// A merge the other instance made reaches this instance's subscribers
+/// when it follows `main`: one `merge` event with the tiles that changed.
+/// Without it their canvases keep the old color until a resync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribers_see_the_merges_this_instance_follows() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    let seen = new.get("/api/v1/canvas").await["seq"].as_u64().unwrap();
+    let mut s = new.events(&format!("?after={seen}"), &[]).await;
+    old.place
+        .paint(
+            "visitors/ada",
+            Actor::visitor("ada"),
+            &[Tile {
+                x: 5,
+                y: 1,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    old.place.merge_once().await.unwrap().unwrap();
+    new.place.follow_main().await.unwrap();
+    let e = s.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e.kind, "merge", "{e:?}");
+    assert_eq!(
+        e.data["commit"].as_str(),
+        Some(old.place.with_state(|s| s.main.commit).to_string().as_str())
+    );
+    assert_eq!(e.data["throughSeq"].as_u64(), Some(seen));
+    let tiles = e.data["tiles"].as_array().unwrap();
+    assert_eq!(tiles.len(), 1, "{tiles:?}");
+    assert_eq!(
+        (tiles[0]["x"].as_u64(), tiles[0]["y"].as_u64()),
+        (Some(5), Some(1))
+    );
+    assert_eq!(tiles[0]["color"].as_str(), Some(RED));
+    // The snapshot agrees.
+    let snap = new.get("/api/v1/canvas").await;
+    assert_eq!(snap["seq"].as_u64(), e.id);
+    assert_eq!(snap["pixels"].as_str().unwrap().as_bytes()[16 + 5], b'5');
+    // Nothing moved since: following again emits nothing.
+    new.place.follow_main().await.unwrap();
+    assert_eq!(new.place.with_state(|s| s.seq), e.id.unwrap());
+}
+
+/// An agent's stroke still pending on the old instance does not land on a
+/// tile a person painted through the new one in the meantime: once the
+/// old instance follows the person's merge, its last merge drops the
+/// agent's tile there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_agent_stroke_never_lands_on_fresher_human_paint() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    let tile = |x, color| [Tile { x, y: 0, color }];
+    // The old instance's agent queues blue on (3, 0) and (4, 0).
+    old.place
+        .paint(
+            "agent/old-1",
+            Actor::agent("old"),
+            &[tile(3, 12)[0], tile(4, 12)[0]],
+            "",
+        )
+        .await
+        .unwrap();
+    // A person paints (3, 0) red through the new instance, merged there.
+    new.place
+        .paint("visitors/ada", Actor::visitor("ada"), &tile(3, 5), "")
+        .await
+        .unwrap();
+    new.place.merge_once().await.unwrap().unwrap();
+    // The old instance follows (its merger's tick), then shuts down.
+    old.place.follow_main().await.unwrap();
+    old.place.final_merge().await;
+    assert!(old.place.with_state(|s| s.pending.is_empty()));
+    let main = new.clone_work("check").await;
+    assert_eq!(
+        main.git(&["show", "HEAD:tiles/3_0.txt"]).trim(),
+        RED,
+        "the person's tile stays"
+    );
+    assert_eq!(
+        main.git(&["show", "HEAD:tiles/4_0.txt"]).trim(),
+        BLUE,
+        "the agent's other tile lands"
+    );
+}
+
+/// Feeds numbered from overlapping points: a cursor from the old
+/// instance's feed falls inside the new one's backlog. Naming its
+/// instance gets the client a `resync`; read as the new feed's, it would
+/// silently skip the new feed's first events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cursor_from_another_instance_is_resynced_even_inside_this_feeds_range() {
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |c| c.first_seq = 1_000).await;
+    let new = App::start_in(path, Some(dir), |c| c.first_seq = 1_000).await;
+    let paint = |app: &App, x| {
+        let place = app.place.clone();
+        async move {
+            place
+                .paint(
+                    "agent/a-1",
+                    Actor::agent("a"),
+                    &[Tile { x, y: 0, color: 5 }],
+                    "",
+                )
+                .await
+                .unwrap();
+        }
+    };
+    for x in 0..2 {
+        paint(&old, x).await;
+    }
+    for x in 0..4 {
+        paint(&new, x + 4).await;
+    }
+    let snap = old.get("/api/v1/canvas").await;
+    let (seen, instance) = (
+        snap["seq"].as_u64().unwrap(),
+        snap["instance"].as_str().unwrap().to_owned(),
+    );
+    assert_eq!(seen, 1_002);
+    let new_instance = new.get("/api/v1/canvas").await["instance"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(instance, new_instance);
+    // A client naming the old feed: resync, with the new feed's instance.
+    let mut s = new
+        .events(&format!("?after={seen}&instance={instance}"), &[])
+        .await;
+    let e = s.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e.kind, "resync", "{e:?}");
+    assert_eq!(e.data["seq"].as_u64(), Some(1_004));
+    assert_eq!(e.data["instance"].as_str(), Some(new_instance.as_str()));
+    // Naming the new feed itself: the backlog as usual.
+    let mut s = new
+        .events(&format!("?after={seen}&instance={new_instance}"), &[])
+        .await;
+    let e = s.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!((e.kind.as_str(), e.id), ("push", Some(1_003)));
+}
+
+/// Every path that reloads a `main` another writer moved also remembers
+/// its merges, even when the canvas got there first: a refused history
+/// reset reloads the canvas, and the person's tile merged by the other
+/// instance is still remembered (and stays so on the next follow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_history_reset_still_remembers_the_other_instances_merges() {
+    use aspen_place::place::PlaceError;
+    use aspen_place::rules::Tile;
+    use aspen_place::state::Actor;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let old = App::start_in(path.clone(), None, |_| {}).await;
+    let new = App::start_in(path, Some(dir), |_| {}).await;
+    new.place.rebuild_memory().await.unwrap();
+    old.place
+        .paint(
+            "visitors/ada",
+            Actor::visitor("ada"),
+            &[Tile {
+                x: 5,
+                y: 1,
+                color: 5,
+            }],
+            "",
+        )
+        .await
+        .unwrap();
+    old.place.merge_once().await.unwrap().unwrap();
+    let i = 16 + 5;
+    let refused = new.place.reset_history().await;
+    assert!(
+        matches!(refused, Err(PlaceError::Refused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(new.place.with_state(|s| s.main.pixels[i]), 5);
+    new.place.follow_main().await.unwrap();
+    assert!(
+        new.place.with_state(|s| s.human_tiles.contains_key(&i)),
+        "the person's tile is remembered"
+    );
+}

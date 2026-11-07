@@ -132,6 +132,7 @@ mod lease;
 mod mirrors;
 mod push;
 mod ref_changes;
+mod replace;
 mod rows;
 mod shallow;
 mod sql;

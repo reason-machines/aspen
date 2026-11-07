@@ -55,7 +55,7 @@ that the dashboard and alert rules use only these names.
 | Metric | Type | Meaning |
 |---|---|---|
 | `aspen_jobs{kind,state}` with `state="dead"` | gauge | Background jobs parked as dead after 10 failed or expired attempts. Nothing retries them. See [Dead jobs](#dead-jobs) |
-| `aspen_alert_stored_pack_forward_base_total` | counter | Fetches that hit a stored pack whose delta comes before its base. The fetch fails, and a `rewrite_pack` job is enqueued for the pack |
+| `aspen_alert_stored_pack_forward_base_total` | counter | Fetches that hit a stored pack whose delta comes before its base. The fetch fails, and a `rewrite_pack` job is enqueued for the pack; the background worker rewrites it base-first, after which fetches succeed |
 | `aspen_alert_store_corruption_total` | counter | Fetches that read stored data not matching its metadata row (a missing or short blob, a wrong checksum) |
 | `aspen_alert_express_corrupt_pack_total` | counter | Express reads of a pack that does not hash to the checksum in its key ([EXPRESS.md](EXPRESS.md)) |
 
@@ -223,7 +223,9 @@ A job (indexing a push's commits, compaction, a mirror push, rewriting a
 pack) that fails or loses its lease 10 times is parked as `dead`. Nothing
 retries it, and it keeps its slot in the queue, so its work does not happen
 until someone acts: a dead `rewrite_pack` leaves a broken pack failing every
-fetch that stitches it. Any dead job pages (`AspenDeadJobs`).
+fetch that stitches it. Any dead job pages (`AspenDeadJobs`). The
+background worker (`ASPEN_ROLE` `all` or `compact`) claims `compact`,
+`index_commits` and `rewrite_pack` jobs; mirror mode claims `mirror_push`.
 
 ```console
 $ DATABASE_URL=postgres://aspen@db.internal/aspen PGPASSWORD=... aspen doctor jobs

@@ -437,7 +437,7 @@ where
         Ok(())
     }
 
-    async fn read_all(
+    pub(crate) async fn read_all(
         &self,
         key: &aspen_core::blob::BlobKey,
         size: u64,

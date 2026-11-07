@@ -267,8 +267,9 @@ Every line must say `ok`. Then, by hand:
   `daily_budget_limit_usd` and `aspen-cloudfront-monthly`.
 - **SIGTERM.** `aws ecs update-service --cluster "$cluster" --service
   <place service> --force-new-deployment`: the old task's log ends with
-  `aspen-place: stopped` before the new task starts, and a tile pushed just
-  before is on `main` afterwards.
+  `aspen-place: stopped` after the new task has passed its health check
+  (the deploy is start-first), and a tile pushed just before is on `main`
+  afterwards.
 - **Kill switch.** With the operator token:
   `curl -X POST "$(terraform output -raw place_url)/api/v1/admin/kill-switch" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"engaged": true, "reason": "test"}'`,
   then the page shows it engaged and the swarm button is refused.
@@ -291,9 +292,12 @@ two do not idle at $230 together.
 
 - **Deploy a new version:** build and push new tags (step 4), set them in
   the environment's `.tfvars`, plan and apply. Aspen rolls over with no
-  downtime. `place` stops its old task (last merge, then exit) before the
-  new one starts, so the page is down for about a minute; that is the price
-  of never running two merger bots at once.
+  downtime. `place` too: ECS starts the new task beside the old one and
+  stops the old one (last merge, then exit) once the new one is healthy.
+  That needs the account's Fargate On-Demand vCPU quota to hold two place
+  tasks plus two Aspen tasks (34 vCPU at the demo's sizes; a new account
+  has 30); the plan warns (`place_deploy_fits_fargate_quota`) when it does
+  not, and then the new task cannot start and the deploy rolls back.
   The live demo's `demo.tfvars` and `demo.backend.hcl` are kept by the
   maintainers, outside the repository. A restart starts `place` with its kill
   switch released, so a deploy needs no operator step afterwards; the
@@ -392,11 +396,10 @@ longer need it. The account stack stays: its budget keeps watching.
   `git.<base>/-/express` instead (docs/EXPRESS.md).
 - **Metrics are not scraped.** `/-/metrics` stays on the tasks' private
   listener; there is no Prometheus in this deployment yet.
-- **One region**, and one `place` instance. So every deploy of `place`
-  is a short outage: ECS stops the old task before it starts the new one,
-  and the load balancer answers `503` until the new task passes its health
-  check, a minute or two. The page then tells the visitor the server is
-  restarting and to click again. Deploy `place` only when you need to.
+- **One region**, and one `place` instance. A deploy has no outage, but
+  for about a minute two place tasks run side by side, each with its own
+  event feed: a page may resync once. A crash or OOM of the one task is
+  still an outage until ECS replaces it.
 
 ## Checks without an AWS account
 
@@ -418,7 +421,7 @@ filters, a validation that refuses more, alerts to email and SNS and no
 budget action; an environment refuses to plan unless that budget exists
 with at most the approved ceiling and no filters; the demo's place task and
 database at their public-share sizes and staging's at the small ones; place on its own database, role and
-bucket, as exactly one instance, never on Spot, behind the ALB by host,
+bucket, as one task that deploys start-first, never on Spot, behind the ALB by host,
 and never with the RDS master password; no credentials in plain
 environment variables; the CDN in front of `/-/express` with a path-only
 cache key, its logs in a short-lived bucket, and the viewer function that

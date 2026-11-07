@@ -499,6 +499,19 @@ impl MetaStore for Fake {
     ) -> Result<u64, StoreError> {
         unreachable!()
     }
+    async fn pack_references(
+        &self,
+        _: aspen_core::id::PackId,
+    ) -> Result<aspen_core::meta::PackReferences, StoreError> {
+        unreachable!()
+    }
+    async fn replace_pack(
+        &self,
+        _: aspen_core::id::PackId,
+        _: aspen_core::id::PackId,
+    ) -> Result<aspen_core::meta::PackReferences, StoreError> {
+        unreachable!()
+    }
     async fn enqueue_jobs(&self, _: &[NewJob]) -> Result<Vec<JobId>, StoreError> {
         unreachable!()
     }

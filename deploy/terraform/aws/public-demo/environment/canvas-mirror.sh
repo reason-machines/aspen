@@ -7,8 +7,9 @@
 # because place starts main's history again from one root commit whenever
 # it outgrows PLACE_HISTORY_MAX_BYTES; the GitHub repository is a read-only
 # copy whose only writer is this sidecar. It is forced with a lease: only
-# over the main this sidecar last pushed (read from GitHub at start), so a
-# write by anyone else is reported, never overwritten.
+# over the main this sidecar last pushed (read from GitHub at start), or a
+# main from place's own history (another place task's mirror pushed it,
+# from_place), so a write by anyone else is reported, never overwritten.
 #
 # MIRROR_CREDENTIAL is either an SSH deploy key (OpenSSH private key; SSH
 # goes over port 443, ssh.github.com, the only egress the place task has)
@@ -65,6 +66,27 @@ until [ -n "$(timeout 10 git ls-remote "$MIRROR_SOURCE" refs/heads/main 2>/dev/n
   fi
   sleep "$retry"
 done
+# from_place <commit> <tip>: whether <commit> is a main of place's, that is
+# in <tip>'s history or in the history before one of place's resets. Place
+# starts main again from a root commit whose subject names the main it
+# replaced ("Start the canvas again from main at <old>") and keeps <old>
+# fetchable, so follow those roots back, at most 8 resets. A root that is
+# not place's (someone else's history) ends the walk.
+from_place() {
+  head=$2
+  hops=0
+  while :; do
+    git merge-base --is-ancestor "$1" "$head" 2>/dev/null && return 0
+    [ "$hops" -lt 8 ] || return 1
+    root=$(git rev-list --first-parent "$head" | tail -n 1)
+    old=$(git log -1 --format=%s "$root" | sed -n 's/^Start the canvas again from main at \([0-9a-f]\{40,64\}\)$/\1/p')
+    [ -n "$old" ] || return 1
+    git cat-file -e "$old^{commit}" 2>/dev/null ||
+      git fetch --quiet "$MIRROR_SOURCE" "$old" 2>/dev/null || return 1
+    head=$old
+    hops=$((hops + 1))
+  done
+}
 # GitHub's main as this sidecar last left it ("" if it has none), once
 # read.
 pushed=""
@@ -84,10 +106,19 @@ while :; do
         pushed=$tip
       else
         echo "canvas-mirror: push of $tip to $MIRROR_REPO failed (GitHub refused, or its main is not ${pushed:-absent}, as this mirror left it)"
-        # The push may have landed all the same; a main someone else
-        # wrote stays theirs until the sidecar restarts.
-        if [ "$(git ls-remote "$remote" refs/heads/main | cut -f1)" = "$tip" ]; then
+        # The push may have landed all the same; or another place task's
+        # mirror pushed first (during a start-first deploy the old task and
+        # the new one run side by side for a minute). A main that came from
+        # place itself (in place's history, also across its history resets,
+        # from_place) is taken as the lease, and the next run pushes over
+        # it. Any other main someone else wrote stays theirs until the
+        # sidecar restarts.
+        now=$(git ls-remote "$remote" refs/heads/main | cut -f1)
+        if [ "$now" = "$tip" ]; then
           pushed=$tip
+        elif [ -n "$now" ] && from_place "$now" "$tip"; then
+          echo "canvas-mirror: $MIRROR_REPO's main $now is an earlier main of place's; pushing over it next run"
+          pushed=$now
         fi
       fi
     fi

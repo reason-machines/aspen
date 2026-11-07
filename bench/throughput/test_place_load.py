@@ -90,12 +90,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config.rate, config.worker), (50, 2))
 
 
+def use_virtual_time(loop):
+    """Make the loop's clock virtual: when nothing is ready it jumps to the next timer.
+
+    Timings in these tests then depend only on the schedule, never on how busy the
+    machine is (a CPU stall used to make setup miss a 30 ms start lead)."""
+    clock = [0.0]
+    loop.time = lambda: clock[0]
+    select = loop._selector.select
+
+    def virtual_select(timeout=None):
+        if timeout:
+            clock[0] += timeout
+        return select(0)
+    loop._selector.select = virtual_select
+
+
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.loop = asyncio.get_running_loop()
+        use_virtual_time(self.loop)
+        self.wall_base = 1_800_000_000.0
+
     def config(self, **kwargs):
+        # start_at None: the runner picks its start from its own (virtual) wall clock.
         config = load.Config(target_url="http://127.0.0.1/api/v1", execute=True,
                              ramp_seconds=0, hold_seconds=.12, request_timeout=.05,
-                             deadline_seconds=1, start_at=time.time() + .03)
+                             deadline_seconds=1, start_at=None)
         return replace(config, **kwargs)
+
+    def vwall(self):
+        return self.wall_base + self.loop.time()
+
+    def runner(self, config, **kwargs):
+        kwargs.setdefault("clock", self.loop.time)
+        kwargs.setdefault("wall", self.vwall)
+        return load.Runner(config, object(), **kwargs)
 
     def server(self, replies=None, delay=0):
         calls = []
@@ -123,7 +153,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_durable_ack_per_request_no_retries_or_secret_logs(self):
         post, calls, sessions = self.server()
         with patch.object(load, "post_json", post):
-            runner = load.Runner(self.config(), object())
+            runner = self.runner(self.config())
             result = await runner.run()
         self.assertIsNone(result["fatal"])
         self.assertEqual(len(sessions), 110)
@@ -146,7 +176,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                    (429, {"message": "You can push 30 times a minute MEMORY_ONLY_0"})]
         post, calls, _ = self.server(replies)
         with patch.object(load, "post_json", post):
-            result = await load.Runner(self.config(), object()).run()
+            result = await self.runner(self.config()).run()
         stats = result["phases"]["hold"]
         self.assertEqual(len(calls), 6)
         self.assertEqual(stats["success"], 1)
@@ -168,7 +198,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("MEMORY_ONLY")
 
         with patch.object(load, "post_json", post):
-            result = await load.Runner(self.config(), object()).run()
+            result = await self.runner(self.config()).run()
         self.assertEqual(calls, 6)
         self.assertEqual(result["phases"]["hold"]["failures"],
                          {"timeout_outcome_unknown": 3, "transport_error_outcome_unknown": 3})
@@ -182,7 +212,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(load.asyncio, "TimeoutError", LegacyAsyncioTimeoutError):
             for timeout in (TimeoutError, LegacyAsyncioTimeoutError):
                 with self.subTest(timeout=timeout.__name__):
-                    runner = load.Runner(self.config(), object())
+                    runner = self.runner(self.config())
                     runner.sessions = [("visitors/test", "MEMORY_ONLY")]
                     runner.active.add(0)
                     post = AsyncMock(side_effect=timeout("MEMORY_ONLY"))
@@ -202,7 +232,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         for options, reason in (({"sessions": 1}, "session_busy"), ({"max_inflight": 1}, "inflight_limit")):
             post, calls, _ = self.server(delay=.2)
             with patch.object(load, "post_json", post):
-                result = await load.Runner(self.config(**options), object()).run()
+                result = await self.runner(self.config(**options)).run()
             stats = result["phases"]["hold"]
             self.assertEqual(stats["scheduled"], 6)
             self.assertEqual(stats["sent"], 1)
@@ -243,7 +273,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_deadline_cancels_drain_and_preserves_partial_counters(self):
         post, calls, _ = self.server(delay=5)
         with patch.object(load, "post_json", post):
-            result = await load.Runner(self.config(deadline_seconds=.25), object()).run()
+            result = await self.runner(self.config(deadline_seconds=.25)).run()
         self.assertEqual(result["fatal"], "deadline_exceeded")
         self.assertLess(result["elapsed_seconds"], .5)
         self.assertEqual(result["phases"]["hold"]["failures"],
@@ -251,12 +281,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.reconcile(result)
 
     async def test_setup_refusal_and_impossible_start_send_no_pushes(self):
-        for start, status, expected in ((time.time() + .03, 429, "setup_http_429:session_creation_quota"),
-                                        (time.time() - 1, 201, "missed_common_start"),
-                                        (time.time() + 2, 201, "schedule_and_drain_do_not_fit_deadline")):
+        for start, status, expected in ((self.vwall() + .03, 429, "setup_http_429:session_creation_quota"),
+                                        (self.vwall() - 1, 201, "missed_common_start"),
+                                        (self.vwall() + 2, 201, "schedule_and_drain_do_not_fit_deadline")):
             post = AsyncMock(return_value=(status, {"message": "Too many sessions MEMORY_ONLY"}))
             with patch.object(load, "post_json", post):
-                result = await load.Runner(self.config(start_at=start), object()).run()
+                result = await self.runner(self.config(start_at=start)).run()
             self.assertEqual(result["fatal"], expected)
             self.assertEqual(result["phases"]["hold"]["sent"], 0)
             self.assertNotIn("MEMORY_ONLY", json.dumps(result))
@@ -283,6 +313,23 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                          (201, {"seq": 1}))
         self.assertFalse(http.post.call_args.kwargs["allow_redirects"])
         self.assertEqual(http.post.call_args.kwargs["headers"], {"Authorization": "Bearer MEMORY_ONLY"})
+
+    async def test_refusals_record_whether_they_carry_retry_after(self):
+        for headers, expected in (({"Retry-After": "1"}, "http_429:global_ceiling"),
+                                  ({}, "http_429:no_retry_after:global_ceiling")):
+            response = AsyncMock()
+            response.status = 429
+            response.headers = headers
+            stream = asyncio.StreamReader()
+            stream.feed_data(b'{"message":"place is at its limit"}')
+            stream.feed_eof()
+            response.content = stream
+            response.__aenter__.return_value = response
+            http = unittest.mock.Mock()
+            http.post.return_value = response
+            status, data = await load.post_json(http, "https://example.invalid/api/v1/pushes", {}, "T")
+            self.assertEqual(load.refusal_reason(status, data), expected)
+        self.assertEqual(load.refusal_reason(503, {"_retry_after": False}), "http_503:no_retry_after")
 
 
 class AggregationTests(unittest.TestCase):

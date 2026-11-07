@@ -137,6 +137,7 @@ class App {
     void this.ensureSession();
     void this.client.events({
       after: snap.seq,
+      instance: snap.instance ?? null,
       signal: new AbortController().signal,
       onEvent: (e) => this.onEvent(e),
       onResync: async () => {
@@ -144,7 +145,7 @@ class App {
         this.store.loadSnapshot(s);
         this.pushSeqsSinceMerge = [];
         this.needsDraw = true;
-        return s.seq;
+        return { seq: s.seq, instance: s.instance ?? null };
       },
       onState: (s) => this.setConn(s),
     });

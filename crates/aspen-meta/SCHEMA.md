@@ -284,6 +284,9 @@ passed was named then (or was skipped, which holds the watermark). Rows
 that name a pack are never deleted, except `shallow_packs` recordings, and
 every statement that deletes a recording touches the pack in the same
 transaction (eviction, and the byte cap's eviction in `set_shallow_pack`).
+Rows stop naming a pack in one other place, `MetaStore::replace_pack` (a
+`rewrite_pack` job swapping in a pack's base-first rewrite, below), which
+touches the old pack in the same transaction too.
 A touch moves the registration ahead of the watermark, so the walk reads it
 again once its grace period ends. **Any new code that stops naming a pack
 must touch it in the same transaction**, as eviction does; the audit is
@@ -476,6 +479,24 @@ Or, when the work was done some other way, mark it done:
 ```sql
 UPDATE jobs SET state = 'done' WHERE id = :job_id AND state = 'dead';
 ```
+
+**`rewrite_pack` jobs** (reason-machines/aspen#10). The fetch path
+enqueues one when a stored pack it stitches has a delta before its base;
+the compaction worker (`aspen-compact`, which `aspen serve` runs under
+`ASPEN_ROLE` `all` or `compact`) claims it. The job writes the pack's
+base-first rewrite (same objects, entries moved, nothing recompressed),
+verifies it, registers it as a new `packs` row of the same repository and
+origin (so at the same level), uploads its blobs, and then
+`MetaStore::replace_pack` moves, in one transaction, every
+`ref_versions.pack_id`, `covers.pack_id` and `shallow_packs.pack_id` that
+named the old pack to the new row. This is the only update of a committed
+version's or cover's pack, and it changes no object set, so every closure
+and plan stays correct. The job's own row keeps naming the old pack, so
+the sweep keeps the old pack's row and blobs for as long as that row
+exists: a server process may still hold the old ID in a push's search
+packs. A job on a pack nothing names any more, or on one that is already
+base-first, finishes without writing (a lease expiry or a requeue may run
+it twice).
 
 `aspen doctor jobs` lists dead jobs with their `last_error`, and
 `aspen doctor jobs requeue <id>` (resolve, then enqueue a fresh job, in one

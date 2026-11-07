@@ -37,9 +37,12 @@ groups:
           summary: "A stored pack breaks the base-first invariant"
           description: >-
             Fetches that stitch this pack fail with a retryable ERR, and retries
-            cannot heal it. The server enqueued a rewrite_pack job; check that it
-            runs (`aspen doctor jobs`) and look for "is not base-first" in the
-            server logs for the pack ID.
+            cannot heal it. The server enqueued a rewrite_pack job, which the
+            background worker (ASPEN_ROLE all or compact) runs: it rewrites the
+            pack base-first and moves every version that named it to the
+            rewrite, after which fetches succeed. Check that it runs and does
+            not die (`aspen doctor jobs`), and look for "is not base-first" in
+            the server logs for the pack ID.
 
       - alert: AspenStoreCorruption
         expr: sum(increase(aspen_alert_store_corruption_total[10m])) > 0

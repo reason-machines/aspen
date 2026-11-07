@@ -1,0 +1,83 @@
+{
+  "schema": "aspen-place-load-aggregate-v1",
+  "run": "l10-2312-api",
+  "start": 1794006548.0,
+  "workers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "missing_workers": [],
+  "failed_workers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "unfinished_workers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "complete": false,
+  "hold_target_offers_per_second": 400,
+  "phases": {
+    "ramp": {
+      "scheduled": 0,
+      "sent": 0,
+      "success": 0,
+      "skipped": {},
+      "failures": {},
+      "scheduled_per_second": 0.0,
+      "sent_per_second": 0.0,
+      "acknowledged_per_second": 0.0,
+      "latency_histogram_ms": {},
+      "success_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null
+      }
+    },
+    "hold": {
+      "scheduled": 0,
+      "sent": 0,
+      "success": 0,
+      "skipped": {},
+      "failures": {},
+      "scheduled_per_second": 0.0,
+      "sent_per_second": 0.0,
+      "acknowledged_per_second": 0.0,
+      "latency_histogram_ms": {},
+      "success_latency_ms": {
+        "p50": null,
+        "p95": null,
+        "p99": null
+      }
+    }
+  },
+  "success_latency_ms": {
+    "p50": null,
+    "p95": null,
+    "p99": null
+  },
+  "max_schedule_lag_ms": 0,
+  "limits": [
+    "201 acknowledgements, not independently fetched commits",
+    "uniqueness checked within each worker, not across workers",
+    "latency covers successful requests only; transport failures have unknown outcomes"
+  ]
+}

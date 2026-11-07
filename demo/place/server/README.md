@@ -69,7 +69,11 @@ simulated agents.
 - **Kill switch.** `POST /api/v1/admin/kill-switch` needs an operator
   credential: an Aspen API token or OIDC token with an `admin` grant on the
   canvas repository. Engaging it ends a running swarm at once, refuses new
-  starts, and pauses the ambient agents and the personas.
+  starts, and pauses the ambient agents and the personas. It lives in the
+  task's memory: a deploy starts a new task with it released (unless
+  `PLACE_KILL_SWITCH=1`), and while two tasks overlap each has its own. Do
+  not deploy during an incident that needs it engaged; if you must, set
+  `PLACE_KILL_SWITCH=1` for that deploy.
 
 - **Bounded history.** Every merge stores a whole `tiles/` tree (9 to 25
   KiB on a painted 64 x 64 canvas: stored packs have no deltas), so a full
@@ -224,7 +228,18 @@ PLACE_CONTRACT_URL=http://127.0.0.1:7070/api/v1 PLACE_CONTRACT_OPERATOR_TOKEN=$T
   surviving a crash). When the drain ends, requests still running are cut off
   and their connections closed before that last merge; a push whose
   ingest is already running may still land on its branch during or after
-  the merge, and then stays there the same way. Never run two instances at once, not even during a
-  deploy: stop the old one before starting the new one.
+  the merge, and then stays there the same way. Two instances may overlap
+  for the minute of a start-first deploy: every write to `main` and to a
+  branch is a compare-and-swap in the shared store, a merge that loses one
+  reloads `main` and tries again (the last merge at shutdown up to five
+  times, a short jittered pause apart; branches still unmerged after that
+  are logged by name), and a refused server paint reads the branch's tip
+  again next time. Each instance follows `main` on every merger tick, so
+  its canvas and its memory of people's tiles include the other's merges,
+  and branches found at start are not expired for ten minutes. While they
+  overlap each has its own event feed (numbered from its start time, so a
+  client that moves between them resyncs), sessions, swarm, kill switch and
+  personas, and pushes it accepted merge only through its own merger. Do
+  not run two for longer.
 - **Storage.** Each commit the server writes carries a whole `tiles/` tree
   (about 30 bytes per painted tile, compressed), with no deltas.

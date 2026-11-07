@@ -573,7 +573,9 @@ impl Director {
                 .enumerate()
                 .map(|(i, _)| Seat {
                     shift: None,
-                    shifts: (seed.rotate_left(i as u32 * 7) % 89) + 10,
+                    // Wide, so two tasks side by side (a start-first deploy)
+                    // practically never name the same branch.
+                    shifts: (seed.rotate_left(i as u32 * 7) % 1_000_000_000) + 10,
                     rested_ms: 0,
                 })
                 .collect(),

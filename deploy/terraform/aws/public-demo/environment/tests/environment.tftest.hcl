@@ -17,6 +17,11 @@ mock_provider "aws" {
   mock_data "aws_partition" {
     defaults = { partition = "aws" }
   }
+  # The quota a start-first place deploy needs at the demo's sizes (34
+  # vCPU), with room.
+  mock_data "aws_servicequotas_service_quota" {
+    defaults = { value = 40 }
+  }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }
@@ -283,8 +288,8 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
     error_message = "The demo's place task must have 16 vCPU and 64 GiB."
   }
   assert {
-    condition     = aws_ecs_service.place[0].desired_count == 1 && aws_ecs_service.place[0].deployment_maximum_percent == 100
-    error_message = "A bigger place task is still exactly one task."
+    condition     = aws_ecs_service.place[0].desired_count == 1 && aws_ecs_service.place[0].deployment_maximum_percent == 200
+    error_message = "A bigger place task is still one task, started before the old one stops."
   }
   assert {
     condition = contains(
@@ -386,7 +391,7 @@ run "place_must_stay_under_the_base_domain" {
   expect_failures = [var.place_hostname]
 }
 
-run "place_runs_as_exactly_one_instance" {
+run "place_runs_one_task_and_deploys_start_first" {
   command = apply
 
   assert {
@@ -394,8 +399,12 @@ run "place_runs_as_exactly_one_instance" {
     error_message = "place runs one task."
   }
   assert {
-    condition     = aws_ecs_service.place[0].deployment_maximum_percent == 100 && aws_ecs_service.place[0].deployment_minimum_healthy_percent == 0
-    error_message = "A deploy must stop the old place task before starting the new one: two at once would run two merger bots on two in-memory queues."
+    condition     = aws_ecs_service.place[0].deployment_maximum_percent == 200 && aws_ecs_service.place[0].deployment_minimum_healthy_percent == 100
+    error_message = "A deploy must start the new place task before stopping the old one, so the page stays up (stop-first gave about two minutes of 503s)."
+  }
+  assert {
+    condition     = aws_lb_target_group.place[0].stickiness[0].enabled && aws_lb_target_group.place[0].stickiness[0].type == "lb_cookie"
+    error_message = "A browser stays on one place task while two overlap, so its snapshot and event feed come from the same task."
   }
   assert {
     condition     = aws_ecs_service.place[0].launch_type == "FARGATE" && length(aws_ecs_service.place[0].capacity_provider_strategy) == 0
@@ -651,4 +660,40 @@ run "only_staging_and_demo" {
   }
 
   expect_failures = [var.environment]
+}
+
+run "a_fargate_quota_too_small_for_a_start_first_place_deploy_warns" {
+  # The account default, 30 vCPU, is below two 16 vCPU place tasks plus
+  # two Aspen tasks.
+  command = plan
+
+  override_data {
+    target = data.aws_servicequotas_service_quota.fargate_vcpu
+    values = { value = 30 }
+  }
+
+  variables {
+    environment = "demo"
+  }
+
+  expect_failures = [check.place_deploy_fits_fargate_quota]
+}
+
+run "the_fargate_quota_check_counts_every_service_twice" {
+  # 34 vCPU: two 16 vCPU place tasks and two 1 vCPU Aspen tasks.
+  command = plan
+
+  override_data {
+    target = data.aws_servicequotas_service_quota.fargate_vcpu
+    values = { value = 34 }
+  }
+
+  variables {
+    environment = "demo"
+  }
+
+  assert {
+    condition     = local.ondemand_vcpu_units == 34 * 1024
+    error_message = "A start-first deploy of place and Aspen at once needs twice each service's vCPU."
+  }
 }

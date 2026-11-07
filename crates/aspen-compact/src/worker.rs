@@ -1,5 +1,5 @@
-//! The background worker: claims `compact` and `index_commits` jobs and
-//! runs sweeps.
+//! The background worker: claims `compact`, `index_commits` and
+//! `rewrite_pack` jobs and runs sweeps.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -9,14 +9,14 @@ use aspen_core::error::StoreError;
 use aspen_core::id::{JobId, UnixMicros};
 use aspen_core::meta::{JobEvent, JobKind, JobTag, MetaStore};
 
-use crate::{CompactError, CompactReport, Compactor, GcReport, IndexReport};
+use crate::{CompactError, CompactReport, Compactor, GcReport, IndexReport, RewriteReport};
 
 /// How the worker paces itself.
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
     /// The worker's name in job leases; unique per worker. After a claim
-    /// whose answer it did not get, the worker gives back every `compact`
-    /// and `index_commits` job leased under this name, so no other worker
+    /// whose answer it did not get, the worker gives back every job of the
+    /// kinds it claims ([`Worker::TAGS`]) leased under this name, so no other worker
     /// may lease those kinds under it. `aspen serve` and `aspen dev` use
     /// the host name, process ID and a random suffix.
     pub owner: String,
@@ -55,6 +55,8 @@ pub enum JobReport {
     Compact(CompactReport),
     /// An `index_commits` job.
     Index(IndexReport),
+    /// A `rewrite_pack` job.
+    Rewrite(RewriteReport),
 }
 
 /// The end of one job.
@@ -80,16 +82,14 @@ pub enum JobOutcome {
     },
 }
 
-/// The job kinds the worker claims.
-const TAGS: [JobTag; 2] = [JobTag::Compact, JobTag::IndexCommits];
-
 /// First wait before recording a job's outcome again after a transient
 /// store error; it doubles up to [`OUTCOME_RETRY_MAX`].
 const OUTCOME_RETRY_FIRST: Duration = Duration::from_millis(50);
 /// Longest wait between attempts to record a job's outcome.
 const OUTCOME_RETRY_MAX: Duration = Duration::from_secs(5);
 
-/// Claims `compact` and `index_commits` jobs one at a time and runs a sweep
+/// Claims `compact`, `index_commits` and `rewrite_pack` jobs
+/// ([`Worker::TAGS`]) one at a time and runs a sweep
 /// every [`WorkerOptions::gc_every`].
 ///
 /// A transient store error ([`StoreError::Unavailable`]: a failover, a
@@ -122,6 +122,14 @@ pub struct Worker<M, B> {
     release_pending: bool,
 }
 
+impl<M, B> Worker<M, B> {
+    /// The job kinds the worker claims. Every kind a production process
+    /// enqueues has a worker that claims it: these, and `mirror_push`
+    /// (`aspen-mirror`). A kind no worker claims stays queued for good
+    /// (reason-machines/aspen#10).
+    pub const TAGS: [JobTag; 3] = [JobTag::Compact, JobTag::IndexCommits, JobTag::RewritePack];
+}
+
 impl<M, B> Worker<M, B>
 where
     M: MetaStore,
@@ -136,7 +144,7 @@ where
         }
     }
 
-    /// Claims and runs one due `compact` or `index_commits` job; `None` if
+    /// Claims and runs one due job of a kind in [`Worker::TAGS`]; `None` if
     /// none is due.
     pub async fn run_one(&mut self) -> Result<Option<JobOutcome>, StoreError> {
         // Blob requests are counted under `compaction` (`aspen_blob_*`).
@@ -150,7 +158,7 @@ where
         let owner = &self.options.owner;
         if self.release_pending {
             meta.release_jobs(
-                &TAGS,
+                &Self::TAGS,
                 owner,
                 "given back after a claim whose answer was lost",
             )
@@ -160,7 +168,7 @@ where
         // The lease runs from the claim; read the time before it, so this
         // end is never later than the store's.
         let claimed_at = Instant::now();
-        let claimed = meta.claim_job(&TAGS, owner, self.options.lease).await;
+        let claimed = meta.claim_job(&Self::TAGS, owner, self.options.lease).await;
         self.release_pending = claimed.is_err();
         let Some(job) = claimed? else {
             return Ok(None);
@@ -179,6 +187,11 @@ where
                     .index_version(version)
                     .await
                     .map(JobReport::Index),
+                JobKind::RewritePack { pack } => self
+                    .compactor
+                    .rewrite_pack(pack)
+                    .await
+                    .map(JobReport::Rewrite),
                 other => Err(CompactError::Store(StoreError::Corrupt {
                     what: format!("job {} was claimed as compaction work: {other:?}", job.id),
                 })),

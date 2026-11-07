@@ -24,8 +24,9 @@ use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
     CommitLookup, CommitOutcome, CommitRow, CompactionHeat, Cover, CoverChain, GC_LEASE, JobEvent,
     JobKind, JobState, JobTag, Lease, MAX_JOB_ATTEMPTS, MAX_JOB_HEAT, MetaStore, NewCommit,
-    NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery, RefWrite,
-    SeqRange, ShallowDepth, ShallowRecorded, SweepBatch, VerifiedRange, VersionJob, VersionJobKind,
+    NewCover, NewJob, PackReferences, PackTombstone, PushCommit, RefChanges, RefCursor,
+    RefListQuery, RefWrite, SeqRange, ShallowDepth, ShallowRecorded, SweepBatch, VerifiedRange,
+    VersionJob, VersionJobKind,
 };
 use aspen_core::name::{RefName, RefPattern, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackGeneration, PackOrigin, entry_table_len};
@@ -144,6 +145,8 @@ const CASES: &[(&str, CaseFn)] = cases![
     unused_recordings_are_evicted_current_or_not,
     concurrent_recordings_never_overshoot_the_cap,
     a_recordings_repository_lock_never_blocks_pushes_or_compaction,
+    replace_pack_moves_every_reference_in_one_transaction,
+    replace_pack_refuses_a_mismatched_or_swept_replacement,
 ];
 
 async fn run_case(name: &str, url: &str, case: CaseFn) {
@@ -5299,4 +5302,152 @@ async fn a_recordings_repository_lock_never_blocks_pushes_or_compaction(c: Ctx) 
         ShallowRecorded::Recorded { .. }
     ));
     probe.pool().close().await;
+}
+
+// Replacing a pack with its base-first rewrite (reason-machines/aspen#10)
+
+/// `replace_pack` moves every ref version, cover and shallow pack
+/// recording naming the old pack to the new one, and nothing else: other
+/// packs' rows, and the `rewrite_pack` job on the old pack, keep their
+/// pack. `pack_references` counts what names a pack. The old pack is
+/// touched, so the sweep keeps it a whole grace period even once no job
+/// names it, and a repeat of the swap moves nothing.
+async fn replace_pack_moves_every_reference_in_one_transaction(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let t0 = c.now().0;
+
+    // Level 0: two versions of main name `old`, a third names `other`.
+    let old = pack(s, repo, 1).await;
+    let other = pack(s, repo, 2).await;
+    let v1 = advance(s, repo, MAIN, oid(1), old).await;
+    let v2 = advance(s, repo, MAIN, oid(2), old).await;
+    let v3 = advance(s, repo, MAIN, oid(3), other).await;
+    let new = pack(s, repo, 3).await;
+    let job = s
+        .enqueue_jobs(&[new_job(repo, JobKind::RewritePack { pack: old }, 0)])
+        .await
+        .unwrap()[0];
+    assert_eq!(
+        s.pack_references(old).await.unwrap(),
+        PackReferences {
+            versions: 2,
+            covers: 0,
+            shallow_packs: 0
+        }
+    );
+    assert!(s.pack_references(new).await.unwrap().is_empty());
+
+    c.set_time(t0 + 5 * GRACE_US);
+    let moved = s.replace_pack(old, new).await.unwrap();
+    assert_eq!(
+        moved,
+        PackReferences {
+            versions: 2,
+            covers: 0,
+            shallow_packs: 0
+        }
+    );
+    for (v, want) in [(v1.id, new), (v2.id, new), (v3.id, other)] {
+        let got = s.ref_version(v).await.unwrap().unwrap();
+        assert_eq!(got.value.pack(), Some(want), "version {v}");
+    }
+    assert!(s.pack_references(old).await.unwrap().is_empty());
+    assert_eq!(s.pack_references(new).await.unwrap().versions, 2);
+    // The job keeps naming the pack it repaired.
+    let j = s
+        .claim_job(&[JobTag::RewritePack], "w", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((j.id, j.kind), (job, JobKind::RewritePack { pack: old }));
+    // A repeat after a lost answer moves nothing.
+    assert!(s.replace_pack(old, new).await.unwrap().is_empty());
+
+    // Level 1: a cover and two shallow recordings name `l1_old`.
+    let cover = s
+        .insert_cover(&new_cover(repo, 1, 1, 16, None))
+        .await
+        .unwrap();
+    let l1_old = s
+        .register_pack(&compaction_pack(repo, 10, 1))
+        .await
+        .unwrap()
+        .id;
+    let l1_new = s
+        .register_pack(&compaction_pack(repo, 11, 1))
+        .await
+        .unwrap()
+        .id;
+    s.set_cover_pack(cover.id, l1_old).await.unwrap();
+    record(s, repo, v1.id, depth(1), l1_old).await.unwrap();
+    record(s, repo, v3.id, depth(2), l1_old).await.unwrap();
+    let moved = s.replace_pack(l1_old, l1_new).await.unwrap();
+    assert_eq!(
+        moved,
+        PackReferences {
+            versions: 0,
+            covers: 1,
+            shallow_packs: 2
+        }
+    );
+    assert_eq!(
+        s.covers(repo, &rn(MAIN)).await.unwrap()[0].pack,
+        Some(l1_new)
+    );
+    for (v, d) in [(v1.id, 1), (v3.id, 2)] {
+        let got = s.shallow_pack(repo, v, depth(d)).await.unwrap().unwrap();
+        assert_eq!(got.id, l1_new);
+    }
+
+    // Nothing names `l1_old` and no job does; the swap touched it, so the
+    // sweep keeps it a whole grace period after the swap, then deletes it.
+    let swap = c.now().0;
+    c.set_time(swap + GRACE_US - 1);
+    let swept = sweep(s).await;
+    assert!(!swept.contains(&l1_old), "{swept:?}");
+    c.set_time(swap + GRACE_US + 1);
+    let swept = sweep(s).await;
+    assert!(swept.contains(&l1_old), "{swept:?}");
+    // `old` is still named by its job, so it stays at any age.
+    assert!(!swept.contains(&old), "{swept:?}");
+    for p in [new, l1_new, other] {
+        assert!(!swept.contains(&p), "{p} is named: {swept:?}");
+    }
+}
+
+/// `replace_pack` refuses, writing nothing, a replacement of another
+/// repository or level, the same pack, and a missing old pack; a
+/// replacement the sweep took after its registration is retryable.
+async fn replace_pack_refuses_a_mismatched_or_swept_replacement(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/r").await.id;
+    let elsewhere = new_repo(s, "acme/o").await.id;
+    let t0 = c.now().0;
+    let old = pack(s, repo, 1).await;
+    let v = advance(s, repo, MAIN, oid(1), old).await;
+    let foreign = pack(s, elsewhere, 2).await;
+    let higher = s
+        .register_pack(&compaction_pack(repo, 3, 1))
+        .await
+        .unwrap()
+        .id;
+    for bad in [foreign, higher, old] {
+        assert!(is_conflict(s.replace_pack(old, bad).await), "{bad}");
+    }
+    let missing = PackId::new(1_000_000).unwrap();
+    assert!(matches!(
+        s.replace_pack(missing, old).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let swept = pack(s, repo, 4).await;
+    c.set_time(t0 + 2 * GRACE_US);
+    assert!(sweep(s).await.contains(&swept));
+    let r = s.replace_pack(old, swept).await;
+    assert!(matches!(&r, Err(e) if e.is_pack_swept()), "{r:?}");
+    assert_eq!(
+        s.ref_version(v.id).await.unwrap().unwrap().value.pack(),
+        Some(old)
+    );
+    assert_eq!(s.pack_references(old).await.unwrap().versions, 1);
 }

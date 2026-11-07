@@ -967,6 +967,337 @@ fn a_stored_pack_with_a_forward_base_pages_and_enqueues_a_rewrite() {
     assert!(second.is_none(), "one job per pack, not one per fetch");
 }
 
+/// The object ID of a loose object of `kind` (`blob`, `tree`, `commit`).
+fn object_id(kind: &str, data: &[u8]) -> aspen_core::id::ObjectId {
+    let mut h = format!("{kind} {}\0", data.len()).into_bytes();
+    h.extend_from_slice(data);
+    aspen_core::id::ObjectId::parse_hex(&sha1_hex(&h)).unwrap()
+}
+
+/// A pack of `entries` (type code, base for a REF_DELTA, data), in order,
+/// with its `.idx` and entry table. Nothing checks base-first: that is the
+/// point.
+fn hand_pack(
+    entries: &[(
+        u8,
+        Option<aspen_core::id::ObjectId>,
+        Vec<u8>,
+        aspen_core::id::ObjectId,
+    )],
+) -> (Vec<u8>, Vec<u8>, aspen_core::pack::EntryTable) {
+    use aspen_core::id::PackChecksum;
+    let mut pack = b"PACK\0\0\0\x02".to_vec();
+    pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    let mut idx = Vec::new();
+    for (ty, base, data, id) in entries {
+        let offset = pack.len() as u64;
+        let mut bytes = Vec::new();
+        aspen_pack::header::encode_type_and_size(*ty, data.len() as u64, &mut bytes);
+        if let Some(b) = base {
+            bytes.extend_from_slice(b.as_bytes());
+        }
+        bytes.extend_from_slice(&zlib(data));
+        let mut crc = flate2::Crc::new();
+        crc.update(&bytes);
+        pack.extend_from_slice(&bytes);
+        idx.push(aspen_pack::idx::IdxEntry {
+            id: *id,
+            offset,
+            crc32: crc.sum(),
+        });
+    }
+    let checksum = PackChecksum::parse_hex(&sha1_hex(&pack)).unwrap();
+    pack.extend_from_slice(checksum.as_bytes());
+    idx.sort_by_key(|e| e.id);
+    let idx = aspen_pack::idx::write(idx, &checksum);
+    let parsed = aspen_pack::idx::IdxV2::parse(&idx, Some(pack.len() as u64)).unwrap();
+    let table = aspen_pack::entries::build(std::io::Cursor::new(&pack), pack.len() as u64, &parsed)
+        .unwrap();
+    (pack, idx, table)
+}
+
+/// Invariant (reason-machines/aspen#10; S1, fetch path step 4): the
+/// `rewrite_pack` job a forward-base page enqueues is claimed by the
+/// production worker (`aspen_compact::Worker` with its default options)
+/// and repairs the pack: afterwards the same fetch succeeds and the clone
+/// passes `git fsck --strict`. The repair is a new pack row that passes
+/// `verify_pack` and holds exactly the old pack's objects; every version
+/// that named the old pack names the new one, and nothing names the old
+/// one. Running the job again, or a job on the new pack, finds nothing to
+/// do and writes nothing.
+#[test]
+fn the_rewrite_pack_job_repairs_a_stored_pack_and_the_fetch_succeeds() {
+    use aspen_blob::LocalBlobStore;
+    use aspen_compact::{
+        CompactConfig, Compactor, JobOutcome, JobReport, RewriteReport, RewriteSkipped, Worker,
+        WorkerOptions,
+    };
+    use aspen_core::blob::BlobStore;
+    use aspen_core::id::ObjectId;
+    use aspen_core::meta::{JobKind, MetaStore, NewJob, PushCommit, RefWrite};
+    use aspen_core::name::RefName;
+    use aspen_core::pack::{NewPack, PackOrigin, entry_table_len};
+    use aspen_core::refs::{Closure, Deps, RefValue};
+    use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
+
+    let env = Env::new();
+    let src = env.source();
+    let c1 = env.commit(&src, "f", "x\n");
+    let s = TestServer::start(|_| {});
+    let seed = s.seeder("demo", "refs/heads/main", &src);
+    let trunk = s.push(&seed, &Push::new("refs/heads/main", &c1));
+
+    // refs/heads/bad: one commit adding two files, the second's blob a
+    // delta of the first's. Its pack holds the commit, its tree and both
+    // blobs, but the delta comes before its base.
+    let base = b"the base blob of a forward delta, long enough to delta against\n".to_vec();
+    let result = b"the delta's result\n".to_vec();
+    fs::write(src.join("base.txt"), &base).unwrap();
+    fs::write(src.join("result.txt"), &result).unwrap();
+    run(env.git(&src).args(["add", "base.txt", "result.txt"]));
+    run(env
+        .git(&src)
+        .args(["commit", "--quiet", "-m", "forward delta"]));
+    let c2 = rev(&env, &src, "HEAD");
+    let cat = |kind: &str, what: &str| {
+        let out = env
+            .git(&src)
+            .args(["cat-file", kind, what])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out.stdout
+    };
+    let commit = cat("commit", &c2);
+    let tree = cat("tree", &format!("{c2}^{{tree}}"));
+    let (base_id, result_id) = (object_id("blob", &base), object_id("blob", &result));
+    let mut delta = vec![base.len() as u8, result.len() as u8, result.len() as u8];
+    delta.extend_from_slice(&result);
+    let c2_id = ObjectId::parse_hex(&c2).unwrap();
+    // Type 1 is a commit, 2 a tree, 3 a blob and 7 a REF_DELTA.
+    let (pack, idx, table) = hand_pack(&[
+        (1, None, commit, c2_id),
+        (2, None, tree.clone(), object_id("tree", &tree)),
+        (7, Some(base_id), delta, result_id),
+        (3, None, base, base_id),
+    ]);
+    assert!(table.check_layout().is_err(), "the pack is not base-first");
+    let repo = seed.repo().id;
+    let old = s
+        .block_on(s.meta.register_pack(&NewPack {
+            repo,
+            checksum: *table.checksum(),
+            size: pack.len() as u64,
+            idx_size: idx.len() as u64,
+            entries_size: entry_table_len(4),
+            object_count: 4,
+            ref_delta_count: 1,
+            origin: PackOrigin::Push {
+                received_bytes: pack.len() as u64,
+            },
+        }))
+        .unwrap();
+    let keys = old.keys();
+    for (key, bytes) in [
+        (&keys.pack, pack.clone()),
+        (&keys.idx, idx),
+        (&keys.entries, table.encode()),
+    ] {
+        let file = env.path("blob");
+        fs::write(&file, bytes).unwrap();
+        s.block_on(s.blobs.upload_file(key, &file)).unwrap();
+    }
+    let bad = s
+        .block_on(s.meta.commit_push(&PushCommit {
+            repo,
+            writes: vec![RefWrite {
+                name: RefName::new("refs/heads/bad").unwrap(),
+                expected: None,
+                value: RefValue::Live {
+                    tip: c2_id,
+                    pack: Some(old.id),
+                    closure: Closure::Wider,
+                },
+                deps: Deps {
+                    trunk: Some(trunk.id),
+                    scoped_old: None,
+                },
+                commits: vec![aspen_core::meta::NewCommit {
+                    commit: c2_id,
+                    parents: vec![ObjectId::parse_hex(&c1).unwrap()],
+                    committer_time: 0,
+                    generation: None,
+                    root_tree: None,
+                }],
+                jobs: Vec::new(),
+            }],
+        }))
+        .unwrap();
+    let bad = match bad {
+        aspen_core::meta::CommitOutcome::Committed(mut v) => v.remove(0),
+        other => panic!("{other:?}"),
+    };
+
+    let fetch = |name: &str| {
+        let client = env.path(name);
+        fs::create_dir_all(&client).unwrap();
+        run(env.git(&client).args(["init", "--quiet"]));
+        let mut cmd = env.git(&client);
+        cmd.args([
+            "-c",
+            "fetch.fsckObjects=true",
+            "fetch",
+            &s.url("demo"),
+            "refs/heads/bad:refs/heads/bad",
+        ]);
+        (client, cmd)
+    };
+    let (_, mut cmd) = fetch("before");
+    let err = run_fails(&mut cmd);
+    assert!(err.contains("forward delta base"), "{err}");
+    assert_eq!(s.metrics().forward_base_alerts(), 1);
+
+    // The production worker, as `aspen serve` runs it.
+    let spool = env.path("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let blobs: LocalBlobStore = s.blobs.clone();
+    let config = CompactConfig::new(
+        &spool,
+        MaxObjectBytes::new(1 << 20).unwrap(),
+        MaxInflatedBytes::new(1 << 24).unwrap(),
+    );
+    let mut worker = Worker::new(
+        Compactor::new(s.meta.clone(), blobs, config),
+        WorkerOptions::new("test-worker"),
+    );
+    let outcome = s.block_on(worker.run_one()).unwrap().expect("a job is due");
+    let JobOutcome::Done {
+        job,
+        report:
+            JobReport::Rewrite(RewriteReport::Rewritten {
+                new_pack,
+                moved,
+                replaced,
+            }),
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(moved, 2, "the delta and its base swapped places");
+    assert_eq!(replaced.versions, 1);
+    let done = s.block_on(s.meta.job(job)).unwrap().unwrap();
+    assert_eq!(done.kind, JobKind::RewritePack { pack: old.id });
+    assert_eq!(done.attempts, 1);
+    assert_eq!(done.state, aspen_core::meta::JobState::Done);
+
+    // The version names the new pack, which verifies and holds exactly the
+    // old pack's objects; nothing names the old one, whose blobs remain.
+    let now = s.block_on(s.meta.ref_version(bad.id)).unwrap().unwrap();
+    assert_eq!(now.value.pack(), Some(new_pack));
+    assert!(
+        s.block_on(s.meta.pack_references(old.id))
+            .unwrap()
+            .is_empty()
+    );
+    let new = s.block_on(s.meta.packs(&[new_pack])).unwrap().remove(0);
+    assert_eq!(
+        (new.pack.repo, new.pack.object_count, new.pack.origin),
+        (repo, 4, old.pack.origin)
+    );
+    assert_ne!(new.pack.checksum, old.pack.checksum);
+    let read = |key, size| {
+        s.block_on(
+            s.blobs
+                .read_exact_range(key, aspen_core::blob::ByteRange::new(0, size).unwrap()),
+        )
+        .unwrap()
+        .to_vec()
+    };
+    let new_keys = new.keys();
+    let stored = env.path("new.pack");
+    fs::write(&stored, read(&new_keys.pack, new.pack.size)).unwrap();
+    let scratch = env.path("verify");
+    fs::create_dir_all(&scratch).unwrap();
+    let verified = aspen_pack::verify::verify_pack(
+        &stored,
+        &scratch,
+        MaxObjectBytes::new(1 << 20).unwrap(),
+        MaxInflatedBytes::new(1 << 24).unwrap(),
+    )
+    .expect("the rewritten pack verifies");
+    assert_eq!(verified.idx, read(&new_keys.idx, new.pack.idx_size));
+    assert_eq!(
+        verified.table.encode(),
+        read(&new_keys.entries, new.pack.entries_size)
+    );
+    let ids = |t: &aspen_core::pack::EntryTable| {
+        let mut v: Vec<ObjectId> = t.entries().iter().map(|e| e.id).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids(&verified.table), ids(&table));
+    assert_eq!(read(&keys.pack, old.pack.size), pack, "old blobs stay");
+
+    // The same fetch now succeeds and the clone is sound.
+    let (client, mut cmd) = fetch("after");
+    run(&mut cmd);
+    assert_eq!(rev(&env, &client, "refs/heads/bad"), c2);
+    fsck(&env, &client);
+    assert_eq!(
+        run(env
+            .git(&client)
+            .args(["cat-file", "blob", "refs/heads/bad:result.txt"])),
+        "the delta's result\n"
+    );
+    assert_eq!(s.metrics().forward_base_alerts(), 1);
+
+    // Idempotent: a rewrite of the replaced pack (a requeue, or a fetch
+    // that planned before the swap) and one of the new, base-first pack
+    // each find nothing to do and write no pack.
+    let packs_before = s.block_on(async {
+        sqlx::query("SELECT COUNT(*) AS n FROM packs")
+            .fetch_one(s.meta.pool())
+            .await
+            .unwrap()
+    });
+    let count = |row: &sqlx::any::AnyRow| sqlx::Row::get::<i64, _>(row, "n");
+    for (pack, why) in [
+        (old.id, RewriteSkipped::Unreferenced),
+        (new_pack, RewriteSkipped::AlreadyBaseFirst),
+    ] {
+        let id = s
+            .block_on(s.meta.enqueue_jobs(&[NewJob {
+                repo,
+                kind: JobKind::RewritePack { pack },
+                run_after: aspen_core::id::UnixMicros(0),
+            }]))
+            .unwrap()[0];
+        let outcome = s.block_on(worker.run_one()).unwrap();
+        assert_eq!(
+            outcome,
+            Some(JobOutcome::Done {
+                job: id,
+                report: JobReport::Rewrite(RewriteReport::Skipped(why)),
+            })
+        );
+    }
+    let packs_after = s.block_on(async {
+        sqlx::query("SELECT COUNT(*) AS n FROM packs")
+            .fetch_one(s.meta.pool())
+            .await
+            .unwrap()
+    });
+    assert_eq!(count(&packs_after), count(&packs_before), "nothing written");
+    assert_eq!(
+        s.block_on(s.meta.ref_version(bad.id))
+            .unwrap()
+            .unwrap()
+            .value
+            .pack(),
+        Some(new_pack)
+    );
+}
+
 /// Invariant (coordinator review of #34): a clone of many branches, each
 /// with two branch-scoped pushes (so each branch's older version is reached
 /// only through its `scoped_old` dependency), plans in a few loading rounds

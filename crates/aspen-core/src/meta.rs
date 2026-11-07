@@ -554,6 +554,29 @@ pub enum ShallowRecorded {
     },
 }
 
+/// The rows that name one pack, counted by table: what
+/// [`MetaStore::pack_references`] found, or what
+/// [`MetaStore::replace_pack`] moved to the replacement.
+///
+/// Jobs are not counted: a `rewrite_pack` job names the pack it repairs
+/// but does not make anything serve it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackReferences {
+    /// `ref_versions` rows whose pack it is.
+    pub versions: u64,
+    /// `covers` rows whose compaction pack it is.
+    pub covers: u64,
+    /// `shallow_packs` recordings of it.
+    pub shallow_packs: u64,
+}
+
+impl PackReferences {
+    /// Whether nothing names the pack.
+    pub fn is_empty(&self) -> bool {
+        self.versions == 0 && self.covers == 0 && self.shallow_packs == 0
+    }
+}
+
 /// A `packs` row that garbage collection deleted and whose blobs it has
 /// not yet finished deleting ([`MetaStore::sweep_orphan_packs`]). The
 /// generation names the deleted row's keys; a later registration of the
@@ -1872,6 +1895,51 @@ pub trait MetaStore: Send + Sync {
         unused_after: Duration,
         limit: u32,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
+
+    /// The ref versions, covers and shallow pack recordings that name
+    /// `pack` (counts per table; [`PackReferences`]). A pack nothing names
+    /// is served by no fetch, so a `rewrite_pack` job on it has nothing to
+    /// repair.
+    fn pack_references(
+        &self,
+        pack: PackId,
+    ) -> impl Future<Output = Result<PackReferences, StoreError>> + Send;
+
+    /// Replaces stored pack `old` with `new` everywhere it is named, in one
+    /// transaction: every ref version, cover and shallow pack recording
+    /// that names `old` names `new` instead. Returns what moved. Jobs are
+    /// not changed: the `rewrite_pack` job that calls this keeps naming
+    /// `old`, which keeps `old` stored ([`MetaStore::sweep_orphan_packs`]
+    /// counts any job, done or not), because in-process caches of a push's
+    /// search packs may keep `old`'s ID for the life of a process.
+    ///
+    /// This is the one change of a committed row's pack (`docs/PLAN.md`,
+    /// decisions log, reason-machines/aspen#10): the `rewrite_pack` job uses
+    /// it to swap in the base-first rewrite of a pack that broke the
+    /// base-first invariant. The caller guarantees that `new` holds exactly
+    /// `old`'s objects, so every closure, cover and shallow region stays
+    /// what it was; the store cannot check that. `new` must be a registered
+    /// pack of the same repository at the same level as `old` (a cover's
+    /// pack must be at the cover's level), with its blobs uploaded
+    /// (writers register, then upload, then reference).
+    ///
+    /// `old` is also touched as [`MetaStore::evict_shallow_packs`] touches
+    /// the packs it evicts, so even with no job naming it the sweep would
+    /// keep its row and blobs for a whole grace period after the swap: a
+    /// fetch that read `old`'s ID just before may still be reading it.
+    ///
+    /// [`StoreError::NotFound`] if `old` does not exist;
+    /// [`StoreError::Unavailable`] ([`StoreError::pack_swept`]) if `new`
+    /// was swept after it was registered, so the caller registers and
+    /// uploads it again; [`StoreError::Conflict`] if the two are the same
+    /// pack, or are of different repositories or levels. Replacing a pack
+    /// nothing names moves nothing and is not an error, so a repeat after
+    /// a lost answer is harmless.
+    fn replace_pack(
+        &self,
+        old: PackId,
+        new: PackId,
+    ) -> impl Future<Output = Result<PackReferences, StoreError>> + Send;
 
     /// Enqueues jobs, idempotently: a job whose kind and target (ref version
     /// or pack) already have a job that is not done is not added again, so

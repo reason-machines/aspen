@@ -253,6 +253,19 @@ impl MetaStore for Flaky {
             .evict_shallow_packs(superseded_after, unused_after, limit)
             .await
     }
+    async fn pack_references(
+        &self,
+        pack: aspen_core::id::PackId,
+    ) -> Result<aspen_core::meta::PackReferences, StoreError> {
+        self.inner.pack_references(pack).await
+    }
+    async fn replace_pack(
+        &self,
+        old: aspen_core::id::PackId,
+        new: aspen_core::id::PackId,
+    ) -> Result<aspen_core::meta::PackReferences, StoreError> {
+        self.inner.replace_pack(old, new).await
+    }
     async fn enqueue_jobs(&self, jobs: &[NewJob]) -> Result<Vec<JobId>, StoreError> {
         self.inner.enqueue_jobs(jobs).await
     }

@@ -203,6 +203,11 @@ paths:
         the snapshot's `seq`. Without `after`, the stream starts at the live
         edge.
 
+        Each server instance numbers its own feed. Pass the snapshot's
+        `instance` with `after`: when it names another instance (a client
+        that reconnects to a different task during a deploy), the server
+        sends `resync` instead of reading the cursor against its own feed.
+
         Swarm pushes can reach `SwarmStatus.pushesPerSecondCap` events per
         second; clients should batch rendering.
 
@@ -217,6 +222,11 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 0 }
+        - name: instance
+          in: query
+          required: false
+          description: The snapshot's `instance`; another instance's gets a `resync`.
+          schema: { type: string }
         - name: Last-Event-ID
           in: header
           required: false
@@ -446,6 +456,11 @@ components:
       required: [seq, mergedThroughSeq, mainCommit, width, height, pixels, branches]
       properties:
         seq: { type: integer, minimum: 0, description: The last event this snapshot includes. }
+        instance:
+          {
+            type: string,
+            description: The server instance whose event feed `seq` counts; pass it to `GET /events` with `after`.,
+          }
         mergedThroughSeq: { type: integer, minimum: 0, description: Every push with seq at or below this is in main. }
         mainCommit: { $ref: "#/components/schemas/Oid" }
         width: { type: integer, minimum: 1 }
@@ -632,6 +647,7 @@ components:
       properties:
         type: { const: resync }
         seq: { type: integer, minimum: 0 }
+        instance: { type: string, description: The instance whose feed `seq` counts. }
         at: { $ref: "#/components/schemas/Timestamp" }
     Event:
       oneOf:
