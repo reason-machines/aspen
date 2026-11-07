@@ -958,10 +958,11 @@ fn prefetch_round_trips_do_not_grow_with_chain_depth() {
     // delta chain costs the same round trips at depth 50, what `git gc` and
     // compaction write, as at depth 1, whether the pack's `.idx` is kept
     // whole (chain map in memory) or sampled (chain map on local disk).
-    // Warm, a whole pack reads the chain in one round; a sampled one looks
-    // the object up (one round) and then reads the chain (one more). Before
-    // chain maps a chain cost one round per level: 51 at depth 50, about
-    // 1 s on S3. A sampled pack without a chain directory still does.
+    // Warm, a whole pack reads the chain in one round, and so does a
+    // sampled one, which looks the object up in its local copy of the
+    // `.idx` (12b; it took a round of its own before). Before chain maps a
+    // chain cost one round per level: 51 at depth 50, about 1 s on S3. A
+    // sampled pack without a local directory still does, plus the lookup.
     let dir = scratch();
     let (rows, blobs) = (Rows::default(), Blobs::default());
     let lock = Lockstep {
@@ -982,7 +983,7 @@ fn prefetch_round_trips_do_not_grow_with_chain_depth() {
             };
             let mut stored = StoredPacks::new(&rows, &lock, options);
             if mode == "sampled" {
-                stored = stored.with_chain_dir(&chains);
+                stored = stored.with_local_dir(&chains);
             }
             let (cold, cold_rounds) = lock.run(stored.prefetch_bases(&search, &candidates(&[top])));
             let (warm, warm_rounds) = lock.run(stored.prefetch_bases(&search, &candidates(&[top])));
@@ -998,7 +999,7 @@ fn prefetch_round_trips_do_not_grow_with_chain_depth() {
     for (depth, mode, cold, warm) in measured {
         match mode {
             "whole" => assert_eq!((cold, warm), (2, 1), "depth {depth}, {mode}"),
-            "sampled" => assert_eq!(warm, 2, "depth {depth}, {mode}"),
+            "sampled" => assert_eq!(warm, 1, "depth {depth}, {mode}"),
             _ => assert_eq!(warm, depth + 2, "depth {depth}, {mode}"),
         }
     }
@@ -1048,6 +1049,29 @@ fn a_lookup_probes_every_sampled_pack_in_one_round_trip() {
     let again = again.unwrap();
     assert_eq!(again, ready(whole.locate(&search, &want)).unwrap());
     assert_eq!(rounds, 1, "5 sampled packs, warm");
+    // With local copies of their lookup sections (12b), a warm lookup reads
+    // nothing, and answers the same, in either probe order.
+    let local = StoredPacks::new(
+        &rows,
+        &lock,
+        LocateOptions {
+            max_whole_idx_bytes: 0,
+            ..LocateOptions::new(MAX_OBJECT)
+        },
+    )
+    .with_local_dir(dir.path().join("local"));
+    for order in [
+        SearchPacks::new(ids.iter().copied()),
+        SearchPacks::new(ids.iter().rev().copied()),
+    ] {
+        let (cold, _) = lock.run(local.locate(&order, &want));
+        let (warm, rounds) = lock.run(local.locate(&order, &want));
+        let want_found = ready(whole.locate(&order, &want)).unwrap();
+        assert_eq!(cold.unwrap(), want_found);
+        assert_eq!(warm.unwrap(), want_found);
+        assert_eq!(rounds, 0, "5 sampled packs with local copies, warm");
+    }
+    assert!(local.stats().local_lookups > 0);
     let at = want
         .as_slice()
         .iter()
@@ -1090,7 +1114,7 @@ fn a_damaged_entry_table_never_gives_a_wrong_base() {
                 ..LocateOptions::new(MAX_OBJECT)
             },
         )
-        .with_chain_dir(dir.path().join("chains"));
+        .with_local_dir(dir.path().join("chains"));
         match ready(stored.prefetch(&search, &candidates(&[top]))) {
             Err(e) => assert!(e.is_corruption(), "{e}"),
             Ok(pre) => {

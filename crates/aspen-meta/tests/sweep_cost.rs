@@ -17,13 +17,17 @@
 //! 2. runs the new sweep, batch after batch, until it has caught up, while
 //!    concurrent writers register packs and commit ref versions, and
 //!    checks every batch read at most twice its limit, every orphan is
-//!    gone, no named pack is, and no write failed;
+//!    gone, no named pack is, and no write failed (on SQLite, writers that
+//!    lost the write lock to the sweep's back-to-back batches for the whole
+//!    lock timeout used to fail with "database is locked": the store's
+//!    write queue, `crates/aspen-meta/src/tx.rs`);
 //! 3. times one caught-up batch, the steady state.
 //!
 //! Required CI runs `N` = 20,000 on SQLite and PostgreSQL and checks, on
 //! both, that the two scans are index range scans (the plans). Nightly runs
 //! `N` = 1,000,000 (the tests marked `#[ignore]`) and also checks that the
-//! caught-up batch costs less than a tenth of the old query. Run one with
+//! caught-up batch costs less than a tenth of the old query, and that no
+//! write waited a quarter of the lock timeout. Run one with
 //! the numbers printed:
 //!
 //! ```text
@@ -42,7 +46,7 @@ use aspen_core::name::{RefName, RepoName};
 use aspen_core::pack::{NewPack, PackOrigin, entry_table_len};
 use aspen_core::refs::{Closure, Deps, RefValue};
 use aspen_core::repo::RepoSettings;
-use aspen_meta::{Dialect, SWEEP_AUDIT_SQL, SWEEP_WALK_SQL, SqlStore};
+use aspen_meta::{Dialect, SWEEP_AUDIT_SQL, SWEEP_WALK_SQL, SqlStore, StoreOptions};
 use sqlx::{AssertSqlSafe, Row as _};
 
 use common::PgCluster;
@@ -113,9 +117,14 @@ async fn measure(url: &str, n: i64, compare_time: bool) {
 
     let old_due = old_query(&store).await;
 
-    // The sweep on a store of its own, as `aspen serve` gives it a pool of
-    // its own on Postgres; writers on the other.
-    let gc = SqlStore::connect(url).await.unwrap();
+    // The sweep runs where `aspen serve` runs it: on Postgres, on a store
+    // with a pool of its own, the writers on the other; on SQLite, which
+    // has one writer at a time whatever the pool, on the writers' store, so
+    // the sweep and the writers wait for the write lock in one queue.
+    let gc = match dialect {
+        Dialect::Postgres => SqlStore::connect(url).await.unwrap(),
+        Dialect::Sqlite => store.clone(),
+    };
     let lease = gc
         .acquire_lease(GC_LEASE, "sweep-cost", Duration::from_secs(3600))
         .await
@@ -155,9 +164,11 @@ async fn measure(url: &str, n: i64, compare_time: bool) {
     }
     let catch_up = started.elapsed();
     done.store(true, Ordering::SeqCst);
-    let mut write_errors = Vec::new();
+    let (mut write_errors, mut slowest_write) = (Vec::new(), Duration::ZERO);
     for w in writers {
-        write_errors.extend(w.await.unwrap());
+        let (errors, slowest) = w.await.unwrap();
+        write_errors.extend(errors);
+        slowest_write = slowest_write.max(slowest);
     }
     let pushes = pushed.load(Ordering::SeqCst);
 
@@ -192,10 +203,19 @@ async fn measure(url: &str, n: i64, compare_time: bool) {
         "{dialect:?}, {n} packs: old candidate query {old_due:?} with orphans due, \
          {old_steady:?} with none (every pass); new sweep caught up in {batches} batches \
          over {catch_up:?} (slowest {slowest:?}, at most {most} rows), {pushes} writes \
-         alongside, none failed; caught-up batch {steady_time:?} ({} rows)",
+         alongside, none failed, slowest {slowest_write:?}; caught-up batch {steady_time:?} \
+         ({} rows)",
         steady.examined
     );
     if compare_time {
+        // A writer waits its turn behind a few others, never most of the
+        // lock timeout, after which it would fail.
+        let lock_timeout = StoreOptions::default().lock_timeout;
+        assert!(
+            slowest_write * 4 < lock_timeout,
+            "a write took {slowest_write:?} during the sweep, past a quarter of the \
+             {lock_timeout:?} lock timeout"
+        );
         assert!(
             steady_time * 10 < old_steady,
             "a caught-up batch ({steady_time:?}) is not a tenth of the old query ({old_steady:?})"
@@ -261,7 +281,15 @@ async fn seed(store: &SqlStore, repo: RepoId, n: i64) {
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("ANALYZE").execute(pool).await.unwrap();
+    // On Postgres, vacuum too: autovacuum sets the visibility map soon after
+    // a bulk insert, and from then on the planner may read `packs` with an
+    // index-only scan. Whether it had yet depended on the machine's speed,
+    // so check the plans of that steady state.
+    let analyze = match store.dialect() {
+        Dialect::Postgres => "VACUUM (ANALYZE)",
+        Dialect::Sqlite => "ANALYZE",
+    };
+    sqlx::query(analyze).execute(pool).await.unwrap();
 }
 
 /// The sweep's candidate query as it was before migration 0009 (crates/
@@ -298,7 +326,11 @@ async fn old_query(store: &SqlStore) -> Duration {
 }
 
 /// Both scans of a sweep batch read an index range, not a table: the walk
-/// uses `pack_touches_due`, the audit the `packs` primary key.
+/// uses `pack_touches_due`, the audit an index of `packs` led by `id`. On
+/// Postgres that is the primary key or, once the table is vacuumed, often
+/// `packs_id_repo_unique` (`id, repo_id`), which holds both columns the
+/// audit reads and so needs no heap fetch; either reads from the audit
+/// cursor in order.
 async fn check_plans(store: &SqlStore) {
     let walk = SWEEP_WALK_SQL
         .replace("$1", "0")
@@ -307,15 +339,34 @@ async fn check_plans(store: &SqlStore) {
         .replace("$4", "1000");
     // Deep in the table, where a scan from the start would show.
     let audit = SWEEP_AUDIT_SQL.replace("$1", "15000").replace("$2", "1000");
-    for (what, sql, index) in [
-        ("walk", walk, "pack_touches_due"),
-        ("audit", audit, "packs_pkey"),
+    for (what, sql, indexes, cond) in [
+        (
+            "walk",
+            walk,
+            &["pack_touches_due"][..],
+            "Index Cond: ((ROW(touched_at_us, pack_id) > ROW(0, 0))",
+        ),
+        (
+            "audit",
+            audit,
+            &["packs_pkey", "packs_id_repo_unique"][..],
+            "Index Cond: (id > 15000)",
+        ),
     ] {
         let plan = explain(store, &sql).await;
         eprintln!("{:?} plan of the {what}:\n{plan}", store.dialect());
         match store.dialect() {
             Dialect::Postgres => {
-                assert!(plan.contains(index), "{what}: no scan of {index}:\n{plan}");
+                assert!(
+                    indexes
+                        .iter()
+                        .any(|index| plan.contains(&format!(" using {index} on "))),
+                    "{what}: no scan of {indexes:?}:\n{plan}"
+                );
+                assert!(
+                    plan.contains(cond),
+                    "{what}: not a range from {cond}:\n{plan}"
+                );
                 assert!(
                     !plan.contains("Seq Scan"),
                     "{what}: a sequential scan:\n{plan}"
@@ -334,7 +385,7 @@ async fn check_plans(store: &SqlStore) {
                 let index = if what == "audit" {
                     "INTEGER PRIMARY KEY"
                 } else {
-                    index
+                    indexes[0]
                 };
                 assert!(
                     plan.contains(index),
@@ -363,15 +414,16 @@ async fn explain(store: &SqlStore, sql: &str) -> String {
 }
 
 /// Registers a new pack and commits a branch naming it, again and again,
-/// until `done`, as concurrent pushes do; returns every error.
+/// until `done`, as concurrent pushes do; returns every error, and the
+/// longest one write (registration and commit) took.
 async fn write_until(
     store: SqlStore,
     repo: RepoId,
     writer: u32,
     done: Arc<AtomicBool>,
     pushed: Arc<AtomicU64>,
-) -> Vec<String> {
-    let mut errors = Vec::new();
+) -> (Vec<String>, Duration) {
+    let (mut errors, mut slowest) = (Vec::new(), Duration::ZERO);
     let mut i = 0u32;
     while !done.load(Ordering::SeqCst) {
         i += 1;
@@ -388,6 +440,7 @@ async fn write_until(
             ref_delta_count: 0,
             origin: PackOrigin::Push { received_bytes: 80 },
         };
+        let begun = Instant::now();
         let result = async {
             let row = store.register_pack(&pack).await?;
             store
@@ -409,6 +462,7 @@ async fn write_until(
                 .await
         }
         .await;
+        slowest = slowest.max(begun.elapsed());
         match result {
             Ok(aspen_core::meta::CommitOutcome::Committed(_)) => {
                 pushed.fetch_add(1, Ordering::SeqCst);
@@ -417,7 +471,7 @@ async fn write_until(
             Err(e) => errors.push(e.to_string()),
         }
     }
-    errors
+    (errors, slowest)
 }
 
 async fn count(store: &SqlStore, table: &str) -> i64 {

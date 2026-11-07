@@ -557,8 +557,9 @@ pub const SWEEP_WALK_SQL: &str = "SELECT pack_id, touched_at_us FROM pack_touche
      ORDER BY touched_at_us, pack_id LIMIT $4";
 
 /// The sweep's audit: the `$2` packs after ID `$1`, with their
-/// registration times. A range scan of the `packs` primary key with one
-/// keyed lookup per row; public so tests can check its plan. The lookup is
+/// registration times. A range scan of an index of `packs` led by `id` (the
+/// primary key, or `packs_id_repo_unique` once the table is vacuumed) with
+/// one keyed lookup per row; public so tests can check its plan. The lookup is
 /// a subquery, not a join: Postgres plans a join as a merge that reads
 /// `pack_touches` from its start, which grows with the table.
 pub const SWEEP_AUDIT_SQL: &str = "SELECT p.id, p.repo_id, \
