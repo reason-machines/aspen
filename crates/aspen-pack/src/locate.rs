@@ -30,7 +30,16 @@
 //! - **Lookups** in sampled packs read a window's IDs and offsets together
 //!   (one round trip), and probe every sampled search pack at once, so a
 //!   lookup costs one round trip however many large packs the repository
-//!   has; probe order still decides which pack answers.
+//!   has; probe order still decides which pack answers. With a local
+//!   directory ([`StoredPacks::with_local_dir`]) the sample keeps a copy of
+//!   the sections lookups read on local disk, written while it is built
+//!   (`crate::sampled`), and a lookup sends no blob store request at all
+//!   (node 12b: a push looks up every object it brings, and each lookup in a
+//!   sampled `.idx` was two GETs).
+//! - **Local disk** ([`StoredPacks::with_local_dir`]): beside each sampled
+//!   `.idx` in the cache, its chain map (16 bytes per object) and its
+//!   lookup sections (24 bytes per object), in unnamed files deleted when
+//!   the sample leaves the cache.
 //! - **Memory** of a prefetch is bounded by
 //!   [`LocateOptions::max_prefetch_bytes`]: every inflated entry, every
 //!   intermediate chain result and every output object is charged before it
@@ -109,8 +118,10 @@ pub struct LocateOptions {
     /// Largest `.idx` kept whole (default 64 MiB, a pack of about 2.4
     /// million objects). A larger one is kept as a sample, one ID of every
     /// 256 (`crate::sampled`), and each lookup in it reads the 256 IDs that
-    /// can hold the object, and its offset, from the blob store: one read
-    /// of about 5 KiB plus one of 4 bytes, however large the pack. Without
+    /// can hold the object, and their offsets: from the sample's copy on
+    /// local disk when the locator has a directory for one
+    /// ([`StoredPacks::with_local_dir`]), else from the blob store (two
+    /// reads of about 5 KiB and 1 KiB), however large the pack. Without
     /// it, a repository whose `.idx` files outgrow
     /// [`Self::idx_cache_bytes`] (about 7 million objects at the default
     /// 256 MiB) reads them whole on every push. Keep it at most a quarter
@@ -358,6 +369,9 @@ pub struct LocateStats {
     /// Object IDs looked up (each once per call, however many packs it was
     /// probed in).
     pub ids_looked_up: u64,
+    /// Lookups in sampled `.idx` files answered from the sample's copy on
+    /// local disk, with no blob store read (one per sampled pack probed).
+    pub local_lookups: u64,
     /// Pack entries read from the blob store by prefetches.
     pub entries_read: u64,
     /// Misses that waited for another call's load of the same `.idx`
@@ -372,6 +386,7 @@ struct Counters {
     idx_bytes_read: AtomicU64,
     table_bytes_read: AtomicU64,
     ids_looked_up: AtomicU64,
+    local_lookups: AtomicU64,
     entries_read: AtomicU64,
     idx_load_waits: AtomicU64,
 }
@@ -442,9 +457,9 @@ pub struct StoredPacks<M, B> {
     object_hits: std::sync::atomic::AtomicU64,
     object_misses: std::sync::atomic::AtomicU64,
     counters: Counters,
-    /// Where sampled packs' chain maps are kept (`crate::chains`); `None`
-    /// keeps none.
-    chain_dir: Option<std::path::PathBuf>,
+    /// Where sampled packs' chain maps (`crate::chains`) and lookup
+    /// sections (`crate::sampled`) are kept; `None` keeps neither.
+    local_dir: Option<std::path::PathBuf>,
 }
 
 /// A resolved base object in the base-object cache.
@@ -463,16 +478,19 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             object_hits: Default::default(),
             object_misses: Default::default(),
             counters: Counters::default(),
-            chain_dir: None,
+            local_dir: None,
         }
     }
 
-    /// Keeps the chain maps of sampled packs in files in `dir`, a real
-    /// local disk (`crate::chains`): about 16 bytes per object of every
-    /// sampled pack in the `.idx` cache. Without it a chain in a sampled
-    /// pack costs a round trip per level.
-    pub fn with_chain_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.chain_dir = Some(dir.into());
+    /// Keeps, for every sampled pack in the `.idx` cache, its chain map
+    /// (`crate::chains`, 16 bytes per object) and the sections of its
+    /// `.idx` a lookup reads (`crate::sampled`, 24 bytes per object) in
+    /// files in `dir`, a real local disk: about 40 bytes per object in all,
+    /// deleted when the sample leaves the cache. Without it a chain in a
+    /// sampled pack costs a round trip per level, and each lookup in one
+    /// reads the blob store twice.
+    pub fn with_local_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.local_dir = Some(dir.into());
         self
     }
 
@@ -485,6 +503,7 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
             idx_bytes_read: c.idx_bytes_read.load(Relaxed),
             table_bytes_read: c.table_bytes_read.load(Relaxed),
             ids_looked_up: c.ids_looked_up.load(Relaxed),
+            local_lookups: c.local_lookups.load(Relaxed),
             entries_read: c.entries_read.load(Relaxed),
             idx_load_waits: c.idx_load_waits.load(Relaxed),
         }
@@ -598,17 +617,18 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
     }
 
     /// Reads one pack's `.idx`: whole with its chain map (the `.idx` and
-    /// the entry table read at once), or as a sample with its chain map on
-    /// disk when the locator has a directory for one.
+    /// the entry table read at once), or as a sample with its chain map and
+    /// lookup sections on disk when the locator has a directory for them.
     async fn load_one(&self, row: PackRecord, whole: bool) -> Result<Idx, StoreError> {
         if !whole {
+            let dir = self.local_dir.as_deref();
             let chains = async {
-                match &self.chain_dir {
+                match dir {
                     Some(dir) => self.load_chains(&row, dir).await,
                     None => Ok(None),
                 }
             };
-            let (chains, sampled) = futures_join(chains, self.load_sampled(row.clone())).await;
+            let (chains, sampled) = futures_join(chains, self.load_sampled(row.clone(), dir)).await;
             return Ok(Idx::Sampled(Arc::new(sampled?), chains?.map(Arc::new)));
         }
         let range = ByteRange::new(0, row.pack.idx_size)
@@ -672,11 +692,19 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
     }
 
     /// Streams a large `.idx` through [`SampleBuilder`], which checks all
-    /// of it and keeps one ID of every 256.
-    async fn load_sampled(&self, row: PackRecord) -> Result<SampledIdx, StoreError> {
+    /// of it and keeps one ID of every 256, and copies the sections lookups
+    /// read to `dir` when given.
+    async fn load_sampled(
+        &self,
+        row: PackRecord,
+        dir: Option<&std::path::Path>,
+    ) -> Result<SampledIdx, StoreError> {
         let key = row.keys().idx;
         let head = self.read_idx(&key, SampledIdx::head_range()).await?;
         let mut builder = SampleBuilder::new(row.clone(), &head).map_err(|e| corrupt(&row, e.0))?;
+        if let Some(dir) = dir {
+            builder = builder.copy_to(dir);
+        }
         let sections = builder.sections(SAMPLE_READ_ENTRIES);
         for group in sections.chunks(8) {
             let reads = join_bounded(group.iter().map(|(_, r)| self.read_idx(&key, *r)), 8).await;
@@ -805,8 +833,9 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
         Ok(out)
     }
 
-    /// The offset of `id` in a sampled pack: one round trip, reading the
-    /// IDs that can hold it and their offsets together (a second for a
+    /// The offset of `id` in a sampled pack: from the sample's local copy
+    /// when it has one (no blob store read), else one round trip, reading
+    /// the IDs that can hold it and their offsets together (a second for a
     /// large offset).
     async fn sampled_lookup(
         &self,
@@ -816,6 +845,10 @@ impl<M: PackRows, B: BlobStore> StoredPacks<M, B> {
         let Some((from, to, range)) = s.window(id) else {
             return Ok(None);
         };
+        if let Some(found) = s.lookup_local(id) {
+            self.counters.local_lookups.fetch_add(1, Relaxed);
+            return Ok(found);
+        }
         let key = s.record.keys().idx;
         let (ids, offsets) = futures_join(
             self.read_idx(&key, range),

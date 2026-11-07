@@ -154,6 +154,16 @@ Two SQLite details for the store (node A3):
   lock up front, so racing pushes serialize and the loser sees the unique
   violation above. (With deferred transactions, the store's concurrent
   claim test fails with `database is locked` on every run.)
+- Before `BEGIN IMMEDIATE`, a write transaction waits its turn in the
+  store's write queue (`src/tx.rs`, `WriteQueue`), first in, first out.
+  SQLite's busy handler polls for the lock and serves writers in no order,
+  so a sweep running batch after batch could keep a push waiting past the
+  lock timeout. The queue gives up only once the lock timeout passes with no
+  write transaction ending. It orders one store's writers (its clones
+  included); other processes or stores on the same file still meet the busy
+  timeout. So do this store's few autocommit writes outside a transaction
+  (`insert_token`, `revoke_token`, `insert_ssh_key`, `revoke_ssh_key`),
+  which skip the queue.
 
 Because the new row must match the new version's `seq`, and the parent
 foreign key makes the version with the next `seq` a child of the version

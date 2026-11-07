@@ -25,10 +25,16 @@
 //! (`crate::admission`) from before `BEGIN` until it has ended, the spawned
 //! rollback included, so the queue never hands its connection's slot to
 //! another operation while the transaction still holds the connection.
+//! On SQLite it also holds its turn at the write lock ([`WriteQueue`]) for
+//! as long.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use aspen_core::error::StoreError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::admission::Permit;
 use crate::conn::Conn;
@@ -44,10 +50,108 @@ use crate::store::{Dialect, SqlStore};
 pub(crate) struct WriteTx {
     /// `Some` until the transaction is committed or rolled back.
     conn: Option<Conn>,
-    /// This transaction's turn at the pool; released after the
-    /// transaction ends (dropped with the guard, or moved into the spawned
-    /// rollback).
-    permit: Option<Permit>,
+    /// This transaction's turn at the pool, and on SQLite at the write
+    /// lock; released after the transaction ends (dropped with the guard,
+    /// or moved into the spawned rollback).
+    permit: Option<(Option<WriteTurn>, Permit)>,
+}
+
+/// SQLite's queue for its one write lock, which [`SqlStore::write`] joins
+/// before `BEGIN IMMEDIATE`. Shared by a store's clones.
+///
+/// SQLite lets one transaction write at a time. A connection that finds
+/// the lock taken polls for it: its busy handler sleeps between tries, up
+/// to 100 ms at a time, until the lock timeout. So without this queue,
+/// writers get the lock in no particular order, and one that has waited
+/// for seconds loses to one that has just asked. A garbage-collection
+/// sweep that runs batch after batch takes the lock again within
+/// microseconds of each commit, and in the nightly `sweep_cost` test at a
+/// million packs, pushes running beside it waited out the 10 s lock
+/// timeout and failed with "database is locked". Here writers take the
+/// lock first in, first out, so the busy handler only arbitrates between
+/// this store and other processes, or other stores, on the same file.
+///
+/// A waiter gives up only once the lock timeout passes with no write
+/// transaction of this store ending, the admission queue's rule
+/// (`crate::admission`): a long line of writers that each hold the lock
+/// briefly is not a failure, a writer stuck holding it is.
+#[derive(Debug, Clone)]
+pub(crate) struct WriteQueue {
+    inner: Arc<WriteQueueInner>,
+}
+
+#[derive(Debug)]
+struct WriteQueueInner {
+    /// One permit, handed out in arrival order (Tokio's semaphore is fair).
+    lock: Arc<Semaphore>,
+    /// Write transactions that have ended: the progress a waiter looks for.
+    ended: AtomicU64,
+    /// How long a waiter waits without progress; zero means for ever.
+    timeout: Duration,
+}
+
+/// A turn at the write lock; it ends when dropped.
+#[derive(Debug)]
+pub(crate) struct WriteTurn {
+    _permit: OwnedSemaphorePermit,
+    queue: Arc<WriteQueueInner>,
+}
+
+impl Drop for WriteTurn {
+    fn drop(&mut self) {
+        self.queue.ended.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl WriteQueue {
+    /// A queue whose waiters give up after `timeout` without a write
+    /// transaction ending (zero: never).
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(WriteQueueInner {
+                lock: Arc::new(Semaphore::new(1)),
+                ended: AtomicU64::new(0),
+                timeout,
+            }),
+        }
+    }
+
+    /// Waits for the write lock's turn, in arrival order. Fails with
+    /// [`StoreError::Unavailable`] only after the timeout passes with no
+    /// write transaction ending.
+    pub(crate) async fn turn(&self) -> Result<WriteTurn, StoreError> {
+        let inner = &self.inner;
+        let turn = |permit: Result<OwnedSemaphorePermit, _>| WriteTurn {
+            _permit: permit.expect("the semaphore is never closed"),
+            queue: Arc::clone(inner),
+        };
+        // One `Acquire` future for the whole wait: dropping it would give
+        // up this waiter's place in the queue.
+        let acquire = Arc::clone(&inner.lock).acquire_owned();
+        tokio::pin!(acquire);
+        if inner.timeout.is_zero() {
+            return Ok(turn(acquire.await));
+        }
+        let mut seen = inner.ended.load(Ordering::Acquire);
+        loop {
+            match tokio::time::timeout(inner.timeout, &mut acquire).await {
+                Ok(permit) => return Ok(turn(permit)),
+                Err(_) => {
+                    let now = inner.ended.load(Ordering::Acquire);
+                    if now == seen {
+                        return Err(StoreError::Unavailable {
+                            reason: format!(
+                                "no write transaction on the metadata database ended in {:?} \
+                                 while this one waited for the write lock (a writer is stuck)",
+                                inner.timeout
+                            ),
+                        });
+                    }
+                    seen = now;
+                }
+            }
+        }
+    }
 }
 
 impl WriteTx {
@@ -122,7 +226,9 @@ impl SqlStore {
     /// On SQLite the transaction is `BEGIN IMMEDIATE`: the write lock is
     /// taken (waiting up to the lock timeout) before the first statement,
     /// so the transaction can never fail with `SQLITE_BUSY` halfway through
-    /// when another writer commits between its reads and its writes.
+    /// when another writer commits between its reads and its writes. Before
+    /// that, it waits its turn at the write lock in [`WriteQueue`], so this
+    /// store's writers get the lock in arrival order.
     ///
     /// `E` lets a body end in a rollback that is not a storage error, such
     /// as a lost compare-and-swap.
@@ -134,6 +240,10 @@ impl SqlStore {
         E: From<StoreError>,
     {
         let permit = self.admit_turn().await?;
+        let write_turn = match self.write_queue() {
+            Some(queue) => Some(queue.turn().await?),
+            None => None,
+        };
         self.count_write_transaction();
         let tx = self
             .connect_in_turn(|| async {
@@ -146,7 +256,7 @@ impl SqlStore {
         self.counter().transaction_control();
         let mut tx = WriteTx {
             conn: Some(Conn::tx(tx, self.counter().clone())),
-            permit: Some(permit),
+            permit: Some((write_turn, permit)),
         };
         match crate::admission::in_turn(body(&mut tx)).await {
             Ok(value) => {
@@ -187,4 +297,130 @@ pub(crate) async fn rollback_to(conn: &mut Conn) -> Result<(), StoreError> {
         .await
         .map_err(store_error)?;
     release(conn).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::store::StoreOptions;
+
+    /// Invariant: on SQLite, a writer that asks while another writer of
+    /// the store runs transactions back to back gets the lock within a few
+    /// of them. Before the write queue it polled for the lock, lost every
+    /// time to the writer that retook it within microseconds of each
+    /// commit, and failed with "database is locked" once the lock timeout
+    /// passed (the nightly `sweep_cost` test at a million packs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_writer_is_not_starved_by_back_to_back_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("w.db").display());
+        let opts = StoreOptions {
+            lock_timeout: Duration::from_secs(1),
+            ..StoreOptions::default()
+        };
+        let store = SqlStore::connect_with(&url, &opts).await.unwrap();
+        store.migrate().await.unwrap();
+
+        // A sweep catching up: one write transaction after another, each
+        // holding the lock 20 ms.
+        let done = Arc::new(AtomicBool::new(false));
+        let hog = {
+            let (store, done) = (store.clone(), Arc::clone(&done));
+            tokio::spawn(async move {
+                while !done.load(Ordering::SeqCst) {
+                    store
+                        .write(async |_| {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok::<_, StoreError>(())
+                        })
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut slowest = Duration::ZERO;
+                    for _ in 0..10 {
+                        let begun = Instant::now();
+                        store
+                            .write(async |_| Ok::<_, StoreError>(()))
+                            .await
+                            .unwrap();
+                        slowest = slowest.max(begun.elapsed());
+                    }
+                    slowest
+                })
+            })
+            .collect();
+        let mut slowest = Duration::ZERO;
+        for w in writers {
+            slowest = slowest.max(w.await.unwrap());
+        }
+        done.store(true, Ordering::SeqCst);
+        hog.await.unwrap();
+        // Behind at most the hog's turn and the two other writers'.
+        assert!(
+            slowest < Duration::from_millis(500),
+            "a write waited {slowest:?} for the lock"
+        );
+    }
+
+    /// A waiter keeps its place for as long as write transactions keep
+    /// ending, however long the line; it gives up once none has ended for
+    /// the timeout, a writer stuck holding the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiter_gives_up_only_when_no_write_ends() {
+        // Wide margins for loaded runners: a write ends every 60 ms, well
+        // inside the 200 ms timeout, and the waiter's line lasts 300 ms,
+        // half again the timeout.
+        let timeout = Duration::from_millis(200);
+        let hold = Duration::from_millis(60);
+        let queue = WriteQueue::new(timeout);
+
+        // Five turns of 60 ms ahead of the waiter: 300 ms in all, longer
+        // than the timeout, with one ending every 60 ms.
+        let first = queue.turn().await.unwrap();
+        let mut ahead = Vec::new();
+        for _ in 0..4 {
+            let queue = queue.clone();
+            ahead.push(tokio::spawn(async move {
+                let turn = queue.turn().await.unwrap();
+                tokio::time::sleep(hold).await;
+                drop(turn);
+            }));
+            // Let it join the line before the next one.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let waiter = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                let begun = Instant::now();
+                queue.turn().await.map(|_| begun.elapsed())
+            })
+        };
+        tokio::time::sleep(hold).await;
+        drop(first);
+        let waited = waiter.await.unwrap().unwrap();
+        assert!(waited > timeout, "waited only {waited:?}");
+        for a in ahead {
+            a.await.unwrap();
+        }
+
+        // A turn held past the timeout with nothing ending: the waiter fails.
+        let stuck = queue.turn().await.unwrap();
+        let begun = Instant::now();
+        let err = queue.turn().await.unwrap_err();
+        assert!(matches!(err, StoreError::Unavailable { .. }), "{err:?}");
+        assert!(begun.elapsed() >= timeout);
+        drop(stuck);
+        assert!(queue.turn().await.is_ok());
+    }
 }

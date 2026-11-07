@@ -11,11 +11,29 @@
 //! trailing checksum), so a lookup can trust what it reads. The checks run
 //! as the sections stream in, so building one never holds the file.
 //!
+//! **Local copy** (node 12b). Given a directory on local disk
+//! ([`SampleBuilder::copy_to`]), the builder also writes the sections a
+//! lookup reads (IDs, offsets and large offsets, 24 bytes per object plus 8
+//! per large offset) to an unnamed file there as they stream in, and a
+//! lookup reads its window from that file ([`SampledIdx::lookup_local`]),
+//! normally from the page cache: no blob store request, however many
+//! objects a push looks up or how large the pack is. The copy is kept only
+//! if the whole `.idx` checked, so it holds exactly the checked bytes; it
+//! is as trusted as the spool file a push completes from. It is deleted
+//! when the sample is dropped. Without one (no directory, or the file could
+//! not be written), a lookup reads its window from the blob store: two or
+//! three range reads, as before.
+//!
 //! The locator ([`crate::locate::StoredPacks`]) samples an `.idx` larger
 //! than [`crate::locate::LocateOptions::max_whole_idx_bytes`]. Without
 //! this, a repository whose `.idx` files do not fit the `.idx` cache read
 //! them whole on every push: work that grows with the repository, not with
 //! the push.
+
+use std::fs::File;
+use std::io::{BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::Path;
+use std::sync::Mutex;
 
 use aspen_core::blob::ByteRange;
 use aspen_core::id::{ObjectId, SHA1_LEN};
@@ -66,6 +84,16 @@ pub struct SampledIdx {
     fanout: Vec<u32>,
     /// The ID at every position `k * SAMPLE_EVERY`.
     samples: Vec<ObjectId>,
+    /// The lookup sections on local disk (module docs), if kept.
+    local: Option<LocalSections>,
+}
+
+/// The sections of an `.idx` a lookup reads, on local disk: its IDs, then
+/// its offsets and large offsets (the `.idx` without its header, CRCs and
+/// trailer).
+#[derive(Debug)]
+struct LocalSections {
+    file: Mutex<File>,
 }
 
 /// Builds a [`SampledIdx`] from an `.idx` fed in file order.
@@ -82,6 +110,9 @@ pub struct SampleBuilder {
     next_large: u64,
     /// Where the next section must start.
     expect: Section,
+    /// The local copy being written ([`SampleBuilder::copy_to`]); dropped,
+    /// and the sample kept without one, if a write fails.
+    local: Option<BufWriter<File>>,
 }
 
 impl SampleBuilder {
@@ -130,7 +161,30 @@ impl SampleBuilder {
             } else {
                 Section::Ids(0, 0)
             },
+            local: None,
         })
+    }
+
+    /// Also copies the sections a lookup reads to an unnamed file in `dir`
+    /// (created if missing), so lookups in the finished sample read local
+    /// disk instead of the blob store (module docs). If the file cannot be
+    /// made or written, the sample is built without a copy.
+    #[must_use]
+    pub fn copy_to(mut self, dir: &Path) -> Self {
+        self.local = std::fs::create_dir_all(dir)
+            .and_then(|()| tempfile::tempfile_in(dir))
+            .ok()
+            .map(|f| BufWriter::with_capacity(1 << 16, f));
+        self
+    }
+
+    /// Appends `bytes` to the local copy, dropping the copy if that fails.
+    fn copy(&mut self, bytes: &[u8]) {
+        if let Some(w) = &mut self.local
+            && w.write_all(bytes).is_err()
+        {
+            self.local = None;
+        }
     }
 
     /// The sections to read, in order, each at most `per_read` entries,
@@ -261,6 +315,9 @@ impl SampleBuilder {
                 return Ok(());
             }
         }
+        if !matches!(section, Section::Crcs(..)) {
+            self.copy(bytes);
+        }
         self.hasher.update(bytes);
         self.expect = section;
         Ok(())
@@ -271,12 +328,20 @@ impl SampleBuilder {
         if self.expect != Section::Trailer {
             return Err(bad("the index ended early"));
         }
+        // The trailer's checksum covered every byte copied.
+        let local = self
+            .local
+            .and_then(|w| w.into_inner().ok())
+            .map(|file| LocalSections {
+                file: Mutex::new(file),
+            });
         Ok(SampledIdx {
             record: self.record,
             count: self.count,
             large_count: self.large_count,
             fanout: self.fanout,
             samples: self.samples,
+            local,
         })
     }
 }
@@ -291,6 +356,56 @@ impl SampledIdx {
     /// Bytes this sample holds in memory.
     pub fn cost(&self) -> u64 {
         (self.samples.len() * SHA1_LEN + self.fanout.len() * 4) as u64 + 64
+    }
+
+    /// Whether the lookup sections are on local disk (module docs).
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// The offset of `id` (`Some(None)` when the pack lacks it), answered
+    /// from the local copy with no blob store read: [`Self::window`],
+    /// [`Self::find`] and the offset, as a lookup over the blob store does.
+    /// `None` when there is no local copy or a local read fails; the caller
+    /// then reads the blob store.
+    pub fn lookup_local(&self, id: &ObjectId) -> Option<Option<u64>> {
+        self.local.as_ref()?;
+        let Some((from, _, range)) = self.window(id) else {
+            return Some(None);
+        };
+        let Some(i) = Self::find(from, &self.read_local(range)?, id) else {
+            return Some(None);
+        };
+        let raw = self.read_local(self.offset_range(i))?;
+        Some(Some(match self.small_offset(&raw) {
+            Ok(offset) => offset,
+            Err(large) => Self::large_offset(&self.read_local(large)?),
+        }))
+    }
+
+    /// The bytes of `range` of the `.idx`, from its local copy: `None`
+    /// when there is none, the range is not inside the IDs or the offsets
+    /// and large offsets, or the local read fails (the caller then reads
+    /// the blob store).
+    fn read_local(&self, range: ByteRange) -> Option<Vec<u8>> {
+        let local = self.local.as_ref()?;
+        let n = self.count;
+        let ids = IDS_AT..IDS_AT + 20 * n;
+        let offsets = IDS_AT + 24 * n..IDS_AT + 28 * n + 8 * self.large_count;
+        // Where the range starts in the copy, which leaves out the 4 bytes
+        // of CRC per object between the IDs and the offsets.
+        let at = if ids.start <= range.start() && range.end() <= ids.end {
+            range.start() - IDS_AT
+        } else if offsets.start <= range.start() && range.end() <= offsets.end {
+            range.start() - IDS_AT - 4 * n
+        } else {
+            return None;
+        };
+        let mut bytes = vec![0; usize::try_from(range.len()).ok()?];
+        let mut file = local.file.lock().expect("not poisoned");
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
     }
 
     /// The positions `[from, to)` that can hold `id`, and the byte range of
@@ -449,6 +564,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Invariant (12b): a sample with a local copy answers every lookup
+    /// from it exactly as a whole parse does (present IDs with small and
+    /// large offsets, absent IDs), and the copy goes when the sample does.
+    #[test]
+    fn local_lookups_agree_with_the_whole_index() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, big) in [(0u64, false), (1, false), (255, false), (2_000, true)] {
+            let checksum = PackChecksum::from_bytes([7; 20]);
+            let idx = write(entries(n, big), &checksum);
+            let pack_size = 1 << 40;
+            let whole = IdxV2::parse(&idx, Some(pack_size)).unwrap();
+            let rec = record(&idx, n as u32, pack_size, checksum);
+            for per_read in [1, 7, 4096] {
+                let mut b = SampleBuilder::new(rec.clone(), &idx[..IDS_AT as usize])
+                    .unwrap()
+                    .copy_to(dir.path());
+                for (s, r) in b.sections(per_read) {
+                    b.feed(s, &idx[r.start() as usize..r.end() as usize])
+                        .unwrap();
+                }
+                let s = b.finish().unwrap();
+                assert!(s.is_local());
+                for i in 0..n as usize {
+                    let id = whole.id(i);
+                    assert_eq!(s.lookup_local(&id), Some(Some(whole.offset(i))));
+                }
+                for k in 0..200u64 {
+                    let id = crate::sha1(&(1_000_000 + k).to_be_bytes());
+                    let want = whole.lookup(&id).map(|i| whole.offset(i));
+                    assert_eq!(s.lookup_local(&id), Some(want));
+                }
+                // Without a copy, nothing is answered locally.
+                let plain = sample(&idx, rec.clone(), per_read).unwrap();
+                assert!(!plain.is_local());
+                if n > 0 {
+                    assert_eq!(plain.lookup_local(&whole.id(0)), None);
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "local copies are unnamed files, gone with their samples"
+        );
     }
 
     /// Invariant: building a sample refuses everything a whole parse

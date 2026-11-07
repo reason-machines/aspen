@@ -88,7 +88,9 @@ const HUGE: Shape = Shape {
 const PUSHES: usize = 24;
 
 /// CPU time this process has used, in microseconds: the server runs in it,
-/// `git` runs in children, which are not counted. Linux only (`/proc`);
+/// `git` runs in children, which are not counted. Every thread of the
+/// process counts, so only one [`compare`] measures at a time
+/// ([`MEASURING`]). Linux only (`/proc`);
 /// elsewhere 0, and the CPU bound is not checked.
 fn cpu_micros() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
@@ -252,7 +254,14 @@ async fn measure(shape: Shape) -> Cost {
     cost
 }
 
+/// Held by each [`compare`] for its whole run. [`cpu_micros`] counts the
+/// whole test process, so two comparisons running at once (the nightly
+/// suite's `--include-ignored` runs both tests of this file in one process)
+/// would charge each other's server work to their own pushes.
+static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn compare(large: Shape) {
+    let _alone = MEASURING.lock().await;
     let small = measure(SMALL).await;
     let big = measure(large).await;
     eprintln!(

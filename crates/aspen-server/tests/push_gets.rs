@@ -401,23 +401,24 @@ async fn measure(shape: Shape, history: usize, idx: Idx, workload: Workload) -> 
     r
 }
 
-/// Steady-state GETs per push with whole `.idx` files, every caller
-/// included (the push's stages and its share of compaction), may not
-/// exceed this at any repository size. Measured: 4.2 at 4,608 files and
-/// 5.1 at 65,610 (decisions log, 12a).
+/// Steady-state GETs per push, every caller included (the push's stages
+/// and its share of compaction), may not exceed this at any repository
+/// size, whether `.idx` files are kept whole or sampled (the default for a
+/// pack over about 2.4 million objects, so the monorepo's import pack).
+/// Measured with whole files: 4.2 at 4,608 files and 5.1 at 65,610
+/// (decisions log, 12a). Sampled, the same since 12b; before it 28.4 and
+/// 33.6, of which `push_graph` sent 22 (two ranged reads of a sampled
+/// `.idx` per object a push looked up) and `push_prefetch` 3.4 to 8.6,
+/// growing with the repository. A sample now keeps the sections a lookup
+/// reads on local disk (`aspen_pack::sampled`; decisions log, 12b).
 const GETS_PER_PUSH_BOUND: f64 = 8.0;
 
-/// What a trunk push costs today with sampled `.idx` files (the default for
-/// a pack over about 2.4 million objects, so the monorepo's import pack):
-/// 28.4 GETs at 4,608 files and 33.6 at 65,610, measured on 2026-11-06.
-/// `push_graph` sends 22 of them at both sizes, one ranged read of a
-/// sampled `.idx` window per object it looks up; `push_prefetch` grows with
-/// the repository (3.4 to 8.6). This is a regression guard at today's
-/// value, not the goal: TODO(12b, 12c) bring sampled pushes under
-/// [`GETS_PER_PUSH_BOUND`] and make them flat (an object cache across
-/// pushes, coalesced range reads, hot trunk objects in memory; a trunk
-/// generation index), then replace this with the flat assertion.
-const SAMPLED_GETS_PER_PUSH_TODAY: f64 = 36.0;
+/// The agent cycle's fetch, counted per push (one fetch every two pushes):
+/// it stitches the trunk pack it lacks, reading that pack, its `.idx` and
+/// its entry table. Measured: 9.3 at 4,608 and at 65,610 files (12b). Not
+/// what this file bounds (node 12b leaves the fetch path alone); here so
+/// the agent cycle's bound is the push's plus this.
+const FETCH_GETS_PER_PUSH: f64 = 10.0;
 
 /// Asserts that `r` counted what a push and its compaction really send, so
 /// that the bounds cannot pass because counting broke: some GETs, some
@@ -459,61 +460,58 @@ fn assert_counted(r: &PerPush) {
 /// sizes, whole and sampled).
 const COMPACTION_FLOOR: f64 = 1.0;
 
-/// Asserts `bound` at both sizes, and, when `flat`, that the larger
-/// repository costs at most 2 more GETs per push than the smaller.
-fn assert_bounded(small: &PerPush, large: &PerPush, bound: f64, flat: bool) {
+/// Asserts `bound` at both sizes, and that the larger repository costs at
+/// most 2 more GETs per push than the smaller (flat).
+fn assert_bounded(small: &PerPush, large: &PerPush, bound: f64) {
     for r in [small, large] {
         assert_counted(r);
         assert!(r.total <= bound, "{r:?}: more than {bound} GETs per push");
     }
-    if flat {
-        assert!(
-            large.total <= small.total + 2.0,
-            "GETs per push grew with the repository: {large:?} against {small:?}"
-        );
+    assert!(
+        large.total <= small.total + 2.0,
+        "GETs per push grew with the repository: {large:?} against {small:?}"
+    );
+}
+
+/// Invariant (12a, 12b): a trunk writer's GETs per push stay under a fixed
+/// bound that does not grow with the repository, with whole `.idx` files
+/// and with sampled ones: 4,608 files and 33 trunk versions against 65,610
+/// files and 113.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gets_per_push_do_not_grow_with_the_repository() {
+    for idx in [Idx::Whole, Idx::SampledOver(64 << 10)] {
+        let small = measure(SMALL, 16, idx, Workload::Trunk).await;
+        let large = measure(LARGE, 96, idx, Workload::Trunk).await;
+        assert_bounded(&small, &large, GETS_PER_PUSH_BOUND);
     }
 }
 
-/// Invariant (12a): with whole `.idx` files, a trunk writer's GETs per
-/// push stay under a fixed bound that does not grow with the repository:
-/// 4,608 files and 33 trunk versions against 65,610 files and 113. With
-/// sampled `.idx` files they are held at today's measured value (they grow;
-/// see [`SAMPLED_GETS_PER_PUSH_TODAY`]).
+/// Invariant (12b): the load test's agent cycle (fetch trunk, push a new
+/// branch through the plain URL), with `.idx` files sampled, stays under
+/// [`GETS_PER_PUSH_BOUND`] plus the fetch's share and does not grow with
+/// the repository (nightly). Measured: 11.7 GETs per push at 4,608 files and
+/// 12.7 at 65,610 (fetch 9.3, `push_prefetch` 0.9 to 1.9, compaction 1.5);
+/// before 12b, 35.8 and 41.7 (`push_graph` 22, `push_prefetch` 3.0 to 8.9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gets_per_push_do_not_grow_with_the_repository() {
-    let small = measure(SMALL, 16, Idx::Whole, Workload::Trunk).await;
-    let large = measure(LARGE, 96, Idx::Whole, Workload::Trunk).await;
-    assert_bounded(&small, &large, GETS_PER_PUSH_BOUND, true);
-    let idx = Idx::SampledOver(64 << 10);
-    let small = measure(SMALL, 16, idx, Workload::Trunk).await;
-    let large = measure(LARGE, 96, idx, Workload::Trunk).await;
-    assert_bounded(&small, &large, SAMPLED_GETS_PER_PUSH_TODAY, false);
-}
-
-/// The load test's agent cycle (fetch trunk, push a new branch through the
-/// plain URL), with `.idx` files sampled, held at today's measured value
-/// (nightly: about 15 minutes). Measured on 2026-11-06: 35.8 GETs per push
-/// at 4,608 files, 41.7 at 65,610 (fetch 9.3, `push_graph` 22,
-/// `push_prefetch` 3.0 to 8.9, compaction 1.5). TODO(12b, 12c): flat and
-/// under [`GETS_PER_PUSH_BOUND`] plus the fetch's share.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: about 15 minutes; run by the nightly suite"]
+#[ignore = "slow: a few minutes; run by the nightly suite"]
 async fn agent_gets_per_push_with_sampled_idx() {
     let idx = Idx::SampledOver(64 << 10);
     let workload = Workload::Agents { agents: 4 };
     let small = measure(SMALL, 16, idx, workload).await;
     let large = measure(LARGE, 96, idx, workload).await;
-    assert_bounded(&small, &large, 46.0, false);
+    assert_bounded(&small, &large, GETS_PER_PUSH_BOUND + FETCH_GETS_PER_PUSH);
 }
 
-/// The trunk writer at about the monorepo benchmark's 300,000 files and
-/// 500 trunk versions, sampled `.idx` (nightly). Prints the breakdown and
-/// holds today's sampled bound.
+/// Invariant (12b): the trunk writer at about the monorepo benchmark's
+/// 300,000 files and 500 trunk versions, sampled `.idx`, stays under
+/// [`GETS_PER_PUSH_BOUND`] and within 2 GETs per push of the small
+/// repository (nightly). Measured: 4.2 against 4.6; before 12b, 28.4
+/// against 33.8.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow: several minutes; run by the nightly suite"]
+#[ignore = "slow: a few minutes; run by the nightly suite"]
 async fn gets_per_push_at_300k_files() {
     let idx = Idx::SampledOver(64 << 10);
     let small = measure(SMALL, 16, idx, Workload::Trunk).await;
     let huge = measure(HUGE, 480, idx, Workload::Trunk).await;
-    assert_bounded(&small, &huge, SAMPLED_GETS_PER_PUSH_TODAY * 2.0, false);
+    assert_bounded(&small, &huge, GETS_PER_PUSH_BOUND);
 }

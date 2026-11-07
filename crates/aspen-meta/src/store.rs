@@ -29,6 +29,7 @@ use crate::rows::{
     VERSION_RETURNING,
 };
 use crate::sql::{CHUNK, PrefixRange, RANGES_PER_QUERY, placeholders, prefix_ranges};
+use crate::tx::WriteQueue;
 
 /// The SQL dialect behind a [`SqlStore`], chosen from the URL scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +109,10 @@ pub struct StoreOptions {
     /// [`StoreError::Unavailable`]: Postgres `lock_timeout` (SQLSTATE
     /// `55P03`), SQLite `busy_timeout` (`SQLITE_BUSY`). A racing push waits
     /// for the winner's transaction to end this long at most, so it bounds
-    /// how long a stuck writer can hold up the others.
+    /// how long a stuck writer can hold up the others. On SQLite a write
+    /// transaction first waits its turn at the write lock in the store's
+    /// queue, and gives up there only once this long passes with no write
+    /// transaction ending.
     pub lock_timeout: Duration,
     /// How long one statement may run on Postgres before the server cancels
     /// it (`statement_timeout`, SQLSTATE `57014`, which is
@@ -152,6 +156,8 @@ fn setting_ms(d: Duration) -> u128 {
 pub struct SqlStore {
     pool: AnyPool,
     admission: Admission,
+    /// SQLite only: the queue for the write lock ([`WriteQueue`]).
+    write_queue: Option<WriteQueue>,
     dialect: Dialect,
     clock: Clock,
     /// Write transactions begun through this store (shared by clones).
@@ -246,9 +252,12 @@ impl SqlStore {
             }
         }
         let pool = options.connect(url).await.map_err(store_error)?;
+        let write_queue =
+            (dialect == Dialect::Sqlite).then(|| WriteQueue::new(opts.lock_timeout.min(NO_LIMIT)));
         Ok(Self {
             pool,
             admission,
+            write_queue,
             dialect,
             clock: Clock::system(),
             write_transactions: Arc::default(),
@@ -344,6 +353,11 @@ impl SqlStore {
     /// its connection through [`Admission::connect`] itself.
     pub(crate) async fn admit_turn(&self) -> Result<crate::admission::Permit, StoreError> {
         self.admission.admit().await
+    }
+
+    /// The queue for SQLite's write lock; `None` on Postgres.
+    pub(crate) fn write_queue(&self) -> Option<&WriteQueue> {
+        self.write_queue.as_ref()
     }
 
     /// See [`Admission::connect`].

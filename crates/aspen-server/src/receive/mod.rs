@@ -66,10 +66,11 @@ pub use push::{PushOutcome, Timings};
 pub struct ReceiveConfig {
     /// Where pushes are spooled and completed: a real disk (never tmpfs),
     /// sized for about twice the largest accepted push plus its `.idx`
-    /// (S4). Each push works in its own temporary directory under it. The
-    /// delta-chain maps of sampled packs (`aspen_pack::chains`, 16 bytes
-    /// per object of each sampled pack in the `.idx` cache) are kept in
-    /// `chains/` under it.
+    /// (S4). Each push works in its own temporary directory under it. For
+    /// each sampled pack in the `.idx` cache, its delta-chain map
+    /// (`aspen_pack::chains`, 16 bytes per object) and the sections of its
+    /// `.idx` a lookup reads (`aspen_pack::sampled`, 24 bytes per object)
+    /// are kept in `sampled/` under it.
     pub spool_dir: PathBuf,
     /// Object count and pack size limits, checked before and while the
     /// pack body is read.
@@ -296,9 +297,11 @@ where
     pub fn new(meta: M, blobs: B, config: ReceiveConfig) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&config.spool_dir)?;
         // Sampled packs keep their delta-chain maps on the spool disk, so a
-        // deep chain in a large pack costs one round of reads (item 11).
+        // deep chain in a large pack costs one round of reads (item 11), and
+        // the sections of their `.idx` a lookup reads, so a lookup in one
+        // reads no blob store (12b).
         let packs = StoredPacks::new(meta.clone(), blobs.clone(), config.locate)
-            .with_chain_dir(config.spool_dir.join("chains"));
+            .with_local_dir(config.spool_dir.join("sampled"));
         let group = config
             .group_commit
             .enabled
@@ -549,6 +552,11 @@ where
                 "aspen_push_idx_read_bytes_total",
                 "Bytes of .idx read from the blob store: whole loads, samples, and lookups in samples.",
                 l.idx_bytes_read,
+            ),
+            (
+                "aspen_push_idx_local_lookups_total",
+                "Lookups in sampled indexes answered from their copy on the spool disk, with no blob store read.",
+                l.local_lookups,
             ),
         ] {
             crate::metrics::expo::counter(out, name, help, v);
