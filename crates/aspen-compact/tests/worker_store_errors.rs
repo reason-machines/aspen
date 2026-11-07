@@ -129,6 +129,36 @@ impl MetaStore for Flaky {
     async fn index_commits(&self, repo: RepoId, rows: &[CommitRow]) -> Result<(), StoreError> {
         self.inner.index_commits(repo, rows).await
     }
+    async fn unexamined_commits(
+        &self,
+        repo: RepoId,
+        after: Option<(aspen_core::id::RefVersionId, aspen_core::id::ObjectId)>,
+        limit: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        self.inner.unexamined_commits(repo, after, limit).await
+    }
+    async fn commits_waiting_on(
+        &self,
+        repo: RepoId,
+        ids: &aspen_core::ingest::SortedIds,
+        limit: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        self.inner.commits_waiting_on(repo, ids, limit).await
+    }
+    async fn set_generation_waits_on(
+        &self,
+        repo: RepoId,
+        waits: &[(aspen_core::id::ObjectId, aspen_core::id::ObjectId)],
+    ) -> Result<(), StoreError> {
+        self.inner.set_generation_waits_on(repo, waits).await
+    }
+    async fn set_generations(
+        &self,
+        repo: RepoId,
+        generations: &[(aspen_core::id::ObjectId, u64)],
+    ) -> Result<(), StoreError> {
+        self.inner.set_generations(repo, generations).await
+    }
     async fn covers(&self, repo: RepoId, name: &RefName) -> Result<Vec<Cover>, StoreError> {
         self.inner.covers(repo, name).await
     }

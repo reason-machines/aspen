@@ -180,6 +180,22 @@ run "staging_serves_git_and_place_under_its_base_domain" {
   }
 }
 
+run "personas_can_be_disabled_explicitly" {
+  command = apply
+
+  variables {
+    place_personas = false
+  }
+
+  assert {
+    condition = contains(
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment,
+      { name = "PLACE_PERSONAS", value = "false" }
+    )
+    error_message = "An explicit place_personas=false must disable the personas."
+  }
+}
+
 run "the_demo_can_serve_place_at_its_zone_apex" {
   command = apply
   # Its own state: certificates for other hostnames must not carry over.
@@ -276,6 +292,17 @@ run "the_demo_can_serve_place_at_its_zone_apex" {
       { name = "PLACE_DB_MAX_CONNECTIONS", value = "64" }
     )
     error_message = "The demo's place pool must have 64 connections."
+  }
+  assert {
+    condition = contains(
+      jsondecode(aws_ecs_task_definition.place[0].container_definitions)[1].environment,
+      { name = "PLACE_PERSONAS", value = "true" }
+    )
+    error_message = "The demo runs the personas by default (PLACE_PERSONAS=true)."
+  }
+  assert {
+    condition     = length(regexall("(?m)^place_personas[[:space:]]*=[[:space:]]*true[[:space:]]*$", file("${path.module}/demo.tfvars.example"))) == 1
+    error_message = "The example demo tfvars must keep personas enabled, matching the default."
   }
   # The kill switch lives in place's memory: an env var that engages it at
   # start would leave the public demo stopped after every restart.

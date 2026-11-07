@@ -79,7 +79,10 @@ wrongly refused. When the branch does not exist yet there is no stored tip,
 and only the trunk is excluded. [`pushRange`](../src/shared/tiles.ts)
 implements this rule over an in-memory commit graph.
 
-Worked example, with the default cap of 64 tiles:
+Worked example, with the default cap of 64 tiles (the test
+`a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_value`
+runs it on `refs/heads/ada`, outside `paint/`, where step 3's force-push
+is allowed):
 
 1. Ada clones at trunk `T0`, commits `A1` painting 40 tiles and pushes to
    `refs/heads/paint/ada`. The branch is new, so the range is

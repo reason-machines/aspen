@@ -935,6 +935,10 @@ fieldset {
   color: var(--spruce);
 }
 
+.row .who {
+  color: var(--ink-2);
+}
+
 .row-merge .what {
   font-weight: 600;
 }
@@ -1172,4 +1176,57 @@ fieldset {
   .panel.feed {
     min-height: 220px;
   }
+}
+
+/* Desktop: nothing beside or above the canvas changes size while it is used.
+   The stage is as wide as the fitted board (main.ts sets --stage-w), the stat
+   line stays one line, and the readout keeps two lines' room under the tools. */
+@media (min-width: 900px) {
+  .stage {
+    width: var(--stage-w, auto);
+  }
+
+  .statline {
+    flex-wrap: nowrap;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .statline .main-commit {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #stat-merge {
+    display: inline-block;
+    min-width: 8ch;
+  }
+
+  /* Zooming scrolls inside the fitted board instead of growing it. */
+  .plat[data-zoomed="true"] {
+    max-height: var(--fit-h, 70vh);
+  }
+
+  .canvas-bar {
+    display: grid;
+    grid-template-areas: "tools" "readout";
+    justify-items: start;
+  }
+
+  .canvas-bar .view-tools {
+    grid-area: tools;
+    flex-wrap: nowrap;
+  }
+
+  .canvas-bar .readout {
+    grid-area: readout;
+    min-height: 3em;
+    overflow-wrap: anywhere;
+  }
+}
+
+.made-by {
+  align-self: center;
+  font-size: 0.88rem;
 }

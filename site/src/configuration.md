@@ -5,7 +5,8 @@ deployment path (Compose, Helm, Terraform, a systemd unit) sets the same
 ones. It checks them at startup and refuses to start, naming the variable,
 when one is unusable: a database URL that carries a password, a policy that
 does not parse, an SSH listener without a host key. `aspen serve --help`
-prints the list with defaults.
+prints a summary of the most-used variables with their defaults; this page
+is the complete list.
 
 This page lists every variable the `aspen` binary reads. A check in CI
 (`site/build.py`) compares it with the code, so a new variable cannot ship

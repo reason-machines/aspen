@@ -550,14 +550,19 @@ async fn write_one(
                     let o = arg(Arg::Bytes(Some(c.commit.as_bytes().to_vec())));
                     let p = arg(Arg::Bytes(Some(rows::parents_column(&c.parents))));
                     let t = arg(Arg::Int(Some(c.committer_time)));
-                    format!("(CAST({o} AS BYTEA), CAST({p} AS BYTEA), CAST({t} AS BIGINT))")
+                    let g = arg(Arg::Int(rows::generation_column(c.generation)));
+                    let r = arg(Arg::Bytes(c.root_tree.map(|r| r.as_bytes().to_vec())));
+                    format!(
+                        "(CAST({o} AS BYTEA), CAST({p} AS BYTEA), CAST({t} AS BIGINT), \
+                         CAST({g} AS BIGINT), CAST({r} AS BYTEA))"
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
             sql.push_str(&format!(
                 ", c AS (INSERT INTO commit_index (repo_id, commit_oid, ref_version_id, parents, \
-                 committer_time) SELECT {repo}, x.o, v.id, x.p, x.t FROM v CROSS JOIN \
-                 (VALUES {values}) AS x (o, p, t) ORDER BY x.o \
+                 committer_time, generation, root_tree) SELECT {repo}, x.o, v.id, x.p, x.t, x.g, \
+                 x.r FROM v CROSS JOIN (VALUES {values}) AS x (o, p, t, g, r) ORDER BY x.o \
                  ON CONFLICT (repo_id, commit_oid) DO NOTHING)"
             ));
         }

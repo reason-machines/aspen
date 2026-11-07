@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createPlaceClient } from '../src/client/api.ts';
+import { ApiError, createPlaceClient, isUnavailable } from '../src/client/api.ts';
 import { FeedModel } from '../src/client/feed.ts';
 import { cellAt, formatDuration, lineCells, RateMeter, shellQuote } from '../src/client/geometry.ts';
 import { createSseParser, type SseMessage } from '../src/client/sse.ts';
@@ -189,6 +189,24 @@ describe('feed', () => {
     for (let i = 0; i < 30; i++) f.add(push(100 + i, `agent/x-${i}`), 0);
     expect(f.list).toHaveLength(10);
   });
+
+  it('names the persona behind an agent branch', () => {
+    const f = new FeedModel(10, () => 'visitors/me');
+    f.reset(0);
+    f.add(
+      {
+        type: 'push',
+        seq: 1,
+        branch: 'agent/maja-12',
+        actor: { kind: 'agent', label: 'Maja' },
+        commit: oid('a'),
+        tiles: [{ x: 3, y: 4, color: red }],
+        at,
+      },
+      0,
+    );
+    expect(f.list[0]).toMatchObject({ kind: 'push', actor: 'agent', who: 'Maja', branch: 'agent/maja-12', tiles: 1 });
+  });
 });
 
 describe('geometry', () => {
@@ -308,5 +326,51 @@ describe('agent prompt', () => {
 
 Your commit's name and email are public. Use a pseudonym if you prefer: git -c user.name=... -c user.email=... commit ...
 `);
+  });
+});
+
+describe('error responses', () => {
+  const lbBody =
+    '<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>\r\n<body>\r\n<center><h1>503 Service Temporarily Unavailable</h1></center>\r\n</body>\r\n</html>\r\n';
+  const answering = (status: number, body: string, type: string) =>
+    createPlaceClient({
+      baseUrl: 'https://place.test/api/v1',
+      fetch: async () => new Response(body, { status, headers: { 'Content-Type': type } }),
+    });
+
+  it("never shows the load balancer's HTML 503 page: a readable message, marked unavailable", async () => {
+    const err = await answering(503, lbBody, 'text/html')
+      .push('t', { branch: 'visitors/x', tiles: [] })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(503);
+    expect(err.message).toBe('The canvas server is restarting (HTTP 503). Try again in a minute.');
+    expect(err.message).not.toContain('<');
+    expect(isUnavailable(err)).toBe(true);
+  });
+
+  it("does not show place's own plain-text shutdown body either", async () => {
+    const err = await answering(503, 'aspen-place is shutting down\n', 'text/plain')
+      .push('t', { branch: 'visitors/x', tiles: [] })
+      .catch((e) => e);
+    expect(err.message).toBe('The canvas server is restarting (HTTP 503). Try again in a minute.');
+    expect(isUnavailable(err)).toBe(true);
+  });
+
+  it('keeps the message of a JSON error, and other statuses are not "unavailable"', async () => {
+    const err = await answering(
+      429,
+      JSON.stringify({ error: 'rate-limited', message: 'Too many pushes.' }),
+      'application/json',
+    )
+      .push('t', { branch: 'visitors/x', tiles: [] })
+      .catch((e) => e);
+    expect(err.message).toBe('Too many pushes.');
+    expect(isUnavailable(err)).toBe(false);
+    const other = await answering(500, 'boom', 'text/plain')
+      .config()
+      .catch((e) => e);
+    expect(other.message).toBe('The server answered HTTP 500. Try again in a minute.');
+    expect(isUnavailable(other)).toBe(false);
   });
 });

@@ -33,7 +33,7 @@ use aspen_core::id::ObjectId;
 use aspen_core::ingest::{ObjectKind, SortedIds};
 
 use crate::ingest::{core_kind, gix_chain};
-use crate::scan::{CommitInfo, ObjectError, ScanError, ScanOptions, parse_commit, references};
+use crate::scan::{CommitInfo, ObjectError, ScanError, ScanOptions, references};
 use crate::{from_gix, to_gix};
 
 /// One pack's objects and references, by `.idx` position (ascending ID).
@@ -144,12 +144,7 @@ impl PackGraph {
                     }
                 }
                 let commit = if kind == ObjectKind::Commit {
-                    let (parents, committer_time) = parse_commit(bytes).map_err(fail)?;
-                    Some(CommitInfo {
-                        id,
-                        parents,
-                        committer_time,
-                    })
+                    Some(CommitInfo::parse(id, bytes).map_err(fail)?)
                 } else {
                     None
                 };

@@ -51,6 +51,8 @@ tokio = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
 # carries RUSTSEC-2023-0071 with no fix, so RSA keys are not accepted
 # (decisions log, C3).
 russh = { version = "=0.65.1", default-features = false, features = ["ring"] }
+# The ECS task's memory limit (task metadata endpoint v4, admission).
+serde_json = { workspace = true }
 # Push spools and per-push work directories (receive-pack).
 tempfile = { workspace = true }
 # A blocking reader over the push body, for pass 1 (receive-pack).

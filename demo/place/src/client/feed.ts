@@ -11,6 +11,8 @@ export type FeedItem =
       key: string;
       seq: number;
       actor: ActorKind;
+      /** The actor's label: a persona's name for its `agent/` branch. */
+      who: string;
       branch: string;
       commit: string;
       colors: string[];
@@ -91,6 +93,7 @@ export class FeedModel {
           key: `p${e.seq}`,
           seq: e.seq,
           actor: e.actor.kind,
+          who: e.actor.label,
           branch: e.branch,
           commit: e.commit,
           colors: [...new Set(e.tiles.map((t) => t.color))].slice(0, 6),

@@ -38,6 +38,36 @@ pub struct CommitRow {
     pub parents: Vec<ObjectId>,
     /// Committer time, seconds since the Unix epoch.
     pub committer_time: i64,
+    /// The commit's generation number: 1 for a commit without parents,
+    /// otherwise one more than the largest of its parents' (Git's
+    /// commit-graph "topological level"). Every ancestor of a commit has a
+    /// smaller generation, so a commit whose generation is not larger than
+    /// `a`'s cannot have `a` as an ancestor (unless it is `a`): ancestry
+    /// walks stop there instead of walking down to the merge base
+    /// (decisions log, "12c: generation numbers"). `None` when it was not
+    /// known when the row was written (a row from before migration 0011,
+    /// or a commit whose parents had none yet); the `index_commits` job
+    /// fills it in ([`MetaStore::set_generations`]). Derived data: it is a
+    /// function of the commit's history, so every writer that knows it
+    /// writes the same value.
+    pub generation: Option<u64>,
+    /// The commit's root tree; `None` for rows from before migration 0011.
+    pub root_tree: Option<ObjectId>,
+}
+
+/// A ref's current version as a push reads it
+/// ([`MetaStore::current_versions`]): the version, and the generation number
+/// of its tip from the tip's `commit_index` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentVersion {
+    /// The version the `refs` row points at; a deleted ref's deletion
+    /// version.
+    pub version: RefVersion,
+    /// [`CommitRow::generation`] of the version's tip: `None` for a
+    /// deletion, a tip without a row, or a row without a generation. A push
+    /// computes its new commits' generations from it without a statement of
+    /// its own (decisions log, "12c: generation numbers").
+    pub tip_generation: Option<u64>,
 }
 
 /// The answer for one commit from the commit index.
@@ -66,6 +96,10 @@ pub struct NewCommit {
     pub parents: Vec<ObjectId>,
     /// Committer time, seconds since the Unix epoch.
     pub committer_time: i64,
+    /// [`CommitRow::generation`], if the writer knows it.
+    pub generation: Option<u64>,
+    /// [`CommitRow::root_tree`].
+    pub root_tree: Option<ObjectId>,
 }
 
 /// The kinds of job that name a ref version.
@@ -280,6 +314,8 @@ impl PushCommit {
                 ref_version: version,
                 parents: c.parents.clone(),
                 committer_time: c.committer_time,
+                generation: c.generation,
+                root_tree: c.root_tree,
             }));
             rows.jobs.extend(w.jobs.iter().map(|j| NewJob {
                 repo: self.repo,
@@ -1301,20 +1337,53 @@ pub trait MetaStore: Send + Sync {
     ) -> impl Future<Output = Result<Option<RefVersion>, StoreError>> + Send;
 
     /// The current versions of `names`, in the order asked (`None` for a
-    /// name with no `refs` row), read in one statement: what a push reads
-    /// before it searches (trunk and the ref it builds on) and again for its
-    /// commit check.
+    /// name with no `refs` row), each with its tip's generation number from
+    /// the `commit_index`: what a push reads before it searches (trunk and
+    /// the ref it builds on) and for its commit check. The generations let
+    /// a fast-forward compute its new commits' generations without reading
+    /// their parents' rows.
+    ///
+    /// This default sends one [`MetaStore::current_version`] per name and
+    /// then one [`MetaStore::lookup_commits`] for the tips. `SqlStore`
+    /// overrides it to read everything in one statement, which is what the
+    /// push path's statement budget counts on.
     fn current_versions(
         &self,
         repo: RepoId,
         names: &[RefName],
-    ) -> impl Future<Output = Result<Vec<Option<RefVersion>>, StoreError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Option<CurrentVersion>>, StoreError>> + Send {
         async move {
-            let mut out = Vec::with_capacity(names.len());
+            let mut versions = Vec::with_capacity(names.len());
             for name in names {
-                out.push(self.current_version(repo, name).await?);
+                versions.push(self.current_version(repo, name).await?);
             }
-            Ok(out)
+            let tips = SortedIds::from_unsorted(
+                versions
+                    .iter()
+                    .flatten()
+                    .filter_map(|v| v.value.tip())
+                    .collect(),
+            );
+            let rows = if tips.is_empty() {
+                Vec::new()
+            } else {
+                self.lookup_commits(repo, &tips).await?
+            };
+            let generation_of = |tip: ObjectId| {
+                rows.iter().find_map(|r| match r {
+                    CommitLookup::Indexed(r) if r.commit == tip => r.generation,
+                    _ => None,
+                })
+            };
+            Ok(versions
+                .into_iter()
+                .map(|v| {
+                    v.map(|version| CurrentVersion {
+                        tip_generation: version.value.tip().and_then(generation_of),
+                        version,
+                    })
+                })
+                .collect())
         }
     }
 
@@ -1554,6 +1623,53 @@ pub trait MetaStore: Send + Sync {
         &self,
         repo: RepoId,
         rows: &[CommitRow],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Up to `limit` of `repo`'s commit index rows that have no generation
+    /// number and that no backfill has examined yet (no commit they wait
+    /// on, [`MetaStore::set_generation_waits_on`]), in `(ref_version,
+    /// commit)` order after `after` (from the start when `None`). The
+    /// `index_commits` job's backfill reads them in pages: rows written
+    /// before migration 0011, and rows a push wrote without one. Version
+    /// order roughly follows history, so a page's parents are mostly in it
+    /// or in earlier pages.
+    fn unexamined_commits(
+        &self,
+        repo: RepoId,
+        after: Option<(RefVersionId, ObjectId)>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<CommitRow>, StoreError>> + Send;
+
+    /// Up to `limit` of `repo`'s rows without a generation that wait on one
+    /// of `ids` ([`MetaStore::set_generation_waits_on`]), in no particular
+    /// order. When those commits get generations, these rows may get theirs.
+    fn commits_waiting_on(
+        &self,
+        repo: RepoId,
+        ids: &SortedIds,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<CommitRow>, StoreError>> + Send;
+
+    /// Sets the generation number of each listed commit whose row has none,
+    /// and clears what it waited on (a row that has one keeps it:
+    /// generations are derived from history, so a second writer computes
+    /// the same value).
+    fn set_generations(
+        &self,
+        repo: RepoId,
+        generations: &[(ObjectId, u64)],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Records, for each listed `(commit, waits_on)` whose row still has no
+    /// generation, the commit whose generation it waits on (decisions log,
+    /// "12c: generation numbers"): the backfill examined the row and could
+    /// not give it one. Only a job that gives `waits_on` a generation looks
+    /// at the row again ([`MetaStore::commits_waiting_on`]), so a row whose
+    /// ancestor has no row costs nothing until that ancestor gets one.
+    fn set_generation_waits_on(
+        &self,
+        repo: RepoId,
+        waits: &[(ObjectId, ObjectId)],
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Covers of one ref's version chain, ordered by level then `first_seq`,
@@ -2276,6 +2392,8 @@ mod tests {
             commit: oid(1),
             parents: vec![oid(9)],
             committer_time: 1_700_000_000,
+            generation: None,
+            root_tree: None,
         });
         tip.jobs.push(VersionJob {
             kind: VersionJobKind::IndexCommits,
@@ -2312,6 +2430,8 @@ mod tests {
                 ref_version: v10,
                 parents: vec![oid(9)],
                 committer_time: 1_700_000_000,
+                generation: None,
+                root_tree: None,
             }]
         );
         assert_eq!(

@@ -329,7 +329,8 @@ stands:
 - Object storage: S3 and S3-compatible stores and the local file system.
   Google Cloud Storage works through its S3 API with an HMAC key; Azure
   Blob Storage is not supported yet.
-- Mirror mode: HTTPS upstreams only, no Git LFS.
+- Mirror mode: HTTP(S) upstreams only (no SSH; credentials only over HTTPS
+  or to loopback), no Git LFS.
 - Storage overhead from compaction and multi-ref pushes has not been measured
   on a large repository.
 

@@ -115,6 +115,19 @@ muts = [
   ["-p", "aspen-place", "--lib", "the_boundary_walk_stays_within_its_budget_on_a_wide_generation"]),
  ("P29 the hook walks the whole range before looking for an earlier main", [(HOOK, "let probe = PROBE_COMMITS.min(max_commits);", "let probe = max_commits;")],
   ["-p", "aspen-place", "--lib", "a_push_on_an_earlier_main_costs_the_same_whatever_its_length"]),
+ # The server-wide push ceiling.
+ ("P30 Git updates not counted by the push ceiling", [(HOOK, "    if let Err(at_limit) = shared.take_push() {", "    if let Err(at_limit) = Ok::<(), AtLimit>(()) {")],
+  E2E + ["web_and_git_pushes_share_one_server_wide_ceiling"]),
+ ("P31 web strokes not counted by the push ceiling", [(API, "    if let Err(at_limit) = place.shared.take_push() {", "    if let Err(at_limit) = Ok::<(), crate::hook::AtLimit>(()) {")],
+  E2E + ["web_and_git_pushes_share_one_server_wide_ceiling"]),
+ ("P32 a Git update its quota refuses still spends the ceiling", [(HOOK, "        shared.give_back_push();\n", "")],
+  E2E + ["a_push_its_own_quota_refuses_does_not_spend_the_ceiling"]),
+ ("P33 a web stroke its session refuses still spends the ceiling", [(API, "        place.shared.give_back_push();\n", "")],
+  E2E + ["a_push_its_own_quota_refuses_does_not_spend_the_ceiling"]),
+ ("P34 a Git update that breaks a tile rule spends the ceiling", [(HOOK, "    let tiles = match rules::validate_push(&commits, &shared.rules) {\n        Ok(t) => t,\n        Err(r) => return Ok(refuse(r)),\n    };\n    if let Err(at_limit) = shared.take_push() {\n        return Ok(refuse_one(at_limit.message()));\n    }\n", "    if let Err(at_limit) = shared.take_push() {\n        return Ok(refuse_one(at_limit.message()));\n    }\n    let tiles = match rules::validate_push(&commits, &shared.rules) {\n        Ok(t) => t,\n        Err(r) => return Ok(refuse(r)),\n    };\n")],
+  E2E + ["a_push_refused_for_a_rule_takes_no_token_from_the_ceiling"]),
+ ("P35 a refused paint/ delete spends the ceiling", [(HOOK, "    let Some(new) = update.new else {\n        if forward_only {", "    let Some(new) = update.new else {\n        let _ = shared.take_push();\n        if forward_only {")],
+  E2E + ["a_push_refused_for_a_rule_takes_no_token_from_the_ceiling"]),
 ]
 
 only = sys.argv[1:]

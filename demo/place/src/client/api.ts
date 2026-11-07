@@ -24,9 +24,17 @@ export class ApiError extends Error {
   readonly code: ErrorCode | 'network';
   readonly retryAfterSeconds: number | null;
   readonly rejections: Rejection[];
+  /** False when place itself did not answer (no response, or a body that is not place's JSON). */
+  readonly fromPlace: boolean;
 
-  constructor(status: number, body: Partial<ApiErrorBody>, retryAfterHeader: string | null = null) {
+  constructor(
+    status: number,
+    body: Partial<ApiErrorBody>,
+    retryAfterHeader: string | null = null,
+    fromPlace = status !== 0,
+  ) {
     super(body.message ?? `HTTP ${status}`);
+    this.fromPlace = fromPlace;
     this.name = 'ApiError';
     this.status = status;
     this.code = body.error ?? (status === 0 ? 'network' : 'bad-request');
@@ -34,6 +42,34 @@ export class ApiError extends Error {
     this.retryAfterSeconds = body.retryAfterSeconds ?? header;
     this.rejections = body.rejections ?? [];
   }
+}
+
+/**
+ * True when the server is restarting or overloaded (the load balancer has
+ * no healthy place to send to, or place is shutting down): the request did
+ * not go through, and the same request may succeed shortly.
+ */
+export function isUnavailable(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 502 || err.status === 503 || err.status === 504);
+}
+
+/**
+ * True when the request provably never reached place, so sending it again
+ * cannot commit twice: the network failed before a response, or the load
+ * balancer answered 503 itself because it had no healthy place task (its
+ * HTML page, not place's JSON). A 502 or 504 may have reached place, so it
+ * does not count.
+ */
+export function neverReachedPlace(err: unknown): boolean {
+  return err instanceof ApiError && !err.fromPlace && (err.status === 0 || err.status === 503);
+}
+
+/** A short, readable message for an error response whose body is not JSON. */
+export function nonJsonErrorMessage(status: number): string {
+  if (status === 502 || status === 503 || status === 504) {
+    return `The canvas server is restarting (HTTP ${status}). Try again in a minute.`;
+  }
+  return `The server answered HTTP ${status}. Try again in a minute.`;
 }
 
 export type StreamState =
@@ -102,10 +138,12 @@ export function createPlaceClient({
       // Fall through: a non-JSON body becomes a generic error below.
     }
     if (!res.ok) {
-      const errBody = (
-        json && typeof json === 'object' ? json : { message: text || res.statusText }
-      ) as Partial<ApiErrorBody>;
-      throw new ApiError(res.status, errBody, res.headers.get('Retry-After'));
+      // A body that is not JSON comes from something in front of place (the
+      // load balancer's HTML 503 while place restarts) or from place's own
+      // shutdown: never show it verbatim.
+      const fromPlace = json !== null && typeof json === 'object';
+      const errBody = (fromPlace ? json : { message: nonJsonErrorMessage(res.status) }) as Partial<ApiErrorBody>;
+      throw new ApiError(res.status, errBody, res.headers.get('Retry-After'), fromPlace);
     }
     return json as T;
   }

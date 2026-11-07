@@ -226,15 +226,32 @@ pub struct CommitInfo {
     pub parents: Vec<ObjectId>,
     /// Committer time, seconds since the epoch.
     pub committer_time: i64,
+    /// Root tree.
+    pub tree: ObjectId,
 }
 
 impl CommitInfo {
-    /// The `commit_index` row for the version a write creates.
+    /// Parses commit `id`'s header from its inflated `data`.
+    pub fn parse(id: ObjectId, data: &[u8]) -> Result<Self, String> {
+        let h = CommitHeader::parse(data)?;
+        Ok(Self {
+            id,
+            parents: h.parents,
+            committer_time: h.committer_time,
+            tree: h.tree,
+        })
+    }
+
+    /// The `commit_index` row for the version a write creates. Its
+    /// generation number is left unknown: the push path fills it in
+    /// (`aspen_core::meta::NewCommit::generation`).
     pub fn to_new_commit(&self) -> NewCommit {
         NewCommit {
             commit: self.id,
             parents: self.parents.clone(),
             committer_time: self.committer_time,
+            generation: None,
+            root_tree: Some(self.tree),
         }
     }
 }
@@ -337,12 +354,7 @@ pub fn scan(pack: &Path, idx: &Path, options: ScanOptions) -> Result<ScanOutcome
                 references(kind, bytes, |r| local_refs.push(r)).map_err(fail)?;
             }
             if options.commits && kind == ObjectKind::Commit {
-                let (parents, committer_time) = parse_commit(bytes).map_err(fail)?;
-                commit = Some(CommitInfo {
-                    id,
-                    parents,
-                    committer_time,
-                });
+                commit = Some(CommitInfo::parse(id, bytes).map_err(fail)?);
             }
             Ok::<(), ObjectError>(())
         })();

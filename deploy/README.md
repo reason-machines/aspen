@@ -216,8 +216,10 @@ git clone http://127.0.0.1:7070/demo.git
 ```
 
 `aspen dev` is `aspen serve` with SQLite and local disk under `--data-dir`,
-the `demo` repository (more with `--repo <name>`), and packfile URIs served
-from its own `/-/blobs` route. It lets anyone who can reach it push, so it
+the `demo` repository, and packfile URIs served from its own `/-/blobs`
+route. `--repo <name>` (repeatable) names the repositories to create
+instead; naming any replaces `demo`, so keep it with
+`aspen dev --repo demo --repo extra`. It lets anyone who can reach it push, so it
 listens only on a loopback address and refuses any other.
 Once a Homebrew tap exists (not yet: publishing waits on the release
 gate, see "Releases"), `brew install reason-machines/tap/aspen` installs the

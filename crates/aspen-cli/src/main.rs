@@ -52,7 +52,9 @@ struct Cli {
 }
 
 const SERVE_HELP: &str = "\
-Configuration (environment variables; see site/src/configuration.md):
+Configuration: the most used environment variables, with their defaults. The
+Configuration page of the documentation (site/src/configuration.md in the
+source) lists every variable the binary reads.
   ASPEN_LISTEN                 address for Git over HTTP [default: 0.0.0.0:7070]
   ASPEN_PUBLIC_URL             URL clients use, e.g. https://git.example.com
   DATABASE_URL                 postgres://user@host/db (password in PGPASSWORD) or sqlite://path?mode=rwc  (required)
@@ -84,11 +86,11 @@ Configuration (environment variables; see site/src/configuration.md):
   ASPEN_MAX_CONCURRENT_STITCHES inline packs stitched at once [default: 32]
   ASPEN_ADMISSION_QUEUE        requests of each kind waiting for a slot [default: 64]
   ASPEN_ADMISSION_QUEUE_WAIT_SECS longest wait in that queue [default: 10]
-  ASPEN_MEMORY_HIGH_WATER_BYTES resident memory over which new requests get 503, 0 = off [default: 80% of the cgroup or machine memory]
+  ASPEN_MEMORY_HIGH_WATER_BYTES resident memory over which new requests get 503, 0 = off [default: 80% of the memory limit (the cgroup's, else the machine's)]
   ASPEN_PREFETCH_FLOOR_BYTES   prefetch memory each push reserves first [default: 67108864]
-  ASPEN_PREFETCH_PER_PUSH_BYTES most prefetch memory one push may use [default: 4 x ASPEN_MAX_OBJECT_BYTES, >= 1 GiB]
+  ASPEN_PREFETCH_PER_PUSH_BYTES most prefetch memory one push may use [default: 2147483648: 4 x ASPEN_MAX_OBJECT_BYTES, >= 1 GiB]
   ASPEN_PREFETCH_WAIT_SECS     longest wait for prefetch memory [default: 60]
-  ASPEN_PREFETCH_PARALLEL_READS object store reads in flight per push prefetch [default: 64]
+  ASPEN_PREFETCH_PARALLEL_READS object store reads in flight per push prefetch [default: 256]
   ASPEN_IDX_CACHE_BYTES        pack index cache shared by pushes [default: 1073741824]
   ASPEN_OBJECT_CACHE_BYTES     delta-base cache shared by pushes, 0 = off [default: 67108864]
   ASPEN_IDX_WHOLE_MAX_BYTES    largest pack index kept whole; larger ones are sampled [default: 67108864]
@@ -132,7 +134,9 @@ enum Command {
         /// Directory for the SQLite database, stored packs and the spool.
         #[arg(long, default_value = ".aspen")]
         data_dir: PathBuf,
-        /// Repository to create if it does not exist (repeatable).
+        /// Repository to create if it does not exist. Repeatable; naming
+        /// any replaces the default `demo`, so keep it with
+        /// `--repo demo --repo other`.
         #[arg(long = "repo", default_value = "demo")]
         repos: Vec<String>,
         /// Don't run the background worker: no compaction, commit indexing
@@ -649,5 +653,53 @@ mod tests {
             leaks.is_empty(),
             "options showing env values in help: {leaks:?}"
         );
+    }
+
+    /// Every `[default: X]` that `aspen serve --help` prints is the default
+    /// `site/src/configuration.md` documents for that variable: the same
+    /// value, optionally followed by `: ` or ` (` and an explanation. The
+    /// page's defaults are in turn checked against what the server runs
+    /// (`config`'s throughput and contract tests), so help cannot show a
+    /// stale default (reason-machines/aspen#14: it printed 64 for
+    /// `ASPEN_PREFETCH_PARALLEL_READS` after the default became 256).
+    #[test]
+    fn every_default_serve_help_prints_is_the_documented_one() {
+        let page = include_str!("../../../site/src/configuration.md");
+        let mut problems = Vec::new();
+        let mut checked = 0;
+        for line in super::SERVE_HELP.lines() {
+            let Some((_, default)) = line.split_once("[default: ") else {
+                continue;
+            };
+            let default = default
+                .strip_suffix(']')
+                .unwrap_or_else(|| panic!("a default ends its line: {line}"));
+            let name = line.split_whitespace().next().unwrap_or_default();
+            let Some(row) = page
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{name}` |")))
+            else {
+                problems.push(format!("{name} has no row in site/src/configuration.md"));
+                continue;
+            };
+            let documented = row.split(" | ").nth(1).unwrap_or_default();
+            // A value in backticks is compared alone: "`536870912` (512 MiB)".
+            let documented = match documented.strip_prefix('`') {
+                Some(rest) => rest.split('`').next().unwrap_or_default(),
+                None => documented,
+            };
+            let agrees = default == documented
+                || [": ", " ("]
+                    .iter()
+                    .any(|sep| default.starts_with(&format!("{documented}{sep}")));
+            if !agrees {
+                problems.push(format!(
+                    "{name}: help says [default: {default}], the page says {documented}"
+                ));
+            }
+            checked += 1;
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        assert!(checked >= 40, "only {checked} defaults found in SERVE_HELP");
     }
 }

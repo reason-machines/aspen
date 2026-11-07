@@ -336,7 +336,8 @@ where
 {
     let (tx, rx) = mpsc::channel::<Chunk>(CHANNEL_FRAMES);
     let server = server.clone();
-    tokio::spawn(async move {
+    // A spawned task starts outside the request's scope.
+    tokio::spawn(aspen_core::blob::BlobCaller::Fetch.scope(async move {
         let _slot = slot;
         let mut response = response;
         if tx.send(Ok(Bytes::from(head))).await.is_err() {
@@ -361,7 +362,7 @@ where
                 let _ = tx.send(item).await;
             }
         }
-    });
+    }));
     Body::from_stream(stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|b| (b, rx))
     }))

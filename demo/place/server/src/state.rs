@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::git::TreeEntry;
-use crate::rules::{Rules, Tile};
+use crate::rules::{AMBIENT_PREFIX, Rules, Tile};
 
 /// A tile that was never painted.
 pub const UNSET: u8 = u8::MAX;
@@ -581,6 +581,34 @@ impl State {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Tiles people (not the server's agents) painted in the last
+    /// [`HUMAN_MEMORY_MS`], without the agents' paint
+    /// [`Self::protected_tiles`] adds.
+    pub fn recent_people_tiles(&self, now: u64) -> Vec<usize> {
+        self.human_tiles
+            .iter()
+            .filter(|(_, at)| at.saturating_add(HUMAN_MEMORY_MS) > now)
+            .map(|(i, _)| *i)
+            .collect()
+    }
+
+    /// Tiles the server's agents (`agent/`) painted in the last
+    /// [`HUMAN_MEMORY_MS`], merged or still pending.
+    pub fn recent_agent_tiles(&self, now: u64) -> Vec<usize> {
+        let rules = &self.rules;
+        self.sprite_tiles
+            .iter()
+            .filter(|(_, at)| at.saturating_add(HUMAN_MEMORY_MS) > now)
+            .map(|(i, _)| *i)
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|p| p.branch.starts_with(AMBIENT_PREFIX))
+                    .flat_map(|p| p.tiles.iter().map(|t| rules.index(t.x, t.y))),
+            )
+            .collect()
     }
 
     /// `branch` was deleted in Git. It leaves the page now if all its

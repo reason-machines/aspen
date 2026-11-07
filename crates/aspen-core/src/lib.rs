@@ -30,6 +30,7 @@ pub mod auth;
 pub mod blob;
 pub mod error;
 pub mod fetch;
+pub mod generation;
 pub mod id;
 pub mod ingest;
 pub mod meta;

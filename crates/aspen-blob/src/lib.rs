@@ -20,7 +20,12 @@
 //! [`BlobStore::read_exact_range`] turning short reads into corruption,
 //! idempotent and write-once uploads, multipart uploads, and presigned
 //! URLs. The S3 backend runs it against a real MinIO server.
+//!
+//! Every request through [`AnyBlobStore`] is counted by caller and file in
+//! [`RequestCounts::global`] (`aspen_blob_*` at `/-/metrics`); [`Counted`]
+//! counts any other store.
 
+mod counts;
 mod dns;
 mod local;
 mod object;
@@ -31,6 +36,7 @@ use std::time::Duration;
 pub use aspen_core::blob::BlobStore;
 use aspen_core::blob::{BlobKey, ByteRange, PresignedUrl, UploadReceipt};
 use aspen_core::error::StoreError;
+pub use counts::{Counted, RequestCount, RequestCounts, RequestKind};
 pub use local::{
     LOCAL_MAX_PRESIGN_TTL, LocalBlobStore, LocalUrlSigner, MIN_SECRET_LEN, STAGING_DIR,
     SignerConfigError, UrlRejected,
@@ -173,6 +179,7 @@ fn client_options_from_env() -> object_store::ClientOptions {
 
 impl BlobStore for AnyBlobStore {
     async fn upload_file(&self, key: &BlobKey, path: &Path) -> Result<UploadReceipt, StoreError> {
+        RequestCounts::global().record(key, RequestKind::Put);
         match self {
             Self::Local(s) => s.upload_file(key, path).await,
             Self::Object(s) => s.upload_file(key, path).await,
@@ -180,13 +187,15 @@ impl BlobStore for AnyBlobStore {
     }
 
     async fn read_range(&self, key: &BlobKey, range: ByteRange) -> Result<Vec<u8>, StoreError> {
+        let counts = RequestCounts::global();
         match self {
-            Self::Local(s) => s.read_range(key, range).await,
-            Self::Object(s) => s.read_range(key, range).await,
+            Self::Local(s) => counts.get(key, s.read_range(key, range)).await,
+            Self::Object(s) => counts.get(key, s.read_range(key, range)).await,
         }
     }
 
     async fn size(&self, key: &BlobKey) -> Result<Option<u64>, StoreError> {
+        RequestCounts::global().record(key, RequestKind::Head);
         match self {
             Self::Local(s) => s.size(key).await,
             Self::Object(s) => s.size(key).await,
@@ -194,6 +203,7 @@ impl BlobStore for AnyBlobStore {
     }
 
     async fn delete(&self, key: &BlobKey) -> Result<(), StoreError> {
+        RequestCounts::global().record(key, RequestKind::Delete);
         match self {
             Self::Local(s) => s.delete(key).await,
             Self::Object(s) => s.delete(key).await,

@@ -476,6 +476,17 @@ where
             );
         }
     };
+    // The server-wide ceiling first, so a push it refuses spends none of
+    // the session's own budget; a token taken for a push the session's
+    // budget then refuses is given back.
+    if let Err(at_limit) = place.shared.take_push() {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate-limited",
+            &format!("{}.", at_limit.message()),
+            Some(at_limit.retry_after_secs),
+        );
+    }
     let admitted = place
         .sessions
         .lock()
@@ -483,6 +494,7 @@ where
         .pushes
         .admit(&session.branch, now);
     if let Err(ms) = admitted {
+        place.shared.give_back_push();
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate-limited",

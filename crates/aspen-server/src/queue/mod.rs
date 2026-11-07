@@ -749,7 +749,10 @@ where
             let polled: BTreeSet<RepoId> =
                 watch.keys().copied().chain(woken.iter().copied()).collect();
             for repo in polled {
-                match self.drain_leased(repo, false).await {
+                match aspen_core::blob::BlobCaller::MergeQueue
+                    .scope(self.drain_leased(repo, false))
+                    .await
+                {
                     Ok(Leased::Elsewhere) => {
                         watch.insert(repo, std::time::Instant::now());
                     }
@@ -788,7 +791,10 @@ where
         let before = walked();
         let mut report = QueueReport::default();
         for repo in self.all_repos().await? {
-            if let Leased::Held(r) = self.drain_leased(repo, true).await? {
+            if let Leased::Held(r) = aspen_core::blob::BlobCaller::MergeQueue
+                .scope(self.drain_leased(repo, true))
+                .await?
+            {
                 report += r;
             }
         }

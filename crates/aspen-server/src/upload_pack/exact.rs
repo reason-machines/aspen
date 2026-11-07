@@ -666,12 +666,13 @@ where
                 let (server, repo, want, version) =
                     (server.clone(), repo.clone(), want.clone(), version.clone());
                 tokio::spawn(async move {
-                    let task = {
-                        let server = server.clone();
-                        tokio::spawn(
-                            async move { build(&server, &repo, &want, &version, depth).await },
-                        )
-                    };
+                    let task =
+                        {
+                            let server = server.clone();
+                            tokio::spawn(aspen_core::blob::BlobCaller::ShallowBuild.scope(
+                                async move { build(&server, &repo, &want, &version, depth).await },
+                            ))
+                        };
                     // A panicking build is a failed build, never a key that
                     // stays "running" for good.
                     let delivered = task.await.unwrap_or_else(|e| {

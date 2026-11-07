@@ -226,7 +226,8 @@ pub(crate) fn pack(row: &AnyRow) -> Result<PackRecord, StoreError> {
 }
 
 /// Columns of `commit_index` that [`commit`] reads.
-pub(crate) const COMMIT_COLS: &str = "commit_oid, ref_version_id, parents, committer_time";
+pub(crate) const COMMIT_COLS: &str =
+    "commit_oid, ref_version_id, parents, committer_time, generation, root_tree";
 
 pub(crate) fn commit(row: &AnyRow) -> Result<CommitRow, StoreError> {
     const T: &str = "commit_index";
@@ -245,7 +246,30 @@ pub(crate) fn commit(row: &AnyRow) -> Result<CommitRow, StoreError> {
         ref_version: row_id(row, T, "ref_version_id", RefVersionId::new)?,
         parents,
         committer_time: get(row, "committer_time")?,
+        generation: generation(row, "generation")?,
+        root_tree: match get::<Option<Vec<u8>>>(row, "root_tree")? {
+            None => None,
+            Some(raw) => Some(ObjectId::from_slice(&raw).map_err(|e| bad(T, "root_tree", e))?),
+        },
     })
+}
+
+/// A `commit_index.generation` column, under the name `column`: NULL, or
+/// at least 1.
+pub(crate) fn generation(row: &AnyRow, column: &str) -> Result<Option<u64>, StoreError> {
+    match get::<Option<i64>>(row, column)? {
+        None => Ok(None),
+        Some(g) => u64::try_from(g)
+            .ok()
+            .filter(|&g| g >= 1)
+            .map(Some)
+            .ok_or_else(|| bad("commit_index", "generation", g)),
+    }
+}
+
+/// [`CommitRow::generation`] as stored.
+pub(crate) fn generation_column(g: Option<u64>) -> Option<i64> {
+    g.map(|g| i64::try_from(g).expect("a generation fits in i64"))
 }
 
 /// `parents` as stored: the IDs concatenated.

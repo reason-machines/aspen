@@ -306,8 +306,10 @@ async fn a_branch_is_checked_over_commits_new_to_it_not_from_the_client_old_valu
 
 /// Invariant: a Git client can create and fast-forward a `paint/`
 /// branch, but cannot delete it or rewrite it, however it asks (`-o
-/// force`, `--force` through the branch URL, a rewind to an ancestor); the
-/// refusal tells it to push to a new branch, and the branch is untouched.
+/// force`, `--force` through the branch URL, a rewind to an ancestor, a
+/// correct `--force-with-lease`, or inside an `--atomic` push whose other
+/// update is valid); the refusal tells it to push to a new branch, and no
+/// branch the push names moves.
 /// The server's own handling of `paint/` branches (merging, expiry's
 /// delete) is not affected, and other branches keep Aspen's policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -401,6 +403,19 @@ async fn paint_branches_only_move_forward_for_git_clients() {
         assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "{what}");
     }
 
+    // A correct lease (the stored tip) does not make a rewrite a
+    // fast-forward. The branch URL advertises the branch, so git checks
+    // the lease, sends the update, and the hook refuses it. (On the main
+    // URL the branch is not advertised and git itself refuses the lease as
+    // stale before sending anything.)
+    let lease = format!("--force-with-lease={bob}:{a2}");
+    let (ok, out) = m.push(&[&lease, &scoped, &format!("HEAD:{bob}")]).await;
+    assert!(!ok, "a rewrite with a correct lease accepted: {out}");
+    assert!(
+        out.contains(forward) && out.contains("push your history to a new branch"),
+        "a rewrite with a correct lease: {out}"
+    );
+    assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "lease");
     // The rewrite goes to a new branch instead.
     let (ok, out) = m.push(&[&app.url(), "HEAD:refs/heads/paint/mallory"]).await;
     assert!(ok, "{out}");
@@ -408,6 +423,28 @@ async fn paint_branches_only_move_forward_for_git_clients() {
         app.tip("refs/heads/paint/mallory").await.as_deref(),
         Some(&b1[..])
     );
+    // An atomic push that pairs a valid fast-forward of another branch
+    // with a rewrite of paint/bob is refused whole: neither tip moves.
+    let b2 = m.paint(&[(5, 6, BLUE)], "B2");
+    let (ok, out) = m
+        .push(&[
+            "--atomic",
+            "-o",
+            "force",
+            &app.url(),
+            "HEAD:refs/heads/paint/mallory",
+            &format!("+{b1}:{bob}"),
+        ])
+        .await;
+    assert!(!ok, "atomic push accepted: {out}");
+    assert!(out.contains(forward), "atomic push: {out}");
+    assert_eq!(
+        app.tip("refs/heads/paint/mallory").await.as_deref(),
+        Some(&b1[..]),
+        "the atomic push's fast-forward to {b2} landed: {out}"
+    );
+    assert_eq!(app.tip(bob).await.as_deref(), Some(&a2[..]), "atomic push");
+    m.git(&["reset", "-q", "--hard", &b1]);
     // Outside `paint/`, a delete is still Aspen's ordinary policy.
     let (ok, out) = m.push(&[&app.url(), "HEAD:refs/heads/scratch"]).await;
     assert!(ok, "{out}");
@@ -462,6 +499,248 @@ async fn git_pushes_are_limited_per_address_and_branch() {
     // Another branch has its own budget.
     let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q2"]).await;
     assert!(ok, "{out}");
+}
+
+/// Opens a web session; returns its branch and its `Authorization` value.
+async fn web_session(app: &App) -> (String, String) {
+    let s = app.http("POST", "/api/v1/sessions", &[], None).await;
+    assert_eq!(s.status, 201, "{}", s.text());
+    let s = s.json();
+    (
+        s["branch"].as_str().unwrap().to_owned(),
+        format!("Bearer {}", s["token"].as_str().unwrap()),
+    )
+}
+
+/// One web stroke of one tile at `(x, 0)` on the session's branch.
+async fn web_push(app: &App, (branch, auth): &(String, String), x: u32) -> Response {
+    let stroke = json!({ "branch": branch, "tiles": [{ "x": x, "y": 0, "color": RED }] });
+    app.http(
+        "POST",
+        "/api/v1/pushes",
+        &[("Authorization", auth.as_str())],
+        Some(&stroke),
+    )
+    .await
+}
+
+/// Invariant: one server-wide push ceiling counts web strokes and Git
+/// updates together. Past it a web push is `429` `rate-limited` with
+/// `Retry-After` and a message that the demo is at its limit, a Git push
+/// is `remote rejected` with the same message, and nothing of a refused
+/// push lands. The rate is far below one push per test, so no token
+/// refills while it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_and_git_pushes_share_one_server_wide_ceiling() {
+    let app = App::start(|c| {
+        c.global_pushes_per_second = 0.001;
+        c.global_push_burst = 3;
+    })
+    .await;
+    let w = app.clone_work("w").await;
+    let session = web_session(&app).await;
+
+    // Three pushes, from both sides, spend the burst.
+    let r = web_push(&app, &session, 0).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    w.paint(&[(1, 0, RED)], "one");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/a"]).await;
+    assert!(ok, "{out}");
+    let r = web_push(&app, &session, 2).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+
+    // Git is refused next, though its own branch has never pushed.
+    let refused = w.paint(&[(3, 0, RED)], "two");
+    let stored_before = stored_files(&app.dir.join("blobs"));
+    // The pushes above stored packs, so an unchanged store is not vacuous.
+    assert!(
+        !stored_before.is_empty(),
+        "the blob store has the earlier packs"
+    );
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/b"]).await;
+    assert!(
+        !ok && out.contains("remote rejected")
+            && out.contains(
+                "place is at its limit: about 0.001 pushes a second from everyone together"
+            )
+            && out.contains("retry in "),
+        "{out}"
+    );
+    assert_eq!(
+        app.tip("refs/heads/paint/b").await,
+        None,
+        "nothing of it landed"
+    );
+    // Nor were its objects stored: no pack was written, and its commit is not
+    // indexed. The `NotIndexed` lookup is the decisive check; the stock fetch
+    // by id below is only supplementary, since a fetch can fail for other
+    // reasons.
+    assert_eq!(
+        stored_files(&app.dir.join("blobs")),
+        stored_before,
+        "the blob store is unchanged"
+    );
+    use aspen_core::meta::MetaStore;
+    let id: aspen_core::id::ObjectId = refused.parse().unwrap();
+    let lookup = app
+        .meta
+        .lookup_commits(
+            app.place.repo().id,
+            &aspen_core::ingest::SortedIds::from_unsorted(vec![id]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(lookup[..], [aspen_core::meta::CommitLookup::NotIndexed]),
+        "{lookup:?}"
+    );
+    let (fetched, out) = app
+        .clone_work("probe")
+        .await
+        .try_git(&["fetch", &app.url(), &refused])
+        .await;
+    assert!(!fetched && out.contains(&refused), "{out}");
+
+    // And so is the web, from a fresh session with its whole own budget.
+    let fresh = web_session(&app).await;
+    let before = app.tip(&format!("refs/heads/{}", fresh.0)).await;
+    let r = web_push(&app, &fresh, 4).await;
+    assert_eq!(r.status, 429, "{}", r.text());
+    let retry: u64 = r
+        .header("retry-after")
+        .expect("Retry-After on a refusal")
+        .parse()
+        .unwrap();
+    assert!(retry >= 1, "{retry}");
+    let body = r.json();
+    assert_eq!(body["error"], "rate-limited");
+    assert_eq!(body["retryAfterSeconds"], retry);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("place is at its limit"),
+        "{body}"
+    );
+    assert_eq!(app.tip(&format!("refs/heads/{}", fresh.0)).await, before);
+
+    // The session's own quota was not charged for the refused push.
+    let q = app
+        .http(
+            "GET",
+            "/api/v1/quota",
+            &[("Authorization", fresh.1.as_str())],
+            None,
+        )
+        .await;
+    assert_eq!(q.status, 200, "{}", q.text());
+    assert_eq!(q.json()["remaining"], 30);
+}
+
+/// Invariant: a push its caller's own quota refuses (a web session's, or a
+/// Git caller's per branch) gives its token back, so it does not count
+/// toward the server-wide ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_its_own_quota_refuses_does_not_spend_the_ceiling() {
+    let app = App::start(|c| {
+        c.pushes_per_minute = 1;
+        c.global_pushes_per_second = 0.001;
+        c.global_push_burst = 3;
+    })
+    .await;
+    let w = app.clone_work("w").await;
+    let session = web_session(&app).await;
+
+    w.paint(&[(1, 0, RED)], "one");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q"]).await;
+    assert!(ok, "{out}");
+    w.paint(&[(2, 0, RED)], "two");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q"]).await;
+    assert!(
+        !ok && out.contains("rate limited: 1 pushes a minute"),
+        "{out}"
+    );
+
+    let r = web_push(&app, &session, 3).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let r = web_push(&app, &session, 4).await;
+    assert_eq!(r.status, 429, "{}", r.text());
+    assert!(
+        r.text().contains("You can push 1 times a minute"),
+        "{}",
+        r.text()
+    );
+
+    // Two of the three tokens are spent; the two refusals took none.
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q2"]).await;
+    assert!(ok, "{out}");
+    w.paint(&[(5, 0, RED)], "three");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/q3"]).await;
+    assert!(!ok && out.contains("place is at its limit"), "{out}");
+}
+
+/// Invariant: only a push that passes every rule of its own takes a token
+/// from the server-wide ceiling. A Git push that breaks a tile rule and a
+/// delete of a paint/ branch are refused for their own reasons and leave
+/// the last token for the next valid push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_refused_for_a_rule_takes_no_token_from_the_ceiling() {
+    let app = App::start(|c| {
+        c.global_pushes_per_second = 0.001;
+        c.global_push_burst = 2;
+    })
+    .await;
+    let w = app.clone_work("w").await;
+    w.paint(&[(1, 0, RED)], "one");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/a"]).await;
+    assert!(ok, "{out}");
+    // One token left.
+
+    let bad = app.clone_work("bad").await;
+    bad.write("README.md", b"changed\n");
+    bad.git(&["add", "-A"]);
+    bad.git(&["commit", "-q", "-m", "bad"]);
+    let (ok, out) = bad.push(&[&app.url(), "HEAD:refs/heads/paint/bad"]).await;
+    assert!(
+        !ok && out.contains("README.md: only files under tiles/ may change"),
+        "{out}"
+    );
+    let (ok, out) = w
+        .push(&["-o", "force", &app.url(), ":refs/heads/paint/a"])
+        .await;
+    assert!(
+        !ok && out.contains("paint/ branches cannot be deleted"),
+        "{out}"
+    );
+    assert!(app.tip("refs/heads/paint/a").await.is_some());
+
+    // The last token is still there, and then it is gone.
+    w.paint(&[(2, 0, RED)], "two");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/c"]).await;
+    assert!(ok, "{out}");
+    w.paint(&[(3, 0, RED)], "three");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/d"]).await;
+    assert!(!ok && out.contains("place is at its limit"), "{out}");
+}
+
+/// Every file under `dir`, recursively.
+fn stored_files(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p);
+            }
+        }
+    }
+    out
 }
 
 /// Invariant (issue #121): the API's per-address limits read
@@ -1918,4 +2197,549 @@ async fn the_memory_of_recent_paint_survives_a_restart() {
     let msg = check.git(&["log", "-1", "--format=%B", "HEAD"]);
     assert!(msg.contains("People-tiles: 2,3 4,5"), "{msg}");
     assert!(msg.contains("Sprite-tiles: 9,9"), "{msg}");
+}
+
+/// Personas paint as agents: each push is one tile on an `agent/<slug>-<n>`
+/// branch, the feed names the persona, its commit's author is the persona
+/// (the server commits), and none of them paints a keep area or a tile a
+/// person just painted. The ambient sprite agents stay off while personas
+/// are on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn personas_paint_one_tile_per_push_as_agents_and_keep_off_peoples_work() {
+    use aspen_place::personas::{PersonaSettings, ROSTER};
+
+    let app = App::start(|c| {
+        c.rules.width = 32;
+        c.rules.height = 32;
+        // Would start six sprite agents if personas did not replace them.
+        c.ambient_agents = 6;
+        c.ambient_interval = Duration::from_millis(40);
+        c.ambient_merge_interval = Duration::from_secs(3600);
+        c.keep_areas = vec![(0, 0, 32, 8)];
+        c.personas = Some(PersonaSettings {
+            min_active: 3,
+            max_active: 4,
+            pushes_per_second: 40.0,
+            push_gap_ms: (20, 60),
+            pause_percent: 0,
+            ..PersonaSettings::default()
+        });
+    })
+    .await;
+    // A person paints a block before the personas start.
+    let w = app.clone_work("w").await;
+    let block: Vec<(u32, u32, &str)> = (12..20)
+        .flat_map(|y| (12..20).map(move |x| (x, y, RED)))
+        .collect();
+    w.paint(&block, "a person's block");
+    assert!(w.push(&[&app.url(), "HEAD:refs/heads/paint/me"]).await.0);
+    let mut feed = app.events("?after=0", &[]).await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+
+    let mut pushes = Vec::new();
+    while pushes.len() < 60 {
+        let e = feed
+            .next(Duration::from_secs(20))
+            .await
+            .expect("persona pushes");
+        if e.kind == "push" && e.data["branch"].as_str().unwrap().starts_with("agent/") {
+            pushes.push(e);
+        }
+    }
+    let mut branches = std::collections::HashSet::new();
+    for e in &pushes {
+        let branch = e.data["branch"].as_str().unwrap();
+        let label = e.data["actor"]["label"].as_str().unwrap();
+        assert_eq!(e.data["actor"]["kind"], "agent", "{e:?}");
+        let persona = ROSTER
+            .iter()
+            .find(|p| p.name == label)
+            .unwrap_or_else(|| panic!("{label} is not a persona (an old sprite agent?)"));
+        let n = branch
+            .strip_prefix(&format!("agent/{}-", persona.slug))
+            .unwrap_or_else(|| panic!("{branch} is not {label}'s"));
+        assert!(n.parse::<u64>().is_ok(), "{branch}");
+        let tiles = e.data["tiles"].as_array().unwrap();
+        assert_eq!(tiles.len(), 1, "one tile per push: {e:?}");
+        let (x, y) = (
+            tiles[0]["x"].as_u64().unwrap(),
+            tiles[0]["y"].as_u64().unwrap(),
+        );
+        assert!(y >= 8, "painted the keep area at {x},{y}");
+        assert!(
+            !((12..20).contains(&x) && (12..20).contains(&y)),
+            "painted over the person's block at {x},{y}"
+        );
+        branches.insert((branch.to_owned(), persona.author()));
+    }
+    assert!(branches.len() >= 3, "{branches:?}");
+    let active = app.place.personas_active();
+    assert!((3..=4).contains(&active.len()), "{active:?}");
+    for (name, branch) in &active {
+        let p = ROSTER.iter().find(|p| p.name == *name).unwrap();
+        assert!(
+            branch.starts_with(&format!("agent/{}-", p.slug)),
+            "{name} {branch}"
+        );
+    }
+
+    // The commit on a persona's branch is by the persona.
+    let (branch, author) = branches.iter().next().unwrap().clone();
+    let r = format!("refs/heads/{branch}");
+    w.git(&["fetch", "-q", &app.url(), &format!("{r}:{r}")]);
+    let who = w.git(&["log", "-1", "--format=%an <%ae>|%cn <%ce>", &r]);
+    assert_eq!(
+        who.trim(),
+        format!("{author}|place <place@aspen.invalid>"),
+        "{branch}"
+    );
+    let _ = stop.send(());
+    run.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn personas_resume_automatically_after_a_restart_without_visitor_budgets() {
+    fn tune(c: &mut aspen_place::PlaceConfig) {
+        c.rules.width = 32;
+        c.rules.height = 32;
+        c.pushes_per_minute = 1;
+        c.ambient_merge_interval = Duration::from_millis(100);
+        c.personas = Some(aspen_place::personas::PersonaSettings {
+            min_active: 1,
+            max_active: 1,
+            pushes_per_second: 10.0,
+            push_gap_ms: (20, 60),
+            pause_percent: 0,
+            ..Default::default()
+        });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let mut before = None;
+    for boot in 0..2 {
+        let app = App::start_in(path.clone(), None, tune).await;
+        if let Some(ref pixels) = before {
+            assert_eq!(&app.get("/api/v1/canvas").await["pixels"], pixels);
+        }
+        let mut feed = app.events("", &[]).await;
+        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(app.place.clone().run(async move {
+            let _ = rx.await;
+        }));
+        for _ in 0..5 {
+            feed.until(Duration::from_secs(20), |e| {
+                e.kind == "push" && e.data["branch"].as_str().unwrap().starts_with("agent/")
+            })
+            .await;
+        }
+        let _ = stop.send(());
+        run.await.unwrap();
+        before = Some(app.get("/api/v1/canvas").await["pixels"].clone());
+        assert!(
+            before
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .chars()
+                .any(|p| p != '.'),
+            "boot {boot} did not paint"
+        );
+    }
+}
+
+/// Personas never spend the server-wide push ceiling (#345): while they
+/// paint, people still find every token of it; once people have used it up
+/// (less than a tenth of its burst left), the personas stop pushing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn personas_leave_the_push_ceiling_to_people_and_back_off_at_it() {
+    use aspen_place::personas::PersonaSettings;
+
+    let app = App::start(|c| {
+        c.rules.width = 32;
+        c.rules.height = 32;
+        c.pushes_per_minute = 100;
+        c.ambient_merge_interval = Duration::from_secs(3600);
+        c.global_pushes_per_second = 0.001;
+        c.global_push_burst = 10;
+        c.personas = Some(PersonaSettings {
+            min_active: 3,
+            max_active: 3,
+            pushes_per_second: 40.0,
+            push_gap_ms: (20, 60),
+            pause_percent: 0,
+            backoff_ms: 50,
+            ..PersonaSettings::default()
+        });
+    })
+    .await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+    let agent_pushes = |evs: &[Ev]| {
+        evs.iter()
+            .filter(|e| {
+                e.kind == "push" && e.data["branch"].as_str().unwrap().starts_with("agent/")
+            })
+            .count()
+    };
+    let mut feed = app.events("", &[]).await;
+    let mut seen = Vec::new();
+    while agent_pushes(&seen) < 10 {
+        seen.push(
+            feed.next(Duration::from_secs(20))
+                .await
+                .expect("persona pushes"),
+        );
+    }
+    assert!(!app.place.push_ceiling_busy());
+
+    // People find the whole burst: the personas took none of it.
+    let s = app.http("POST", "/api/v1/sessions", &[], None).await.json();
+    let auth = format!("Bearer {}", s["token"].as_str().unwrap());
+    let h = [("Authorization", auth.as_str())];
+    for x in 0..10 {
+        let stroke = json!({ "branch": s["branch"], "tiles": [{ "x": x, "y": 31, "color": RED }] });
+        let r = app.http("POST", "/api/v1/pushes", &h, Some(&stroke)).await;
+        assert_eq!(r.status, 201, "push {x}: {}", r.text());
+    }
+    let stroke = json!({ "branch": s["branch"], "tiles": [{ "x": 20, "y": 31, "color": RED }] });
+    let r = app.http("POST", "/api/v1/pushes", &h, Some(&stroke)).await;
+    assert_eq!(r.status, 429, "the ceiling is spent: {}", r.text());
+    assert!(app.place.push_ceiling_busy());
+
+    // At the ceiling the personas push nothing (after any push already in
+    // flight lands).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut quiet = app.events("", &[]).await;
+    let after = events_for(&mut quiet, Duration::from_secs(2)).await;
+    assert_eq!(agent_pushes(&after), 0, "{after:?}");
+    let _ = stop.send(());
+    run.await.unwrap();
+}
+
+/// Every event the stream delivers within `window`, read against one
+/// fixed deadline: a stream that never goes quiet still ends on time, so a
+/// "nothing happened" check fails instead of hanging.
+async fn events_for(stream: &mut Sse, window: Duration) -> Vec<Ev> {
+    let deadline = std::time::Instant::now() + window;
+    let mut seen = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match stream.next(remaining).await {
+            Some(e) => seen.push(e),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// The kill switch stops the personas: no persona push lands while it is
+/// engaged (after any push already in flight), and they carry on once it
+/// is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kill_switch_stops_the_personas() {
+    use aspen_place::personas::PersonaSettings;
+
+    let app = App::start(|c| {
+        c.rules.width = 32;
+        c.rules.height = 32;
+        c.ambient_merge_interval = Duration::from_secs(3600);
+        c.personas = Some(PersonaSettings {
+            min_active: 3,
+            max_active: 4,
+            pushes_per_second: 40.0,
+            push_gap_ms: (20, 60),
+            pause_percent: 0,
+            ..PersonaSettings::default()
+        });
+    })
+    .await;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(app.place.clone().run(async move {
+        let _ = rx.await;
+    }));
+    let is_persona =
+        |e: &Ev| e.kind == "push" && e.data["branch"].as_str().unwrap().starts_with("agent/");
+    let mut feed = app.events("", &[]).await;
+    feed.until(Duration::from_secs(20), is_persona).await;
+
+    app.place.set_kill_switch(true, Some("test".into()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut quiet = app.events("", &[]).await;
+    let during = events_for(&mut quiet, Duration::from_secs(2)).await;
+    assert!(!during.iter().any(is_persona), "{during:?}");
+
+    app.place.set_kill_switch(false, None);
+    quiet.until(Duration::from_secs(20), is_persona).await;
+    let _ = stop.send(());
+    run.await.unwrap();
+}
+
+/// Invariant: the binary's object limit
+/// ([`aspen_place::defaults::max_object_bytes`], here the 64 KiB floor of
+/// the test canvas) refuses a commit whose message is larger, so commit
+/// messages and author lines can no longer reach 16 MiB, and stores
+/// nothing for it; an ordinary stroke still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_message_over_the_object_limit_is_refused() {
+    let app = App::start(|_| {}).await;
+    let limit = aspen_place::defaults::max_object_bytes(&config().rules).get();
+    assert_eq!(limit, aspen_place::defaults::MIN_OBJECT_BYTES);
+    let w = app.clone_work("w").await;
+    let refused = w.paint(&[(1, 1, RED)], &"m".repeat(limit as usize + 1));
+    let stored_before = stored_files(&app.dir.join("blobs"));
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/long"]).await;
+    assert!(
+        !ok && out.contains(&format!("over the {limit}-byte object limit")),
+        "{out}"
+    );
+    assert!(app.current("refs/heads/paint/long").await.is_none());
+    assert_nothing_stored(&app, &stored_before, &refused).await;
+
+    w.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    w.paint(&[(1, 1, RED)], "short");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/short"]).await;
+    assert!(ok, "{out}");
+
+    // The limit refuses only what is larger: a commit of exactly `limit`
+    // bytes lands, and the same commit one byte longer does not.
+    let size = |w: &Work| -> u64 { w.git(&["cat-file", "-s", "HEAD"]).trim().parse().unwrap() };
+    w.paint(&[(2, 2, RED)], "probe");
+    let message = "m".repeat((limit - size(&w)) as usize + "probe".len());
+    w.git(&["commit", "-q", "--amend", "-m", &message]);
+    assert_eq!(size(&w), limit, "a commit of exactly the limit");
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/exact"]).await;
+    assert!(ok, "{out}");
+    w.git(&["commit", "-q", "--amend", "-m", &format!("{message}m")]);
+    assert_eq!(size(&w), limit + 1);
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/over"]).await;
+    assert!(
+        !ok && out.contains(&format!("over the {limit}-byte object limit")),
+        "{out}"
+    );
+}
+
+/// Invariant: with the binary's default limits
+/// ([`aspen_place::defaults::limits`]) a pushed pack over
+/// [`aspen_place::defaults::MAX_PACK_BYTES`] (1 MiB) is refused before it
+/// is stored, even when every object in it is under the object limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pack_over_the_pack_limit_is_refused() {
+    let app = App::start_with_limits(aspen_place::defaults::limits(), |_| {}).await;
+    let w = app.clone_work("w").await;
+    // 24 incompressible 48 KiB files: about 1.2 MiB of pack.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    for i in 0..24 {
+        let bytes: Vec<u8> = (0..48 << 10)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        w.write(&format!("junk/{i}.bin"), &bytes);
+    }
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "too big"]);
+    let refused = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let stored_before = stored_files(&app.dir.join("blobs"));
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/big"]).await;
+    // Past the limit the server stops reading the body, so git either
+    // reads the refusal or sees the connection cut while still sending
+    // (`curl 55 Send failure`, `curl 56` / `Connection reset by peer`,
+    // `remote end hung up`): all are a refused push, and none stores
+    // anything.
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("push too large: at most 1048576 bytes per push")
+            || out.contains("hung up")
+            || out.contains("Broken pipe")
+            || out.contains("Connection reset by peer")
+            || out.contains("curl 56"),
+        "{out}"
+    );
+    assert!(app.current("refs/heads/paint/big").await.is_none());
+    assert_nothing_stored(&app, &stored_before, &refused).await;
+}
+
+/// A refused push stored nothing: the blob store holds the same files as
+/// `before` (which must not be empty, so a wrong path cannot pass), and
+/// its commit `refused` is not indexed.
+async fn assert_nothing_stored(
+    app: &App,
+    before: &std::collections::BTreeSet<std::path::PathBuf>,
+    refused: &str,
+) {
+    assert!(!before.is_empty(), "the blob store path holds the canvas");
+    assert_eq!(
+        &stored_files(&app.dir.join("blobs")),
+        before,
+        "the blob store is unchanged"
+    );
+    use aspen_core::meta::MetaStore;
+    let id: aspen_core::id::ObjectId = refused.parse().unwrap();
+    let lookup = app
+        .meta
+        .lookup_commits(
+            app.place.repo().id,
+            &aspen_core::ingest::SortedIds::from_unsorted(vec![id]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(lookup[..], [aspen_core::meta::CommitLookup::NotIndexed]),
+        "{lookup:?}"
+    );
+}
+
+/// Invariant: on a canvas whose full `tiles/` tree is over the 64 KiB
+/// floor (64 x 64: 150,272 bytes, the live demo) a full canvas still takes
+/// strokes over stock Git, merges, restarts its history (`bound_history`)
+/// and reopens after a process restart. The second stroke reaches the
+/// server as a delta of the full tree; with the object limit at exactly
+/// the tree size it was refused as `internal storage error`, which is why
+/// the limit has [`aspen_place::defaults::DELTA_HEADROOM`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_canvas_still_paints_merges_and_restarts_its_history() {
+    let tune = |c: &mut aspen_place::PlaceConfig| {
+        (c.rules.width, c.rules.height) = (64, 64);
+        // Filled in one push; and every merge restarts the history.
+        c.rules.tiles_per_push = 64 * 64;
+        c.history_max_bytes = 1;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let app = App::start_in(path.clone(), None, tune).await;
+    let mut rules = config().rules;
+    (rules.width, rules.height) = (64, 64);
+    let limit = aspen_place::defaults::max_object_bytes(&rules).get();
+    let full = aspen_place::defaults::full_tiles_tree_bytes(64, 64);
+    assert_eq!(full, 150_272);
+    assert!(full > aspen_place::defaults::MIN_OBJECT_BYTES);
+    assert_eq!(limit, aspen_place::defaults::DELTA_HEADROOM * full);
+
+    // A stock-Git stroke that fills every tile: its `tiles/` tree is the
+    // full tree.
+    let w = app.clone_work("ada").await;
+    let all: Vec<(u32, u32, &str)> = (0..64)
+        .flat_map(|x| (0..64).map(move |y| (x, y, RED)))
+        .collect();
+    w.paint(&all, "fill");
+    assert_eq!(
+        w.git(&["cat-file", "-s", "HEAD:tiles"]).trim(),
+        full.to_string()
+    );
+    let (ok, out) = w.push(&[&app.url(), "HEAD:refs/heads/paint/ada"]).await;
+    assert!(ok, "{out}");
+
+    // The merger writes `main`'s full tree, then restarts its history.
+    let old_main = app.tip("refs/heads/main").await.unwrap();
+    app.place.merge_once().await.unwrap().unwrap();
+    let merged = app.tip("refs/heads/main").await.unwrap();
+    assert_ne!(merged, old_main);
+    let root = app.place.bound_history().await.unwrap().expect("restarted");
+    assert_eq!(app.tip("refs/heads/main").await, Some(root.to_string()));
+    let check = app.clone_work("check").await;
+    assert_eq!(
+        check.git(&["cat-file", "-s", "HEAD:tiles"]).trim(),
+        full.to_string()
+    );
+    assert_eq!(check.git(&["rev-list", "--count", "HEAD"]).trim(), "1");
+
+    // Another stroke on the full canvas lands and merges onto the root.
+    check.paint(&[(5, 5, BLUE)], "repaint");
+    // Its `tiles/` tree goes out as a delta of the full tree: the thin
+    // pack `git push` builds (`pack-objects --thin` against what the
+    // server has), completed and listed, shows the tree with a delta base.
+    let tree = check.git(&["rev-parse", "HEAD:tiles"]).trim().to_owned();
+    let listed = blocking({
+        let (dir, git_dir) = (check.path.clone(), check.path.join(".git"));
+        move || {
+            let script = format!(
+                "printf 'HEAD\\n^origin/main\\n' | git pack-objects --revs --thin --stdout > '{g}/thin.pack' \\
+                 && git index-pack --stdin --fix-thin '{g}/fixed.pack' < '{g}/thin.pack' > /dev/null \\
+                 && git verify-pack -v '{g}/fixed.idx'",
+                g = git_dir.display()
+            );
+            let o = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8(o.stdout).unwrap()
+        }
+    })
+    .await;
+    let line = listed
+        .lines()
+        .find(|l| l.starts_with(&tree))
+        .unwrap_or_else(|| panic!("{tree} not in the pack:\n{listed}"));
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert!(
+        fields.len() == 7 && fields[1] == "tree",
+        "the stroke's tree is a delta (sha type size packed offset depth base): {line}"
+    );
+    let (ok, out) = check.push(&[&app.url(), "HEAD:refs/heads/paint/bob"]).await;
+    assert!(ok, "{out}");
+    app.place.merge_once().await.unwrap().unwrap();
+    let after = app.tip("refs/heads/main").await.unwrap();
+    assert_ne!(after, root.to_string());
+    drop(app);
+
+    // A process restart reads the full `main` back and keeps painting.
+    let app = App::start_in(path, Some(dir), tune).await;
+    assert_eq!(app.tip("refs/heads/main").await, Some(after));
+    let again = app.clone_work("again").await;
+    assert_eq!(
+        std::fs::read(again.path.join("tiles/5_5.txt")).unwrap(),
+        format!("{BLUE}\n").as_bytes()
+    );
+    again.paint(&[(6, 6, BLUE)], "after restart");
+    let (ok, out) = again.push(&[&app.url(), "HEAD:refs/heads/paint/cy"]).await;
+    assert!(ok, "{out}");
+    app.place.merge_once().await.unwrap().unwrap();
+}
+
+/// Invariant: under the binary's default Git limits
+/// ([`aspen_place::defaults::limits`] and `instance_limits`) one address
+/// may clone and push many times at once. 24 stock `git push`es from one
+/// address, all in flight together, all land; the old defaults (10 push
+/// requests at once, so 5 pushes, and 4 running per caller) refused most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_address_may_push_many_branches_at_once_under_the_default_limits() {
+    let app = App::start_with_limits(aspen_place::defaults::limits(), |_| {}).await;
+    let w = app.clone_work("w").await;
+    let mut tips = Vec::new();
+    for i in 0..24u32 {
+        w.git(&["checkout", "-q", "-B", &format!("b{i}"), "origin/main"]);
+        tips.push(w.paint(&[(i % 16, i / 16, RED)], &format!("stroke {i}")));
+    }
+    let pushes = (0..24u32).map(|i| {
+        let (w, url) = (w.clone(), app.url());
+        async move {
+            w.push(&[&url, &format!("b{i}:refs/heads/paint/many-{i}")])
+                .await
+        }
+    });
+    for (i, (ok, out)) in futures_util::future::join_all(pushes)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        assert!(ok, "push {i}: {out}");
+    }
+    for (i, tip) in tips.iter().enumerate() {
+        assert_eq!(
+            app.tip(&format!("refs/heads/paint/many-{i}"))
+                .await
+                .as_deref(),
+            Some(tip.as_str())
+        );
+    }
 }

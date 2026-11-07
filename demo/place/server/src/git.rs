@@ -140,11 +140,24 @@ pub fn write_commit(
     unix_seconds: i64,
     message: &str,
 ) -> Vec<u8> {
+    write_commit_by(tree, parents, who, who, unix_seconds, message)
+}
+
+/// [`write_commit`] with an author other than the committer (a persona's
+/// stroke: the persona is the author, the server the committer).
+pub fn write_commit_by(
+    tree: ObjectId,
+    parents: &[ObjectId],
+    author: &str,
+    who: &str,
+    unix_seconds: i64,
+    message: &str,
+) -> Vec<u8> {
     let mut out = format!("tree {tree}\n");
     for p in parents {
         out.push_str(&format!("parent {p}\n"));
     }
-    out.push_str(&format!("author {who} {unix_seconds} +0000\n"));
+    out.push_str(&format!("author {author} {unix_seconds} +0000\n"));
     out.push_str(&format!("committer {who} {unix_seconds} +0000\n\n"));
     // One message, any text, ending in one newline; no NUL bytes.
     let message = message.replace('\0', " ");

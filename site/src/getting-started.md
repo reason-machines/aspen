@@ -41,6 +41,8 @@ aspen dev
 local directory for packs, both under `./.aspen`. It creates a repository
 named `demo`, listens on `127.0.0.1:7070` and lets anyone who can reach it
 push, which is why it refuses to listen on anything but a loopback address.
+`--repo <name>` (repeatable) creates other repositories instead of `demo`;
+add `--repo demo` to keep it too.
 
 In a second terminal, push a repository to it:
 

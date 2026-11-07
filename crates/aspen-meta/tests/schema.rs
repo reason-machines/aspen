@@ -40,6 +40,7 @@ const PG_SQL: &str = concat!(
     include_str!("../migrations/postgres/0008_job_priority.sql"),
     include_str!("../migrations/postgres/0009_gc_cursor.sql"),
     include_str!("../migrations/postgres/0010_ref_version_txid.sql"),
+    include_str!("../migrations/postgres/0011_commit_generation.sql"),
 );
 const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0001_schema_v1.sql"),
@@ -52,6 +53,7 @@ const SQLITE_SQL: &str = concat!(
     include_str!("../migrations/sqlite/0008_job_priority.sql"),
     include_str!("../migrations/sqlite/0009_gc_cursor.sql"),
     include_str!("../migrations/sqlite/0010_ref_version_txid.sql"),
+    include_str!("../migrations/sqlite/0011_commit_generation.sql"),
 );
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1060,6 +1062,29 @@ fn cases(f: &Fx) -> (Labelled, Labelled) {
         "merge commit",
         c.set("parents", B([vec![1; 20], vec![2; 20]].concat())),
     ));
+    // Migration 0011.
+    good.push((
+        "commit with a generation and a root tree",
+        c.with(&[("generation", I(1)), ("root_tree", oid(3))]),
+    ));
+    good.push((
+        "commit waiting on another for its generation",
+        c.set("generation_waits_on", oid(4)),
+    ));
+    bad.extend([
+        (
+            "commit_index_generation_positive",
+            c.set("generation", I(0)),
+        ),
+        (
+            "commit_index_root_tree_len",
+            c.set("root_tree", B(vec![3; 21])),
+        ),
+        (
+            "commit_index_generation_waits_on_len",
+            c.set("generation_waits_on", B(vec![4; 19])),
+        ),
+    ]);
     bad.extend([
         ("commit_index_pkey", c.set("commit_oid", oid(10))),
         (
@@ -1594,6 +1619,21 @@ fn expected_indexes() -> BTreeSet<(String, String, bool, String, String)> {
             false,
             "repo_id,txid",
             "",
+        ),
+        // Migration 0011.
+        (
+            "commit_index",
+            "commit_index_unexamined",
+            false,
+            "repo_id,ref_version_id,commit_oid",
+            "generationisnullandgeneration_waits_onisnull",
+        ),
+        (
+            "commit_index",
+            "commit_index_waiting",
+            false,
+            "repo_id,generation_waits_on",
+            "generationisnullandgeneration_waits_onisnotnull",
         ),
     ]
     .into_iter()

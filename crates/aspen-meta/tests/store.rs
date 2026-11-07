@@ -82,6 +82,7 @@ const CASES: &[(&str, CaseFn)] = cases![
     a_group_commit_whose_transaction_fails_commits_no_push,
     the_database_refuses_a_version_that_is_not_the_expected_child,
     commit_rows_resolve_in_order_and_are_never_overwritten,
+    commit_generations_round_trip_page_and_are_never_overwritten,
     packs_register_idempotently_and_read_back_exactly,
     list_refs_filters_by_prefix_bytewise_and_paginates,
     list_refs_takes_any_number_of_prefixes,
@@ -460,6 +461,8 @@ async fn a_stale_expectation_loses_and_writes_nothing(c: Ctx) {
         commit: oid(3),
         parents: vec![oid(1)],
         committer_time: 7,
+        generation: None,
+        root_tree: None,
     });
     stale.jobs.push(VersionJob {
         kind: VersionJobKind::IndexCommits,
@@ -701,6 +704,8 @@ async fn a_group_commit_isolates_each_push_in_one_transaction(c: Ctx) {
         commit: oid(10),
         parents: vec![oid(1)],
         committer_time: 7,
+        generation: None,
+        root_tree: None,
     });
     first.jobs.push(VersionJob {
         kind: VersionJobKind::IndexCommits,
@@ -1002,6 +1007,8 @@ async fn a_group_commit_whose_transaction_fails_commits_no_push(c: Ctx) {
         commit: poison,
         parents: Vec::new(),
         committer_time: 1,
+        generation: None,
+        root_tree: None,
     });
     let batch = vec![
         PushCommit {
@@ -1058,6 +1065,8 @@ async fn an_atomic_push_is_all_or_nothing(c: Ctx) {
         commit: oid(3),
         parents: vec![],
         committer_time: 1,
+        generation: None,
+        root_tree: None,
     });
     let outcome = commit(
         s,
@@ -1086,6 +1095,8 @@ async fn an_atomic_push_is_all_or_nothing(c: Ctx) {
         commit: oid(5),
         parents: vec![oid(2)],
         committer_time: 2,
+        generation: None,
+        root_tree: None,
     });
     update_z.jobs.push(VersionJob {
         kind: VersionJobKind::IndexCommits,
@@ -1178,11 +1189,15 @@ async fn commit_rows_resolve_in_order_and_are_never_overwritten(c: Ctx) {
             commit: oid(11),
             parents: vec![oid(10), oid(9)],
             committer_time: 1_700_000_000,
+            generation: None,
+            root_tree: None,
         },
         NewCommit {
             commit: oid(10),
             parents: vec![],
             committer_time: 1_600_000_000,
+            generation: None,
+            root_tree: None,
         },
     ];
     let v1 = committed(s, repo, vec![w]).await.remove(0);
@@ -1195,12 +1210,16 @@ async fn commit_rows_resolve_in_order_and_are_never_overwritten(c: Ctx) {
                 ref_version: v2.id,
                 parents: vec![],
                 committer_time: 0,
+                generation: None,
+                root_tree: None,
             },
             CommitRow {
                 commit: oid(12),
                 ref_version: v2.id,
                 parents: vec![oid(11)],
                 committer_time: 5,
+                generation: None,
+                root_tree: None,
             },
         ],
     )
@@ -1221,18 +1240,24 @@ async fn commit_rows_resolve_in_order_and_are_never_overwritten(c: Ctx) {
                 ref_version: v1.id,
                 parents: vec![],
                 committer_time: 1_600_000_000,
+                generation: None,
+                root_tree: None,
             }),
             CommitLookup::Indexed(CommitRow {
                 commit: oid(11),
                 ref_version: v1.id,
                 parents: vec![oid(10), oid(9)],
                 committer_time: 1_700_000_000,
+                generation: None,
+                root_tree: None,
             }),
             CommitLookup::Indexed(CommitRow {
                 commit: oid(12),
                 ref_version: v2.id,
                 parents: vec![oid(11)],
                 committer_time: 5,
+                generation: None,
+                root_tree: None,
             }),
             CommitLookup::NotIndexed,
         ]
@@ -1252,6 +1277,8 @@ async fn commit_rows_resolve_in_order_and_are_never_overwritten(c: Ctx) {
             ref_version: v2.id,
             parents: vec![oid_n(n + 1)],
             committer_time: i64::from(n),
+            generation: None,
+            root_tree: None,
         })
         .collect();
     s.index_commits(repo, &rows).await.unwrap();
@@ -1267,6 +1294,163 @@ async fn commit_rows_resolve_in_order_and_are_never_overwritten(c: Ctx) {
             }
             CommitLookup::NotIndexed => assert!(n >= 1200),
         }
+    }
+}
+
+/// Migration 0011 (decisions log, "12c: generation numbers"): a row's
+/// generation and root tree round-trip through a push and through the
+/// indexing job's insert; `unexamined_commits` pages through exactly the
+/// rows without one that wait on nothing, in (version, ID) order, per
+/// repository; `set_generation_waits_on` takes a row out of those pages
+/// and into `commits_waiting_on`'s answer for what it waits on, and never
+/// marks a row that has a generation; and `set_generations` fills only
+/// rows that have none (clearing what they waited on), so a value once
+/// written is never changed (generations are derived, so a second writer
+/// computes the same value anyway).
+async fn commit_generations_round_trip_page_and_are_never_overwritten(c: Ctx) {
+    let s = &c.store;
+    let repo = new_repo(s, "acme/gen").await.id;
+    let other = new_repo(s, "acme/gen2").await.id;
+    let p = pack(s, repo, 1).await;
+    let mut w = live(MAIN, None, oid(21), p);
+    w.commits = vec![
+        NewCommit {
+            commit: oid(21),
+            parents: vec![oid(20)],
+            committer_time: 7,
+            generation: Some(2),
+            root_tree: Some(oid(99)),
+        },
+        NewCommit {
+            commit: oid(20),
+            parents: vec![],
+            committer_time: 6,
+            generation: None,
+            root_tree: None,
+        },
+    ];
+    let v = committed(s, repo, vec![w]).await.remove(0);
+    let rows: Vec<CommitRow> = (0..1500)
+        .map(|n| CommitRow {
+            commit: oid_n(1000 + n),
+            ref_version: v.id,
+            parents: vec![],
+            committer_time: 1,
+            generation: (n % 2 == 0).then_some(1),
+            root_tree: Some(oid_n(9000 + n)),
+        })
+        .collect();
+    s.index_commits(repo, &rows).await.unwrap();
+    let got = s
+        .lookup_commits(repo, &SortedIds::from_unsorted(vec![oid(21), oid_n(1001)]))
+        .await
+        .unwrap();
+    let rows_of = |l: &[CommitLookup]| -> Vec<(Option<u64>, Option<ObjectId>)> {
+        l.iter()
+            .map(|l| match l {
+                CommitLookup::Indexed(r) => (r.generation, r.root_tree),
+                CommitLookup::NotIndexed => panic!("indexed"),
+            })
+            .collect()
+    };
+    let mut want = vec![(Some(2), Some(oid(99))), (None, Some(oid_n(9001)))];
+    if oid(21) > oid_n(1001) {
+        want.reverse();
+    }
+    assert_eq!(rows_of(&got), want);
+
+    // Pages: oid(20) and the 750 odd rows, in (version, ID) order (all
+    // name the push's version, so by ID). Nothing of the other
+    // repository's.
+    let pages = |limit: usize| async move {
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = s.unexamined_commits(repo, after, limit).await.unwrap();
+            assert!(page.len() <= limit);
+            let Some(last) = page.last() else { break };
+            after = Some((last.ref_version, last.commit));
+            assert!(page.iter().all(|r| r.generation.is_none()));
+            seen.extend(page.iter().map(|r| (r.ref_version, r.commit)));
+        }
+        seen
+    };
+    let seen = pages(100).await;
+    assert_eq!(seen.len(), 751);
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "(version, ID) order");
+    assert!(seen.contains(&(v.id, oid(20))));
+    assert!(
+        s.unexamined_commits(other, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let seen: Vec<ObjectId> = seen.into_iter().map(|(_, c)| c).collect();
+
+    // Waits: the first 600 unexamined rows wait on 21 or 20 by parity; a
+    // wait recorded for 21, which has a generation, is ignored. They leave
+    // the unexamined pages and are listed as waiting, up to a limit.
+    let waits: Vec<(ObjectId, ObjectId)> = seen[..600]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, if i % 2 == 0 { oid(21) } else { oid(20) }))
+        .chain([(oid(21), oid(20))])
+        .collect();
+    s.set_generation_waits_on(repo, &waits).await.unwrap();
+    s.set_generation_waits_on(repo, &[]).await.unwrap();
+    assert_eq!(pages(1000).await.len(), 151);
+    let on = |ids: Vec<ObjectId>, limit: usize| async move {
+        let mut got: Vec<ObjectId> = s
+            .commits_waiting_on(repo, &SortedIds::from_unsorted(ids), limit)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.commit)
+            .collect();
+        got.sort();
+        got
+    };
+    let mut want_20: Vec<ObjectId> = seen[..600].iter().skip(1).step_by(2).copied().collect();
+    want_20.sort();
+    assert_eq!(on(vec![oid(20)], 1000).await, want_20);
+    assert_eq!(on(vec![oid(20), oid(21)], 1000).await.len(), 600);
+    assert_eq!(on(vec![oid(20), oid(21)], 250).await.len(), 250);
+    assert!(on(vec![oid(22)], 1000).await.is_empty());
+    assert!(
+        s.commits_waiting_on(other, &SortedIds::from_unsorted(vec![oid(20)]), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Fill: odd rows get 5, and an attempt to change 21's 2 (and an even
+    // row's 1) is ignored. Filled rows wait on nothing any more.
+    let mut set: Vec<(ObjectId, u64)> = seen.iter().map(|id| (*id, 5)).collect();
+    set.push((oid(21), 9));
+    set.push((oid_n(1000), 9));
+    s.set_generations(repo, &set).await.unwrap();
+    s.set_generations(repo, &[]).await.unwrap();
+    assert!(pages(10).await.is_empty());
+    assert!(on(vec![oid(20), oid(21)], 1000).await.is_empty());
+    let got = s
+        .lookup_commits(
+            repo,
+            &SortedIds::from_unsorted(vec![oid(21), oid(20), oid_n(1000), oid_n(1001)]),
+        )
+        .await
+        .unwrap();
+    for l in got {
+        let CommitLookup::Indexed(r) = l else {
+            panic!("indexed")
+        };
+        let want = if r.commit == oid(21) {
+            2
+        } else if r.commit == oid_n(1000) {
+            1
+        } else {
+            5
+        };
+        assert_eq!(r.generation, Some(want), "{}", r.commit);
     }
 }
 
@@ -1731,7 +1915,9 @@ async fn versions_by_seq_serves_have_tips(c: Ctx) {
 }
 
 /// `current_versions` answers every name in the order asked, `None` for a
-/// name with no `refs` row, deletions included, in one statement.
+/// name with no `refs` row, deletions included, in one statement, with each
+/// tip's generation from this repository's `commit_index` row (`None` for a
+/// deletion, a tip without a row, or a row without a generation).
 async fn current_versions_reads_many_refs_in_one_statement(c: Ctx) {
     let s = &c.store;
     let repo = new_repo(s, "acme/r").await.id;
@@ -1744,15 +1930,66 @@ async fn current_versions_reads_many_refs_in_one_statement(c: Ctx) {
     let gone = committed(s, repo, vec![delete("refs/heads/b", b.id)])
         .await
         .remove(0);
-    advance(s, other, "refs/heads/x", oid(4), q).await;
-    let names = [rn("refs/heads/x"), rn(MAIN), rn("refs/heads/b"), rn(MAIN)];
+    let x = advance(s, other, "refs/heads/x", oid(4), q).await;
+    let no_generation = advance(s, repo, "refs/heads/c", oid(5), p).await;
+    let no_row = advance(s, repo, "refs/heads/d", oid(6), p).await;
+    let row = |commit, ref_version, generation| CommitRow {
+        commit,
+        ref_version,
+        parents: vec![],
+        committer_time: 1,
+        generation,
+        root_tree: None,
+    };
+    s.index_commits(
+        repo,
+        &[
+            row(oid(2), main, Some(7)),
+            row(oid(5), no_generation.id, None),
+        ],
+    )
+    .await
+    .unwrap();
+    // The same commit in another repository: not this one's row.
+    s.index_commits(other, &[row(oid(2), x.id, Some(99))])
+        .await
+        .unwrap();
+    let names = [
+        rn("refs/heads/x"),
+        rn(MAIN),
+        rn("refs/heads/b"),
+        rn(MAIN),
+        rn("refs/heads/c"),
+        rn("refs/heads/d"),
+    ];
     let before = s.statements();
     let got = s.current_versions(repo, &names).await.unwrap();
     assert_eq!((s.statements() - before).queries, 1, "one statement");
-    let ids: Vec<_> = got.iter().map(|v| v.as_ref().map(|v| v.id)).collect();
-    assert_eq!(ids, vec![None, Some(main), Some(gone.id), Some(main)]);
+    let ids: Vec<_> = got
+        .iter()
+        .map(|v| v.as_ref().map(|v| v.version.id))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            None,
+            Some(main),
+            Some(gone.id),
+            Some(main),
+            Some(no_generation.id),
+            Some(no_row.id)
+        ]
+    );
+    let generations: Vec<_> = got
+        .iter()
+        .map(|v| v.as_ref().and_then(|v| v.tip_generation))
+        .collect();
+    assert_eq!(generations, vec![None, Some(7), None, Some(7), None, None]);
     for (n, v) in names.iter().zip(&got) {
-        assert_eq!(*v, s.current_version(repo, n).await.unwrap());
+        assert_eq!(
+            v.as_ref().map(|v| v.version.clone()),
+            s.current_version(repo, n).await.unwrap()
+        );
     }
     assert!(s.current_versions(repo, &[]).await.unwrap().is_empty());
 }
@@ -1897,6 +2134,8 @@ async fn a_branch_push_commits_in_few_statements(c: Ctx) {
             commit: oid(n),
             parents: vec![oid(1)],
             committer_time: 10,
+            generation: None,
+            root_tree: None,
         }];
         w.jobs = vec![aspen_core::meta::VersionJob {
             kind: aspen_core::meta::VersionJobKind::Compact,
@@ -3070,6 +3309,8 @@ async fn concurrent_pushes_index_shared_commits_in_any_order(c: Ctx) {
                     commit,
                     parents: vec![],
                     committer_time: 0,
+                    generation: None,
+                    root_tree: None,
                 })
                 .collect();
             let (s, barrier) = (s.clone(), Arc::clone(&barrier));
@@ -3116,6 +3357,8 @@ async fn a_cancelled_push_is_all_or_nothing_and_releases_its_locks(c: Ctx) {
                 commit: oid_n(round * 100 + n),
                 parents: vec![],
                 committer_time: 0,
+                generation: None,
+                root_tree: None,
             })
             .collect();
         let push = PushCommit {

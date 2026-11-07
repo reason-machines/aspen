@@ -37,6 +37,12 @@ locals {
     PLACE_TRUSTED_PROXY_HOPS = "1"
     PLACE_DB_MAX_CONNECTIONS = tostring(local.place_db_max_connections)
     PLACE_MIRROR_URL         = var.place_canvas_mirror == null ? "" : "https://github.com/${var.place_canvas_mirror}"
+    PLACE_PERSONAS           = tostring(var.place_personas)
+    # 80% of the task's memory (MiB), as aspen-place's own default
+    # (defaults::memory_high_water). Set here too so the guard holds even
+    # where the process cannot see the task's limit (Fargate sets it on a
+    # parent cgroup).
+    PLACE_MEMORY_HIGH_WATER_BYTES = tostring(floor(local.place_memory * 1048576 / 100) * 80)
   }, var.place_environment)
 }
 
@@ -443,13 +449,18 @@ resource "aws_lb_target_group" "place" {
   # second here is a second the demo is down during a deploy.
   deregistration_delay = 15
 
+  # Frequent, so a new task takes traffic soon after it listens: during a
+  # deploy there is no other place task, and the load balancer answers 503
+  # until this one passes a check. A running task is marked unhealthy only
+  # after 6 failed checks in a row, and with every registered target
+  # unhealthy the load balancer sends to them anyway.
   health_check {
     path                = "/api/v1/config"
     matcher             = "200"
-    interval            = 15
-    timeout             = 5
+    interval            = 5
+    timeout             = 4
     healthy_threshold   = 2
-    unhealthy_threshold = 3
+    unhealthy_threshold = 6
   }
 
   lifecycle {
@@ -569,6 +580,14 @@ locals {
     essential = false
     dependsOn = [{ containerName = "place", condition = "START" }]
     command   = ["sh", "-c", file("${path.module}/canvas-mirror.sh")]
+    # Stop at once on SIGTERM. ECS stops this container before place (it
+    # depends on place), and `sh` as PID 1 ignores SIGTERM, so without an
+    # init it held place's own SIGTERM back until ECS killed it, adding
+    # half a minute to every deploy, during which the load balancer has no
+    # place to send to and answers 503. It has nothing to flush: a push cut
+    # short is pushed again by the next task's mirror.
+    linuxParameters = { initProcessEnabled = true }
+    stopTimeout     = 5
     environment = [
       { name = "MIRROR_REPO", value = coalesce(var.place_canvas_mirror, "-") },
       { name = "MIRROR_SOURCE", value = "http://127.0.0.1:${var.place_port}/canvas.git" },

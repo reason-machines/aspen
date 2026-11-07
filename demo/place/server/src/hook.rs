@@ -18,7 +18,16 @@
 //!    before a reset still pushes, without walking the old history first;
 //! 3. diffs each commit against its first parent and runs
 //!    [`rules::validate_push`] over them;
-//! 4. charges the push to the caller's per-branch quota.
+//! 4. takes a token from the server-wide push ceiling
+//!    ([`Shared::take_push`], shared with web strokes), then charges the
+//!    push to the caller's per-branch quota, giving the token back if the
+//!    quota refuses (an update asked about again after a lost
+//!    compare-and-swap takes another, as it is charged to its quota
+//!    again). Either refusal is the update's `ng` reason, which Git
+//!    prints as `! [remote rejected] ... (<reason>)`. The pack was read
+//!    by then, but nothing of a refused update is stored: receive-pack
+//!    uploads a pack only when an update that names it is about to
+//!    commit.
 //!
 //! The tiles it accepted are kept until the update commits; then
 //! [`PushHook::committed`] records the push, which gives it its sequence
@@ -28,6 +37,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use aspen_core::error::StoreError;
 use aspen_core::id::{ObjectId, RefVersionId, RepoId};
@@ -40,7 +50,7 @@ use aspen_server::receive::hook::{
 };
 
 use crate::git::{MODE_TREE, TreeEntry, parse_commit, parse_tree};
-use crate::limits::Windows;
+use crate::limits::{PushCeiling, Windows};
 use crate::rules::{
     self, ChangeKind, FileChange, PushedCommit, Pusher, Rejection, Rules, TILE_MODE, Tile,
 };
@@ -208,6 +218,9 @@ pub struct Shared {
     pub git_quota: Mutex<Windows>,
     /// Which commits are on `main`'s history, past or present.
     pub main_history: Arc<dyn MainHistory>,
+    /// Every push the server takes from outside, web strokes and Git
+    /// updates together ([`Shared::take_push`]).
+    pub pushes: Mutex<PushCeiling>,
 }
 
 /// What the commit index says about one commit, for [`MainHistory`].
@@ -296,6 +309,64 @@ impl<M: MetaStore + std::fmt::Debug + 'static> MainHistory for IndexedMain<M> {
             }
             Ok(out)
         })
+    }
+}
+
+/// The server-wide push ceiling refused a push; retry after this long.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AtLimit {
+    /// The ceiling's sustained rate, for the message.
+    pub per_second: f64,
+    /// When to retry, in whole seconds (at least 1).
+    pub retry_after_secs: u64,
+}
+
+impl AtLimit {
+    /// One line for a Git `ng` reason or an API error.
+    pub fn message(&self) -> String {
+        format!(
+            "place is at its limit: about {} pushes a second from everyone together. \
+             This push was not taken; retry in {} s",
+            self.per_second, self.retry_after_secs
+        )
+    }
+}
+
+impl Shared {
+    /// Takes one push from the server-wide ceiling. Web strokes and Git
+    /// updates from outside take one each; the server's own writers (the
+    /// merger bot, ambient and swarm agents) take none, so merges never
+    /// wait on it.
+    ///
+    /// A refusal leaves a log line on standard error, the first at once and
+    /// then at most one every [`crate::limits::REFUSAL_REPORT_EVERY`],
+    /// counting the refusals since the line before and in all.
+    pub fn take_push(&self) -> Result<(), AtLimit> {
+        let mut ceiling = self.pushes.lock().expect("not poisoned");
+        let refused = match ceiling.take(Instant::now()) {
+            Ok(()) => return Ok(()),
+            Err(r) => r,
+        };
+        let (per_second, burst) = (ceiling.per_second(), ceiling.burst());
+        drop(ceiling);
+        if let Some((since, total)) = refused.report {
+            eprintln!(
+                "place: push ceiling ({per_second}/s, burst {burst}) refused {since} pushes since its last report, {total} in all"
+            );
+        }
+        Err(AtLimit {
+            per_second,
+            retry_after_secs: refused.wait.as_secs_f64().ceil().max(1.0) as u64,
+        })
+    }
+
+    /// Gives back a push taken with [`Shared::take_push`] that a later
+    /// check refused, so it does not count.
+    pub fn give_back_push(&self) {
+        self.pushes
+            .lock()
+            .expect("not poisoned")
+            .give_back(Instant::now());
     }
 }
 
@@ -511,6 +582,9 @@ async fn check_git_update(
         Ok(t) => t,
         Err(r) => return Ok(refuse(r)),
     };
+    if let Err(at_limit) = shared.take_push() {
+        return Ok(refuse_one(at_limit.message()));
+    }
     let quota_key = format!("{}\n{name}", update.caller.key);
     let admitted = shared
         .git_quota
@@ -518,6 +592,7 @@ async fn check_git_update(
         .expect("not poisoned")
         .admit(&quota_key, now_ms());
     if let Err(retry_after_ms) = admitted {
+        shared.give_back_push();
         return Ok(refuse_one(format!(
             "rate limited: {} pushes a minute per address and branch; retry in {} s",
             limits.pushes_per_minute,

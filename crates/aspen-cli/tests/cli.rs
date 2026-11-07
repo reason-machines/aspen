@@ -376,6 +376,47 @@ fn dev_serves_push_and_clone_and_keeps_data_across_restarts() {
     assert_eq!(git_ok(&again, &["rev-parse", "HEAD"]), tip);
 }
 
+/// `aspen dev --repo` names the repositories to create, replacing the
+/// default `demo` rather than adding to it; `--repo demo --repo extra`
+/// keeps both. On fresh data directories, as `deploy/README.md` and the
+/// flag's help describe it (reason-machines/aspen#11).
+#[test]
+fn dev_repo_flags_replace_the_default_demo_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let repos_served = |name: &str, repo_args: &[&str], probe: &[&str]| -> Vec<bool> {
+        let mut c = aspen();
+        c.args(["dev", "--listen", "127.0.0.1:0"])
+            .args(repo_args)
+            .arg("--data-dir")
+            .arg(dir.path().join(name));
+        let server = Running::start(c);
+        let served = probe
+            .iter()
+            .map(|repo| {
+                git(
+                    dir.path(),
+                    &["ls-remote", &server.url(&format!("/{repo}.git"))],
+                )
+                .status
+                .success()
+            })
+            .collect();
+        assert_eq!(server.terminate().code(), Some(0));
+        served
+    };
+    let probe = ["demo", "extra"];
+    assert_eq!(repos_served("default", &[], &probe), [true, false]);
+    assert_eq!(
+        repos_served("extra", &["--repo", "extra"], &probe),
+        [false, true],
+        "--repo extra replaces demo"
+    );
+    assert_eq!(
+        repos_served("both", &["--repo", "demo", "--repo", "extra"], &probe),
+        [true, true]
+    );
+}
+
 /// `aspen dev` (and so `aspen serve`) runs the background worker (C1): 16
 /// single-commit pushes to `main` end a level-1 cover at the default
 /// fanout, the push enqueues a `compact` job, and the worker drains the

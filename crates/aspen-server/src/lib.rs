@@ -67,7 +67,7 @@ use std::time::Duration;
 use access::{Access, Authorized, Endpoint};
 use aspen_auth::{SshKeyStore, TokenStore};
 use aspen_blob::{LocalBlobStore, RECOMMENDED_MAX_PRESIGN_TTL};
-use aspen_core::blob::BlobStore;
+use aspen_core::blob::{BlobCaller, BlobStore};
 use aspen_core::meta::MetaStore;
 use aspen_express::{Express, Routes};
 use aspen_pack::MaxObjectBytes;
@@ -436,6 +436,7 @@ where
     pub async fn render_metrics(&self) -> String {
         let mut text = String::new();
         metrics::render_build_info(&mut text);
+        metrics::render_blob_requests(&mut text, aspen_blob::RequestCounts::global());
         text.push_str(&self.metrics().render());
         if let Some(receive) = &self.inner.receive {
             receive.render_metrics(&mut text);
@@ -637,9 +638,15 @@ where
     let Authorized { repo, route, .. } = authorized;
     match route.endpoint {
         Endpoint::UploadPackAdvertisement => {
-            upload_pack::advertise(server, repo, route, &parts).await
+            BlobCaller::Fetch
+                .scope(upload_pack::advertise(server, repo, route, &parts))
+                .await
         }
-        Endpoint::UploadPack => upload_pack::serve(server, repo, authorized, &parts, body).await,
+        Endpoint::UploadPack => {
+            BlobCaller::Fetch
+                .scope(upload_pack::serve(server, repo, authorized, &parts, body))
+                .await
+        }
         Endpoint::ReceivePackAdvertisement | Endpoint::ReceivePack => match server.receive_pack() {
             Some(svc) => receive::http::serve(svc, authorized, &parts, body).await,
             None => plain(

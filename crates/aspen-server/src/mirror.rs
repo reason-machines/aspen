@@ -200,7 +200,8 @@ where
             .ok_or_else(|| StoreError::Unavailable {
                 reason: "mirror mode needs the receive-pack service".into(),
             })?;
-        svc.import(repo, update, pack)
+        aspen_core::blob::BlobCaller::Mirror
+            .scope(svc.import(repo, update, pack))
             .await
             .map_err(|ServiceError::Store(e)| e)
     }

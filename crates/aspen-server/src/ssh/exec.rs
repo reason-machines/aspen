@@ -164,31 +164,32 @@ where
         Service::UploadPack => {
             let input = PktInput::new(StreamReader::new(data(read)));
             let repo = &authorized.route.repo;
-            upload_pack::serve_connection(
-                &shared.server,
-                &authorized,
-                requested,
-                input,
-                stdout,
-                // Each later v2 command is decided as one HTTP POST is:
-                // identify the key (a failed check drains the address's
-                // failed-authentication bucket), authorize by name, charge
-                // the bucket.
-                || async {
-                    let identity = identify_now(&shared.access, &credential, address)
-                        .await
-                        .map_err(|r| r.message())?;
-                    identity
-                        .authorize(repo, Need::Read)
-                        .map_err(|e| Refusal::Auth(e).message())?;
-                    shared
-                        .access
-                        .charge(RequestClass::Read, &key, Instant::now())
-                        .map_err(|e| e.to_string())
-                },
-            )
-            .await
-            .map(|end| end == upload_pack::SessionEnd::Done)
+            aspen_core::blob::BlobCaller::Fetch
+                .scope(upload_pack::serve_connection(
+                    &shared.server,
+                    &authorized,
+                    requested,
+                    input,
+                    stdout,
+                    // Each later v2 command is decided as one HTTP POST is:
+                    // identify the key (a failed check drains the address's
+                    // failed-authentication bucket), authorize by name, charge
+                    // the bucket.
+                    || async {
+                        let identity = identify_now(&shared.access, &credential, address)
+                            .await
+                            .map_err(|r| r.message())?;
+                        identity
+                            .authorize(repo, Need::Read)
+                            .map_err(|e| Refusal::Auth(e).message())?;
+                        shared
+                            .access
+                            .charge(RequestClass::Read, &key, Instant::now())
+                            .map_err(|e| e.to_string())
+                    },
+                ))
+                .await
+                .map(|end| end == upload_pack::SessionEnd::Done)
         }
         Service::ReceivePack => {
             let Some(svc) = shared.server.receive_pack() else {

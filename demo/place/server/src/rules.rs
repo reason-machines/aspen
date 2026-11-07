@@ -11,7 +11,10 @@ pub const TRUNK_REF: &str = "refs/heads/main";
 /// Branch namespaces the server writes for its own painters (web visitors,
 /// ambient agents, the swarm). A Git client may not push into them, so a
 /// visitor's branch only ever moves through that visitor's session.
-pub const RESERVED_PREFIXES: [&str; 3] = ["visitors/", "agent/", "swarm/"];
+pub const RESERVED_PREFIXES: [&str; 3] = ["visitors/", AMBIENT_PREFIX, "swarm/"];
+
+/// The ambient agents' branch namespace (sprite agents and personas).
+pub const AMBIENT_PREFIX: &str = "agent/";
 
 /// Branches under this prefix (after `refs/heads/`) only move forward
 /// for Git clients: they may be created and fast-forwarded, never deleted
