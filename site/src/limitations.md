@@ -41,7 +41,8 @@ the reason behind each choice.
   `/-/express`) has been tested with mocked providers, not yet against a
   real distribution. Its URLs go to Git 2.56 and later only; older clients
   download from the servers' `/-/express`.
-- **Mirror mode**: HTTPS upstreams only (no SSH), no Git LFS, and a first
+- **Mirror mode**: HTTP(S) upstreams only (no SSH), and a credential is
+  sent only over HTTPS or to a loopback address. No Git LFS, and a first
   import fetches each ref separately, which is slow for tens of thousands
   of tags.
 - **Storage overhead.** Compaction keeps the packs it merges, and

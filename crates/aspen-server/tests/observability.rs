@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aspen_auth::{AuthService, Limits, LimitsConfig, MemoryTokenStore, PolicyConfig};
-use aspen_blob::LocalBlobStore;
+use aspen_blob::{AnyBlobStore, LocalBlobStore};
+use aspen_core::blob::{BlobCaller, BlobKey, BlobStore as _, ByteRange};
 use aspen_core::error::RejectReason;
 use aspen_core::id::JobId;
 use aspen_core::id::PackChecksum;
@@ -248,6 +249,19 @@ impl Exposition {
             .find(|(n, l, _)| n == name && *l == want)
             .unwrap_or_else(|| panic!("no sample {name}{labels:?}"))
             .2
+    }
+
+    /// Like [`Exposition::value`], but 0 when the sample is not exported
+    /// yet.
+    fn value_or_zero(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+        let want: BTreeMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        self.families
+            .get(name)
+            .and_then(|f| f.samples.iter().find(|(n, l, _)| n == name && *l == want))
+            .map_or(0.0, |s| s.2)
     }
 
     /// Whether `token` (a family, or a histogram's `_bucket`, `_sum` or
@@ -934,4 +948,48 @@ fn the_lint_rejects_malformed_expositions() {
             "accepted:\n{bad}"
         );
     }
+}
+
+/// Invariant (12a): a request through [`AnyBlobStore`] (the store `aspen
+/// serve` runs on) is exported at `/-/metrics` under the caller whose
+/// scope sent it and the file its key names, with the bytes it read.
+#[test]
+fn blob_requests_are_exported_by_caller_and_file() {
+    let s = writable_server();
+    let dir = tempfile::tempdir().unwrap();
+    let store = AnyBlobStore::Local(LocalBlobStore::open(dir.path().join("blobs")).unwrap());
+    let src = dir.path().join("src");
+    fs::write(&src, vec![7u8; 100]).unwrap();
+    let key = BlobKey::new("repos/1/packs/observability-12a.pack").unwrap();
+    s.block_on(async { store.upload_file(&key, &src).await.unwrap() });
+
+    let requests = (
+        "aspen_blob_requests_total",
+        [("caller", "fetch"), ("file", "pack"), ("kind", "get")],
+    );
+    let bytes = (
+        "aspen_blob_get_bytes_total",
+        [("caller", "fetch"), ("file", "pack")],
+    );
+    // Counts are process-wide, so compare against a scrape taken first.
+    let m = metrics(&s);
+    let before = (
+        m.value_or_zero(requests.0, &requests.1),
+        m.value_or_zero(bytes.0, &bytes.1),
+    );
+    s.block_on(BlobCaller::Fetch.scope(async {
+        let r = ByteRange::new(10, 40).unwrap();
+        store.read_range(&key, r).await.unwrap();
+        store.read_range(&key, r).await.unwrap();
+    }));
+
+    let m = metrics(&s);
+    assert!(
+        m.value(requests.0, &requests.1) >= before.0 + 2.0,
+        "two fetch GETs of a pack"
+    );
+    assert!(
+        m.value(bytes.0, &bytes.1) >= before.1 + 60.0,
+        "60 bytes read by fetch from a pack"
+    );
 }

@@ -7,8 +7,11 @@
 //! `packfile-uris` (S3). There is no streaming write: nothing is teed into
 //! the store while a pack is still being received.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::error::StoreError;
@@ -244,6 +247,204 @@ pub trait BlobStore: Send + Sync {
     ) -> impl Future<Output = Result<PresignedUrl, StoreError>> + Send;
 }
 
+/// Which part of Aspen a blob store request serves: the `caller` label of
+/// the request counters the stores keep (`aspen_blob`, exported at
+/// `/-/metrics` as `aspen_blob_*`).
+///
+/// The label travels with the work, not with the store: a request is
+/// counted under the caller of the innermost [`BlobCaller::scope`] that
+/// polls it, so one store (and one `.idx` cache in front of it) serves
+/// every caller and still says who asked. Outside any scope it is
+/// [`BlobCaller::Other`]. A scope covers what its future polls on the same
+/// task; work handed to `tokio::spawn` starts outside it, so a spawner
+/// wraps the spawned future in a scope of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BlobCaller {
+    /// The receive-pack advertisement before a push.
+    PushAdvertise,
+    /// A push computing its search packs (the closures of its
+    /// dependencies), and widening them.
+    PushSearch,
+    /// A push reading its delta bases (push path, base prefetch).
+    PushPrefetch,
+    /// A push's object graph: the walk of the changed paths (old trees),
+    /// the lookup of held objects, the connectivity check and the plan of
+    /// each write.
+    PushGraph,
+    /// A push's commit check (ancestry walks that read commits from packs).
+    PushCheck,
+    /// A push uploading its packs.
+    PushUpload,
+    /// The rest of a push: its hook's reads, mirror forwarding.
+    PushOther,
+    /// A fetch: planning, `shallow-info`, the stitched pack and packfile
+    /// URIs.
+    Fetch,
+    /// Building an exact shallow pack for a fetch (node C8).
+    ShallowBuild,
+    /// The compaction worker's jobs: `compact`, `index_commits` and
+    /// `rewrite_pack`.
+    Compaction,
+    /// Garbage collection's sweep.
+    Gc,
+    /// The merge queue preparing batches. The pushes it lands count under
+    /// the push stages, like any push.
+    MergeQueue,
+    /// Mirror mode's imports (outside the push stages they run).
+    Mirror,
+    /// Anything outside a scope.
+    Other,
+}
+
+impl BlobCaller {
+    /// Every caller, in label order.
+    pub const ALL: [Self; 14] = [
+        Self::PushAdvertise,
+        Self::PushSearch,
+        Self::PushPrefetch,
+        Self::PushGraph,
+        Self::PushCheck,
+        Self::PushUpload,
+        Self::PushOther,
+        Self::Fetch,
+        Self::ShallowBuild,
+        Self::Compaction,
+        Self::Gc,
+        Self::MergeQueue,
+        Self::Mirror,
+        Self::Other,
+    ];
+
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PushAdvertise => "push_advertise",
+            Self::PushSearch => "push_search",
+            Self::PushPrefetch => "push_prefetch",
+            Self::PushGraph => "push_graph",
+            Self::PushCheck => "push_check",
+            Self::PushUpload => "push_upload",
+            Self::PushOther => "push_other",
+            Self::Fetch => "fetch",
+            Self::ShallowBuild => "shallow_build",
+            Self::Compaction => "compaction",
+            Self::Gc => "gc",
+            Self::MergeQueue => "merge_queue",
+            Self::Mirror => "mirror",
+            Self::Other => "other",
+        }
+    }
+
+    /// Position in [`BlobCaller::ALL`], for counter arrays.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The caller of the scope being polled on this thread, or
+    /// [`BlobCaller::Other`]. Stores call it when a request starts, before
+    /// handing the request to another thread.
+    pub fn current() -> Self {
+        CURRENT_CALLER.with(Cell::get)
+    }
+
+    /// `future`, with every blob store request it makes counted under
+    /// `self` (unless a scope inside it says otherwise).
+    pub fn scope<F: Future>(self, future: F) -> CallerScope<F> {
+        CallerScope {
+            caller: self,
+            future: Box::pin(future),
+        }
+    }
+}
+
+thread_local! {
+    static CURRENT_CALLER: Cell<BlobCaller> = const { Cell::new(BlobCaller::Other) };
+}
+
+/// A future whose blob store requests are counted under one
+/// [`BlobCaller`] ([`BlobCaller::scope`]). Each poll sets the caller for
+/// the duration of the poll and restores the outer one after it, so scopes
+/// nest and interleaved tasks on one thread never see each other's.
+#[must_use = "futures do nothing unless polled"]
+pub struct CallerScope<F> {
+    caller: BlobCaller,
+    // Boxed so this type is `Unpin` without unsafe pin projection; a scope
+    // wraps a whole stage, not a single read.
+    future: Pin<Box<F>>,
+}
+
+impl<F> std::fmt::Debug for CallerScope<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerScope")
+            .field("caller", &self.caller)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Future> Future for CallerScope<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        /// Puts the outer caller back, on unwind too.
+        struct Restore(BlobCaller);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_CALLER.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(CURRENT_CALLER.with(|c| c.replace(self.caller)));
+        self.future.as_mut().poll(cx)
+    }
+}
+
+/// What a blob key names, from its file name: the `file` label of the
+/// request counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BlobFile {
+    /// A pack (`.pack`).
+    Pack,
+    /// A pack index (`.idx`).
+    Idx,
+    /// An entry table (`.entries`).
+    Entries,
+    /// Anything else.
+    Other,
+}
+
+impl BlobFile {
+    /// Every kind, in label order.
+    pub const ALL: [Self; 4] = [Self::Pack, Self::Idx, Self::Entries, Self::Other];
+
+    /// The kind of file `key` names.
+    pub fn of(key: &BlobKey) -> Self {
+        let k = key.as_str();
+        if k.ends_with(".pack") {
+            Self::Pack
+        } else if k.ends_with(".idx") {
+            Self::Idx
+        } else if k.ends_with(".entries") {
+            Self::Entries
+        } else {
+            Self::Other
+        }
+    }
+
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pack => "pack",
+            Self::Idx => "idx",
+            Self::Entries => "entries",
+            Self::Other => "other",
+        }
+    }
+
+    /// Position in [`BlobFile::ALL`], for counter arrays.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +557,80 @@ mod tests {
             past_end: PastEndRange::Status416,
         };
         assert!(!format!("{u:?}").contains("secret"));
+    }
+
+    /// Returns `Pending` once, then the caller it sees when polled again.
+    struct YieldThenRead(bool);
+
+    impl Future for YieldThenRead {
+        type Output = BlobCaller;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<BlobCaller> {
+            if self.0 {
+                Poll::Ready(BlobCaller::current())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Invariant: a scope labels exactly what it polls. Scopes nest (the
+    /// innermost wins and the outer label comes back after it), the label
+    /// is gone between polls, and two scoped futures polled in turn on one
+    /// thread each see only their own.
+    #[test]
+    fn caller_scopes_nest_restore_and_do_not_leak_between_tasks() {
+        assert_eq!(BlobCaller::current(), BlobCaller::Other);
+        let seen = ready(BlobCaller::PushGraph.scope(async {
+            let outer = BlobCaller::current();
+            let inner = BlobCaller::PushPrefetch
+                .scope(async { BlobCaller::current() })
+                .await;
+            (outer, inner, BlobCaller::current())
+        }));
+        assert_eq!(
+            seen,
+            (
+                BlobCaller::PushGraph,
+                BlobCaller::PushPrefetch,
+                BlobCaller::PushGraph
+            )
+        );
+        assert_eq!(BlobCaller::current(), BlobCaller::Other);
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut a = BlobCaller::Fetch.scope(YieldThenRead(false));
+        let mut b = BlobCaller::Compaction.scope(YieldThenRead(false));
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        assert_eq!(BlobCaller::current(), BlobCaller::Other, "nothing left set");
+        assert!(Pin::new(&mut b).poll(&mut cx).is_pending());
+        assert_eq!(
+            Pin::new(&mut a).poll(&mut cx),
+            Poll::Ready(BlobCaller::Fetch)
+        );
+        assert_eq!(
+            Pin::new(&mut b).poll(&mut cx),
+            Poll::Ready(BlobCaller::Compaction)
+        );
+        assert_eq!(BlobCaller::current(), BlobCaller::Other);
+    }
+
+    #[test]
+    fn callers_and_files_index_their_label_arrays() {
+        for (i, c) in BlobCaller::ALL.iter().enumerate() {
+            assert_eq!(c.index(), i, "{c:?}");
+        }
+        for (i, f) in BlobFile::ALL.iter().enumerate() {
+            assert_eq!(f.index(), i, "{f:?}");
+        }
+        let key = |k: &str| BlobKey::new(k).unwrap();
+        assert_eq!(BlobFile::of(&key("repos/1/packs/ab.pack")), BlobFile::Pack);
+        assert_eq!(BlobFile::of(&key("repos/1/packs/ab.g2.idx")), BlobFile::Idx);
+        assert_eq!(
+            BlobFile::of(&key("repos/1/packs/ab.entries")),
+            BlobFile::Entries
+        );
+        assert_eq!(BlobFile::of(&key("repos/1/x.json")), BlobFile::Other);
     }
 }

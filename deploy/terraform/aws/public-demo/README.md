@@ -392,7 +392,11 @@ longer need it. The account stack stays: its budget keeps watching.
   `git.<base>/-/express` instead (docs/EXPRESS.md).
 - **Metrics are not scraped.** `/-/metrics` stays on the tasks' private
   listener; there is no Prometheus in this deployment yet.
-- **One region**, and one `place` instance.
+- **One region**, and one `place` instance. So every deploy of `place`
+  is a short outage: ECS stops the old task before it starts the new one,
+  and the load balancer answers `503` until the new task passes its health
+  check, a minute or two. The page then tells the visitor the server is
+  restarting and to click again. Deploy `place` only when you need to.
 
 ## Checks without an AWS account
 

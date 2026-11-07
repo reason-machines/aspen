@@ -105,6 +105,11 @@ run "defaults_are_cheap_and_private" {
     error_message = "Without a NAT gateway, tasks need a public IP to reach AWS APIs."
   }
 
+  assert {
+    condition     = one(aws_db_parameter_group.this.parameter).name == "rds.force_ssl" && one(aws_db_parameter_group.this.parameter).value == "1" && one(aws_db_parameter_group.this.parameter).apply_method == "pending-reboot"
+    error_message = "RDS must require SSL with pending-reboot application, matching the live parameter group."
+  }
+
   # The database is private and encrypted.
   assert {
     condition     = aws_db_instance.this.publicly_accessible == false && aws_db_instance.this.storage_encrypted

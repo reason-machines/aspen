@@ -15,10 +15,12 @@
 //! | [`hook`] | The pre-receive check over each update's exact commit range, and the post-receive step |
 //! | [`place`] | Writes: web and agent strokes, the merger bot, branch expiry, the swarm and the kill switch |
 //! | [`sprites`] | The pixel sprites ambient agents paint |
+//! | [`personas`] | Pretend painters who drop in on shifts and paint pictures tile by tile |
 //! | [`state`] | The canvas, branch overlays, the merge queue and the event log the page reads |
 //! | [`api`] | `demo/place/api/openapi.yaml` over HTTP, server-sent events included |
 //! | [`git`] | The Git objects the server writes, and in-process push requests |
 //! | [`limits`] | Rolling-window rate limits |
+//! | [`defaults`] | The limits the `aspen-place` binary runs Aspen with |
 //!
 //! [`build`] assembles all of it over any stores; the `aspen-place` binary
 //! reads its settings from the environment (`demo/place/server/README.md`).
@@ -26,10 +28,12 @@
 #![deny(missing_docs)]
 
 pub mod api;
+pub mod defaults;
 pub mod git;
 pub mod hook;
 pub mod image;
 pub mod limits;
+pub mod personas;
 pub mod place;
 pub mod rules;
 pub mod sprites;
@@ -45,6 +49,7 @@ use aspen_core::meta::MetaStore;
 use aspen_core::name::RepoName;
 use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
 use aspen_server::access::{Access, ClientAddr};
+use aspen_server::admission::InstanceLimits;
 use aspen_server::receive::ReceiveConfig;
 use aspen_server::upload_pack::exact::ShallowCacheConfig;
 use aspen_server::{Server, ServerConfig};
@@ -67,6 +72,11 @@ pub struct ServerSettings {
     pub limits: LimitsConfig,
     /// Where client addresses come from.
     pub client_addr: ClientAddr,
+    /// Git requests running at once on this instance, and the resident
+    /// memory over which new ones are refused with `503`
+    /// ([`defaults::instance_limits`]). The server's own pushes (the
+    /// merger, web strokes, agents) do not pass through it.
+    pub instance: InstanceLimits,
 }
 
 /// A running `place`: the service, the router serving Git
@@ -118,6 +128,7 @@ where
     B: BlobStore + Clone + 'static,
     T: TokenStore + std::fmt::Debug + 'static,
 {
+    config.validate().map_err(PlaceError::Corrupt)?;
     let repo = place::ensure_repo(&meta, &config.repo).await?;
     let shared = place::shared(
         &repo,
@@ -163,12 +174,15 @@ where
     let svc = server.receive_pack().expect("configured").clone();
     let auth = AuthService::new(settings.policy, tokens)
         .map_err(|e| PlaceError::Corrupt(e.to_string()))?;
-    let access = Arc::new(Access::new(
-        auth,
-        aspen_auth::Limits::new(settings.limits),
-        meta.clone(),
-        settings.client_addr,
-    ));
+    let access = Arc::new(
+        Access::new(
+            auth,
+            aspen_auth::Limits::new(settings.limits),
+            meta.clone(),
+            settings.client_addr,
+        )
+        .with_instance_limits(settings.instance),
+    );
     let operators = Arc::new(place::AdminGrant {
         access: access.clone(),
         repo: RepoName::new(&config.repo).map_err(|e| PlaceError::Corrupt(e.to_string()))?,

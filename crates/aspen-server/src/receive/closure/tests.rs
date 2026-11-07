@@ -359,6 +359,32 @@ impl MetaStore for Fake {
     async fn index_commits(&self, _: RepoId, _: &[CommitRow]) -> Result<(), StoreError> {
         unreachable!()
     }
+    async fn unexamined_commits(
+        &self,
+        _: RepoId,
+        _: Option<(RefVersionId, ObjectId)>,
+        _: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        unreachable!()
+    }
+    async fn commits_waiting_on(
+        &self,
+        _: RepoId,
+        _: &SortedIds,
+        _: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        unreachable!()
+    }
+    async fn set_generation_waits_on(
+        &self,
+        _: RepoId,
+        _: &[(ObjectId, ObjectId)],
+    ) -> Result<(), StoreError> {
+        unreachable!()
+    }
+    async fn set_generations(&self, _: RepoId, _: &[(ObjectId, u64)]) -> Result<(), StoreError> {
+        unreachable!()
+    }
     async fn covers(&self, repo: RepoId, name: &RefName) -> Result<Vec<Cover>, StoreError> {
         let out: Vec<Cover> = self
             .h

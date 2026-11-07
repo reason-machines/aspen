@@ -3,7 +3,14 @@
  * the event feed and the swarm control together. All untrusted strings
  * (branch names, reasons, messages) are written with textContent.
  */
-import { ApiError, createPlaceClient, type PlaceClient, type StreamState } from './client/api.ts';
+import {
+  ApiError,
+  createPlaceClient,
+  isUnavailable,
+  neverReachedPlace,
+  type PlaceClient,
+  type StreamState,
+} from './client/api.ts';
 import { type FeedItem, FeedModel } from './client/feed.ts';
 import { cellAt, formatDuration, RateMeter, shellQuote, shortSha } from './client/geometry.ts';
 import { agentPrompt } from './client/prompt.ts';
@@ -72,6 +79,9 @@ class App {
   private session: Session | null = null;
   private quota: Quota | null = null;
   private quotaBlockedUntil = 0;
+  /** While place restarts, queued clicks wait until this time, backing off. */
+  private restartWaitUntil = 0;
+  private restartAttempts = 0;
   private color: string;
   private showBranches = true;
   private zoom = 1;
@@ -190,6 +200,10 @@ class App {
       this.setSession(s);
       return s;
     } catch (err) {
+      if (neverReachedPlace(err)) {
+        this.waitForRestart(err);
+        return null;
+      }
       $('own-branch').textContent = 'unavailable';
       this.setPaintStatus(errorText(err, 'Could not create your branch'), 'error');
       return null;
@@ -351,6 +365,10 @@ class App {
           await new Promise((r) => setTimeout(r, Math.max(1000, this.quotaBlockedUntil - Date.now())));
           continue;
         }
+        if (Date.now() < this.restartWaitUntil) {
+          await new Promise((r) => setTimeout(r, this.restartWaitUntil - Date.now()));
+          continue;
+        }
         const next = this.queue[0];
         if (!next) break;
         this.lastPushAt = Date.now();
@@ -375,6 +393,7 @@ class App {
       const r = await this.client.push(session.token, { branch: session.branch, tiles });
       this.store.applyOwnPush(session.branch, { kind: 'visitor', label: session.branch }, r.commit, r.seq, r.tiles);
       this.setQuota(r.quota);
+      this.restartAttempts = 0;
       this.needsDraw = true;
       this.setPaintStatus(`Pushed ${shortSha(r.commit)}. It joins main at the next merge.`, 'ok');
       return 'ok';
@@ -390,9 +409,40 @@ class App {
         this.setPaintStatus(errorText(err, 'Too many pushes'), 'error');
         return 'retry';
       }
+      if (neverReachedPlace(err)) {
+        // The load balancer had no place task to send it to, so nothing was
+        // committed: keep the click and push it once place is back.
+        this.waitForRestart(err);
+        return 'retry';
+      }
+      if (isUnavailable(err)) {
+        // Not retried: a 502/503/504 does not prove the push did not
+        // commit, and pushing it again could paint over a newer stroke.
+        this.setPaintStatus(
+          'The canvas server is restarting, so that click may not have been pushed. Click again in a minute.',
+          'error',
+        );
+        return 'dropped';
+      }
       this.setPaintStatus(errorText(err, 'The push failed'), 'error');
       return 'dropped';
     }
+  }
+
+  /** Backs off (2 s doubling to 15 s, or the server's Retry-After) and says the clicks are kept. */
+  private waitForRestart(err: unknown): void {
+    this.restartAttempts++;
+    const asked = err instanceof ApiError && err.retryAfterSeconds !== null ? err.retryAfterSeconds * 1000 : 0;
+    const backoff = Math.min(15_000, 2000 * 2 ** Math.min(this.restartAttempts - 1, 3));
+    this.restartWaitUntil = Date.now() + Math.max(asked, backoff) + Math.floor(Math.random() * 500);
+    const n = this.queue.length;
+    const kept =
+      n === 0
+        ? 'Your branch is created'
+        : n === 1
+          ? 'Your click is kept and pushes'
+          : `Your ${n} clicks are kept and push`;
+    this.setPaintStatus(`The canvas server is restarting. ${kept} when it is back.`, 'busy');
   }
 
   private cellFromEvent(e: PointerEvent): { x: number; y: number } | null {
@@ -558,7 +608,15 @@ class App {
     plat.style.setProperty('--frame-w', `${w}px`);
     plat.style.setProperty('--frame-h', `${hgt}px`);
     plat.dataset.zoomed = String(this.zoom > 1);
-    plat.style.setProperty('--fit-h', `${Math.floor(fitTile * rows) + gutter}px`);
+    // The zoomed board keeps the fitted board's height: the fitted canvas plus
+    // the 18px ruler row above it (.plat grid-template-rows).
+    plat.style.setProperty('--fit-h', `${Math.floor(fitTile * rows) + 18}px`);
+    // Pin the stage to the fitted board. The desktop layout centers a
+    // max-content stage, so without this a longer readout or stat line widens
+    // the column and the whole canvas jumps sideways while someone paints.
+    const stage = $('stage');
+    if (wide) stage.style.setProperty('--stage-w', `${paletteW + gutter + Math.floor(fitTile * cols)}px`);
+    else stage.style.removeProperty('--stage-w');
     this.renderer.resize(w, hgt, window.devicePixelRatio || 1);
     this.needsDraw = true;
   }
@@ -689,6 +747,8 @@ class App {
             { class: 'what' },
             h('code', { class: 'br' }, it.branch),
             ` ${it.tiles} ${it.tiles === 1 ? 'tile' : 'tiles'}`,
+            // An agent with a name of its own (a persona) says who it is.
+            ...(it.actor === 'agent' && it.who !== it.branch ? [h('span', { class: 'who' }, ` by ${it.who}`)] : []),
           ),
           h('code', { class: 'sha' }, shortSha(it.commit)),
           ago,

@@ -762,7 +762,12 @@ where
         scope: Option<&RefName>,
         requested: ProtocolVersion,
     ) -> Result<Vec<u8>, ServiceError> {
-        let (refs, counted) = self.meta.count_statements(self.advertised(r, scope)).await;
+        let (refs, counted) = self
+            .meta
+            .count_statements(
+                aspen_core::blob::BlobCaller::PushAdvertise.scope(self.advertised(r, scope)),
+            )
+            .await;
         let (refs, haves) = refs?;
         if let Some(n) = counted {
             self.record(&Timings {

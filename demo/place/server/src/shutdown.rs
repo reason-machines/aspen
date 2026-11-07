@@ -142,6 +142,7 @@ mod tests {
             policy: serde_json::from_value(serde_json::json!({ "anonymous": [] })).unwrap(),
             limits: aspen_auth::LimitsConfig::default(),
             client_addr: ClientAddr::Peer,
+            instance: aspen_place::defaults::instance_limits(None),
         };
         let blobs = LocalBlobStore::open(dir.join("blobs")).unwrap();
         let built = aspen_place::build(

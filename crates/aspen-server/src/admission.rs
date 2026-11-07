@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -179,23 +180,144 @@ fn status_kib(text: &str, field: &str) -> Option<u64> {
     rest.trim().strip_suffix("kB")?.trim().parse().ok()
 }
 
-/// The memory this process may use, in bytes: its cgroup's limit (v2
-/// `memory.max`, or v1 `memory.limit_in_bytes`) when it has one, else the
-/// machine's memory (`MemTotal`). `None` where neither can be read.
+/// The memory this process may use, in bytes: the smallest finite limit
+/// among its cgroups (the leaf and every ancestor visible under
+/// `/sys/fs/cgroup`, v2 `memory.max` or v1 `memory.limit_in_bytes` and
+/// `hierarchical_memory_limit`) and the ECS task's memory
+/// (`ECS_CONTAINER_METADATA_URI_V4` `/task`, `Limits.Memory`), capped by
+/// the machine's memory (`MemTotal`), which is also the last fallback.
+/// `None` where none of them can be read.
+///
+/// The leaf alone is not enough: Fargate sets the task's limit on a parent
+/// cgroup and leaves the container's own `memory.max` unlimited, so a
+/// leaf-only read fell back to the host's memory (83 GB for a 64 GiB task)
+/// and the guard would never refuse before the kernel killed the task.
 pub fn memory_limit() -> Option<u64> {
-    let read = |path: &str| std::fs::read_to_string(path).ok();
-    let cgroup = read("/sys/fs/cgroup/memory.max")
-        .or_else(|| read("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let total = read("/proc/meminfo")
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
         .and_then(|m| status_kib(&m, "MemTotal:"))
         .map(|k| k * 1024);
-    // A v1 cgroup without a limit reports a huge number; "max" (v2) does
-    // not parse. Either way the machine's memory is the bound.
-    match (cgroup, total) {
-        (Some(c), Some(t)) => Some(c.min(t)),
-        (c, t) => c.or(t),
+    let ecs = std::env::var("ECS_CONTAINER_METADATA_URI_V4")
+        .ok()
+        .and_then(|uri| ecs_task_memory(&uri));
+    let found = [cgroup_memory_limit(Path::new("/"), None), ecs, total];
+    found.into_iter().flatten().min()
+}
+
+/// A cgroup memory limit at or above this is "no limit": v1 reports an
+/// unlimited group as the largest page-aligned `i64` (about 2^63).
+const UNLIMITED: u64 = 1 << 62;
+
+/// The smallest finite cgroup memory limit seen from `root` (the
+/// filesystem root, a fake tree in tests): `proc_cgroup` is the text of
+/// `/proc/self/cgroup` (read from `root` when `None`). For each memory
+/// hierarchy (v2 `0::`, v1 `memory`) it reads the limit of the process's
+/// group and of each ancestor that exists under `root/sys/fs/cgroup`,
+/// trying the path both as the mount shows the whole tree and as it shows
+/// only the process's own group (a cgroup namespace or a bind mount of
+/// the leaf, where ancestors are not visible as directories). v1 also
+/// reports `hierarchical_memory_limit` in `memory.stat`, the smallest
+/// limit on the path to the root, which covers hidden ancestors.
+fn cgroup_memory_limit(root: &Path, proc_cgroup: Option<&str>) -> Option<u64> {
+    let owned;
+    let text = match proc_cgroup {
+        Some(t) => t,
+        None => {
+            owned = std::fs::read_to_string(root.join("proc/self/cgroup")).unwrap_or_default();
+            &owned
+        }
+    };
+    let base = root.join("sys/fs/cgroup");
+    let mut groups: Vec<(PathBuf, &str)> = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let path = path.trim_start_matches('/');
+        if controllers.is_empty() {
+            groups.push((base.clone(), path));
+        } else if controllers.split(',').any(|c| c == "memory") {
+            groups.push((base.join("memory"), path));
+        }
     }
+    if groups.is_empty() {
+        // No /proc/self/cgroup: the mount's own group, v2 then v1.
+        groups.push((base.clone(), ""));
+        groups.push((base.join("memory"), ""));
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for (mount, path) in groups {
+        let mut rel = Path::new(path);
+        loop {
+            dirs.push(mount.join(rel));
+            match rel.parent() {
+                Some(p) => rel = p,
+                None => break,
+            }
+        }
+    }
+    let read = |p: PathBuf| std::fs::read_to_string(p).ok();
+    let finite = |v: &str| {
+        v.trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0 && n < UNLIMITED)
+    };
+    dirs.into_iter()
+        .flat_map(|dir| {
+            let v2 = read(dir.join("memory.max")).and_then(|v| finite(&v));
+            let v1 = read(dir.join("memory.limit_in_bytes")).and_then(|v| finite(&v));
+            let hier = read(dir.join("memory.stat")).and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("hierarchical_memory_limit "))
+                    .and_then(finite)
+            });
+            [v2, v1, hier]
+        })
+        .flatten()
+        .min()
+}
+
+/// The ECS task's memory limit in bytes from the task metadata endpoint v4
+/// (`<uri>/task`, `Limits.Memory` in MiB); `None` when the endpoint is not
+/// plain `http://`, does not answer within a second, or has no limit.
+fn ecs_task_memory(uri: &str) -> Option<u64> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    let rest = uri.strip_prefix("http://")?;
+    let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+    let path = path.trim_end_matches('/');
+    let addr_text = if host.contains(':') {
+        host.to_owned()
+    } else {
+        format!("{host}:80")
+    };
+    let addr = addr_text.to_socket_addrs().ok()?.next()?;
+    let timeout = Duration::from_secs(1);
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let request =
+        format!("GET /{path}/task HTTP/1.0\r\nHost: {host}\r\nAccept: application/json\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    stream.take(1 << 20).read_to_end(&mut response).ok()?;
+    let response = String::from_utf8_lossy(&response);
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.") || head.split_whitespace().nth(1) != Some("200") {
+        return None;
+    }
+    ecs_task_memory_from_json(body)
+}
+
+/// `Limits.Memory` (MiB) of an ECS task metadata `/task` document, in
+/// bytes.
+fn ecs_task_memory_from_json(body: &str) -> Option<u64> {
+    let task: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mib = task.get("Limits")?.get("Memory")?.as_u64()?;
+    (mib > 0).then(|| mib * 1024 * 1024)
 }
 
 /// [`InstanceLimits::memory_high_water`] by default: this share of
@@ -559,6 +681,152 @@ mod tests {
         RESIDENT.store(1 << 30, Ordering::Relaxed);
         a.enter(Work::Fetch, "k").await.unwrap();
         drop(running);
+    }
+
+    /// A fake root with `/proc/self/cgroup` and the given files under
+    /// `sys/fs/cgroup`.
+    fn tree(proc_cgroup: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("proc/self")).unwrap();
+        std::fs::write(dir.path().join("proc/self/cgroup"), proc_cgroup).unwrap();
+        for (path, text) in files {
+            let path = dir.path().join("sys/fs/cgroup").join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// Fargate on cgroup v2: the container's own `memory.max` is `max`, the
+    /// task's limit sits on the parent (issue: place's guard was 80% of
+    /// the host's MemTotal, not of its 64 GiB task).
+    #[test]
+    fn an_unlimited_leaf_takes_its_parents_limit_v2() {
+        let root = tree(
+            "0::/ecs/task-1/container-a\n",
+            &[
+                ("memory.max", "max\n"),
+                ("ecs/memory.max", "max\n"),
+                ("ecs/task-1/memory.max", &format!("{}\n", 64 * GIB)),
+                ("ecs/task-1/container-a/memory.max", "max\n"),
+            ],
+        );
+        assert_eq!(cgroup_memory_limit(root.path(), None), Some(64 * GIB));
+    }
+
+    /// The smallest finite limit on the path wins, wherever it sits.
+    #[test]
+    fn the_smallest_limit_on_the_path_wins() {
+        let root = tree(
+            "0::/a/b\n",
+            &[
+                ("a/memory.max", &(8 * GIB).to_string()),
+                ("a/b/memory.max", &(16 * GIB).to_string()),
+            ],
+        );
+        assert_eq!(cgroup_memory_limit(root.path(), None), Some(8 * GIB));
+    }
+
+    /// A namespaced v2 mount shows only the process's own group at the
+    /// mount root; its limit is read there.
+    #[test]
+    fn a_namespaced_v2_leaf_is_read_at_the_mount_root() {
+        let root = tree("0::/\n", &[("memory.max", &(4 * GIB).to_string())]);
+        assert_eq!(cgroup_memory_limit(root.path(), None), Some(4 * GIB));
+    }
+
+    /// cgroup v1: the leaf's `memory.limit_in_bytes` is the huge
+    /// "unlimited" value; the parent's limit, and the hierarchical limit
+    /// in `memory.stat` (which covers ancestors the mount hides), count.
+    #[test]
+    fn v1_unlimited_leaf_takes_the_parent_or_hierarchical_limit() {
+        let unlimited = "9223372036854771712\n";
+        let visible = tree(
+            "12:memory:/ecs/task-1/container-a\n11:cpu,cpuacct:/ecs/task-1/container-a\n",
+            &[
+                ("memory/memory.limit_in_bytes", unlimited),
+                (
+                    "memory/ecs/task-1/memory.limit_in_bytes",
+                    &(64 * GIB).to_string(),
+                ),
+                (
+                    "memory/ecs/task-1/container-a/memory.limit_in_bytes",
+                    unlimited,
+                ),
+            ],
+        );
+        assert_eq!(cgroup_memory_limit(visible.path(), None), Some(64 * GIB));
+        let hidden = tree(
+            "12:memory:/ecs/task-1/container-a\n",
+            &[
+                ("memory/memory.limit_in_bytes", unlimited),
+                (
+                    "memory/memory.stat",
+                    &format!("cache 0\nhierarchical_memory_limit {}\nrss 1\n", 64 * GIB),
+                ),
+            ],
+        );
+        assert_eq!(cgroup_memory_limit(hidden.path(), None), Some(64 * GIB));
+    }
+
+    /// No limit anywhere (v2 `max`, v1 huge, or no cgroup files at all):
+    /// `None`, so `memory_limit` falls back to the task metadata or
+    /// `MemTotal`.
+    #[test]
+    fn no_limit_anywhere_is_none() {
+        let v2 = tree(
+            "0::/a\n",
+            &[("memory.max", "max\n"), ("a/memory.max", "max\n")],
+        );
+        assert_eq!(cgroup_memory_limit(v2.path(), None), None);
+        let v1 = tree(
+            "4:memory:/\n",
+            &[("memory/memory.limit_in_bytes", "9223372036854771712\n")],
+        );
+        assert_eq!(cgroup_memory_limit(v1.path(), None), None);
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(cgroup_memory_limit(none.path(), Some("")), None);
+    }
+
+    #[test]
+    fn ecs_task_metadata_gives_the_task_memory() {
+        let body = r#"{"Cluster":"c","Limits":{"CPU":8,"Memory":65536},"Containers":[]}"#;
+        assert_eq!(ecs_task_memory_from_json(body), Some(64 * GIB));
+        assert_eq!(ecs_task_memory_from_json(r#"{"Limits":{"CPU":8}}"#), None);
+        assert_eq!(ecs_task_memory_from_json("not json"), None);
+        assert_eq!(ecs_task_memory("https://example.invalid/v4"), None);
+    }
+
+    /// The endpoint is fetched over plain HTTP at `<uri>/task`.
+    #[test]
+    fn ecs_task_metadata_is_fetched_from_the_endpoint() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = conn.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = r#"{"Limits":{"Memory":2048}}"#;
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let got = ecs_task_memory(&format!("http://{addr}/v4/abc"));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /v4/abc/task HTTP/1.0\r\n")
+        );
+        assert_eq!(got, Some(2 * GIB));
     }
 
     #[test]

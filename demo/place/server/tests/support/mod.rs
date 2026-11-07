@@ -15,7 +15,7 @@ use aspen_core::meta::MetaStore;
 use aspen_core::name::RefName;
 use aspen_core::refs::RefVersion;
 use aspen_meta::SqlStore;
-use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
+use aspen_pack::MaxInflatedBytes;
 use aspen_place::{Place, PlaceConfig, ServerSettings};
 use aspen_server::access::ClientAddr;
 use serde_json::Value;
@@ -121,11 +121,13 @@ impl App {
         .unwrap();
         let settings = ServerSettings {
             spool_dir: dir.join("spool"),
-            max_object_bytes: MaxObjectBytes::new(16 << 20).unwrap(),
+            // The binary's limit, so every test pushes under it.
+            max_object_bytes: aspen_place::defaults::max_object_bytes(&config.rules),
             max_inflated_bytes: MaxInflatedBytes::new(256 << 20).unwrap(),
             policy,
             limits,
             client_addr: ClientAddr::Peer,
+            instance: aspen_place::defaults::instance_limits(None),
         };
         let built = aspen_place::build(meta.clone(), blobs, tokens.clone(), config, settings)
             .await
@@ -586,6 +588,19 @@ impl Work {
             .args(git_args)
             .arg("push")
             .args(args);
+        blocking(move || {
+            let o = cmd.output().unwrap();
+            let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+            t.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), t)
+        })
+        .await
+    }
+
+    /// `git <args>`, which may fail: success and combined output.
+    pub async fn try_git(&self, args: &[&str]) -> (bool, String) {
+        let mut cmd = aspen_testkit::git::isolated_git(&self.home);
+        cmd.current_dir(&self.path).args(args);
         blocking(move || {
             let o = cmd.output().unwrap();
             let mut t = String::from_utf8_lossy(&o.stdout).into_owned();

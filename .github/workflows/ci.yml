@@ -56,6 +56,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Bounded Place load runner (local mocks only)
+        run: python3 -m unittest discover -s bench/throughput -p "test_*.py"
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # aspen-blob's S3 conformance suite runs against a real MinIO; under CI

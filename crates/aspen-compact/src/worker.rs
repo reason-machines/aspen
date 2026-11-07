@@ -139,6 +139,13 @@ where
     /// Claims and runs one due `compact` or `index_commits` job; `None` if
     /// none is due.
     pub async fn run_one(&mut self) -> Result<Option<JobOutcome>, StoreError> {
+        // Blob requests are counted under `compaction` (`aspen_blob_*`).
+        aspen_core::blob::BlobCaller::Compaction
+            .scope(self.claim_and_run())
+            .await
+    }
+
+    async fn claim_and_run(&mut self) -> Result<Option<JobOutcome>, StoreError> {
         let meta = &self.compactor.meta;
         let owner = &self.options.owner;
         if self.release_pending {
@@ -268,7 +275,9 @@ where
 
     /// Runs one garbage-collection sweep.
     pub async fn collect_garbage(&self) -> Result<GcReport, crate::CompactError> {
-        self.compactor.collect_garbage().await
+        aspen_core::blob::BlobCaller::Gc
+            .scope(self.compactor.collect_garbage())
+            .await
     }
 
     /// Runs jobs and sweeps until `shutdown` completes. Store errors are

@@ -928,6 +928,8 @@ fn a_stored_pack_with_a_forward_base_pages_and_enqueues_a_rewrite() {
                 commit: ObjectId::parse_hex(&c2).unwrap(),
                 parents: vec![ObjectId::parse_hex(&c1).unwrap()],
                 committer_time: 0,
+                generation: None,
+                root_tree: None,
             }],
             jobs: Vec::new(),
         }],

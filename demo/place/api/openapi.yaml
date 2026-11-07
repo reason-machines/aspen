@@ -153,6 +153,11 @@ paths:
         (`docs/TILES.md`); a stroke additionally may not name one tile twice.
         The response arrives before or after the stream delivers the same
         push; clients deduplicate by `seq`.
+
+        `429` (`rate-limited`) means either this session's pushes per
+        minute are spent or the server is at its push ceiling, which counts
+        every visitor and Git client together; the message says which, and
+        `Retry-After` says when to try again.
       security: [{ session: [] }]
       requestBody:
         required: true

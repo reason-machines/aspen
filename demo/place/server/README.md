@@ -31,7 +31,27 @@ simulated agents.
   or other sprites painted in the last six hours, and stop when the canvas
   has no such room. Merge commits record which tiles people and sprites
   painted (`People-tiles:` and `Sprite-tiles:` trailers), and a restarted
-  server rebuilds that memory from `main`. The
+  server rebuilds that memory from `main`. With `PLACE_PERSONAS` on (the
+  default), personas replace them (`src/personas.rs`): 3 to 6 of a
+  roster of 13 pretend painters are always on a shift, each painting a
+  picture it loves one tile per push, every few seconds, on its own
+  `agent/<name>-<n>` branch with its own commit author, so the feed shows
+  them as agents. They never paint a tile people painted in the last six
+  hours or a keep area, move a picture when a person paints into it, leave
+  a just-finished picture alone for ten minutes, take no token of the
+  server-wide push ceiling and stop while less than a tenth of its burst
+  is left, so people get it; together they push about once a
+  second, at most `PLACE_PERSONAS_PUSHES_PER_SECOND`. Personas run
+  permanently, starting automatically on every boot and deployment. They
+  have no end date, run duration, total push allowance, token allowance,
+  or visitor session budget. Shifts rotate painters, not the service.
+  Rate credit refills continuously; ceiling, no-room and quiet pauses retry
+  automatically. Failed strokes retry the same tile with exponential
+  backoff from one second to one minute, with no attempt limit; success
+  resets the backoff. Only the kill switch or explicit configuration
+  disables them. Restarting starts fresh shifts and restores the canvas
+  and memory of people's recent paint from Git, not a saved visitor session.
+  The
   "Unleash 1,000 agents" swarm is one global run with server-side limits:
   `maxAgents`, `pushesPerSecondCap`, run length, cooldown and starts per
   client address apply whatever a client sends. A start checks the kill
@@ -49,7 +69,7 @@ simulated agents.
 - **Kill switch.** `POST /api/v1/admin/kill-switch` needs an operator
   credential: an Aspen API token or OIDC token with an `admin` grant on the
   canvas repository. Engaging it ends a running swarm at once, refuses new
-  starts, and pauses the ambient agents.
+  starts, and pauses the ambient agents and the personas.
 
 - **Bounded history.** Every merge stores a whole `tiles/` tree (9 to 25
   KiB on a painted 64 x 64 canvas: stored packs have no deltas), so a full
@@ -131,12 +151,16 @@ curl -X POST http://127.0.0.1:7070/api/v1/admin/kill-switch \
 | `PLACE_WIDTH`, `PLACE_HEIGHT` | `64` | Canvas size, 1 to 4096. |
 | `PLACE_TILES_PER_PUSH` | `64` | Distinct tiles one push may change. |
 | `PLACE_PUSHES_PER_MINUTE` | `30` | Per web session, and per Git caller and branch. |
+| `PLACE_GLOBAL_PUSHES_PER_SECOND`, `PLACE_GLOBAL_PUSH_BURST` | `550`, `2750` | The server-wide push ceiling: pushes a second from everyone together, web strokes and Git updates alike, and how many it lets through at once after a quiet spell. Past it a push is refused with a message that the demo is at its limit: `429` with `Retry-After` on the API, the update's `remote rejected` reason for Git. Nothing of a refused push is stored. The server's own agents and the merger bot do not count. The rate may be fractional, down to `0.001`; the burst must refill within 10^6 s at the rate (a sanity cap against mistaken settings), or startup refuses the setting. |
 | `PLACE_BRANCH_TTL_SECONDS` | `600` | Idle branches whose tiles have merged are deleted after this. |
 | `PLACE_MERGE_INTERVAL_MS` | `3000` | How often the merger bot runs while pushes arrive at up to `PLACE_MERGE_BUSY_PUSHES_PER_SECOND`. |
 | `PLACE_MERGE_BUSY_PUSHES_PER_SECOND` | `5` | Above this push rate (since the last merge) the merger waits longer between runs, in proportion to the rate. |
 | `PLACE_MERGE_INTERVAL_MAX_MS` | `30000` | The longest the merger waits between runs under load. |
 | `PLACE_HISTORY_MAX_BYTES` | `8388608` | Once the packs written on `main` since its root reach this size, the merger starts `main`'s history again from one root commit with the same canvas, so a full clone stays about this size. `0` never does. |
-| `PLACE_AGENTS` | `6` | Ambient agents. |
+| `PLACE_AGENTS` | `6` | Ambient agents (sprite painters). Ignored while `PLACE_PERSONAS` is on: the personas replace them. |
+| `PLACE_PERSONAS` | `true` | Personas: a roster of 13 pretend painters who drop in on shifts of 3 to 20 minutes and paint pictures they love (flags, a frog, a house, a cat...) one tile per push, every 1 to 5 s each, on `agent/<name>-<n>` branches with their own commit author (`Name <name@personas.place.invalid>`). They never paint a tile people painted in the last six hours or a keep area, and move a picture when a person paints into it. Both the binary and public-demo Terraform default on. Set `false` or `0` to disable them explicitly. |
+| `PLACE_PERSONAS_MIN`, `PLACE_PERSONAS_MAX` | `3`, `6` | Personas on shift at least and at most; who is on changes over time. |
+| `PLACE_PERSONAS_PUSHES_PER_SECOND` | `3` | Pushes per second all personas together may make (they average about 1). |
 | `PLACE_AMBIENT_INTERVAL_MS` | `30000` | Mean time between the pushes of one sprite an ambient agent paints. |
 | `PLACE_AMBIENT_SPRITE_PAUSE_SECONDS` | `1800` | Mean time an ambient agent rests between two sprites. |
 | `PLACE_KEEP_AREAS` | | `x,y,width,height;...`: areas ambient agents never paint over (people's work from before the server started; it remembers what people paint for six hours, in memory). |
@@ -145,15 +169,26 @@ curl -X POST http://127.0.0.1:7070/api/v1/admin/kill-switch \
 | `PLACE_SWARM_ENABLED` | `false` | Whether visitors may start the swarm (`POST /api/v1/swarm`); off answers 404. |
 | `PLACE_WEB_TILES_PER_PUSH` | `1` | Tiles one push from the page may carry: one click, one commit, one push. Git pushes keep `PLACE_TILES_PER_PUSH`. |
 | `PLACE_AGENT_CONCURRENCY` | `16` | Agent pushes in flight at once. |
-| `PLACE_EVENT_STREAMS`, `PLACE_EVENT_STREAMS_PER_ADDRESS` | `4096`, `16` | Event streams (`GET /api/v1/events`) open at once, in all and per client address; more are refused with 429. |
+| `PLACE_EVENT_STREAMS`, `PLACE_EVENT_STREAMS_PER_ADDRESS` | `20000`, `64` | Event streams (`GET /api/v1/events`) open at once, in all and per client address; more are refused with 429. An open stream costs about 22 KB of server memory (20,000 streams about 425 MiB) (measured by `an_event_stream_costs_kilobytes_so_twenty_thousand_fit_the_memory_mark`), and each holds a file descriptor (Fargate allows 65,535). |
 | `PLACE_EVENT_STREAM_MAX_SECONDS` | `600` | An event stream ends after at most this long (at a random point in its last tenth, so streams do not all reconnect at once); the page reconnects with the `seq` of the last event it saw and misses nothing. |
 | `PLACE_TRUSTED_PROXY_HOPS` | `0` | Proxies in front that append to `X-Forwarded-For`; 0 uses the TCP peer. |
 | `PLACE_TRUSTED_PROXIES` | private ranges | Comma-separated addresses or CIDR blocks the nearest proxy connects from; `X-Forwarded-For` is read only from these peers, and only with hops above 0. Same rules as Aspen's `ASPEN_TRUSTED_PROXIES`. |
 | `PLACE_KILL_SWITCH` | | `1` starts with the kill switch engaged. |
 | `PLACE_POLICY_FILE` | anyone may read and push branches | An `aspen-auth` `PolicyConfig` (JSON), for example to add OIDC operators. |
-| `PLACE_LIMITS_FILE` | 5 reads/s and 1 push/s per caller, 8 MiB packs | An `aspen-auth` `LimitsConfig` (JSON). |
+| `PLACE_LIMITS_FILE` | per client address: 200 pushes/s (2,000 at once) and 200 fetches/s (2,000 at once), 192 pushes and 64 fetches running at once, 1 MiB packs | An `aspen-auth` `LimitsConfig` (JSON). Rates count HTTP requests: a push is 2, a fetch 3 (`aspen_place::defaults`). |
+| `PLACE_SESSIONS_PER_MINUTE` | `120` | Page sessions (`POST /api/v1/sessions`) one client address may open per minute. |
+| `PLACE_MEMORY_HIGH_WATER_BYTES` | 80% of the task's memory | Resident memory over which new Git requests are refused with `503` (the page, the API and the server's own pushes keep running). `0` sets no mark. |
 | `PLACE_WEB_DIR` | | A built page (`npm run build` in `demo/place` writes `dist/`) to serve at `/` beside the API and Git. Read into memory at startup; the start is refused if it has no `index.html`, or if a file would be served at or under a path the server keeps: `/api/v1`, `/-`, `/canvas` or `/canvas.git` (the canvas repository's name). The `place` image sets it. |
 | `PLACE_SHUTDOWN_DRAIN_SECONDS` | `20` | On SIGTERM or Ctrl-C, how long requests in flight may run before the server ends them, closes their connections and runs its last merge. Event streams last up to `PLACE_EVENT_STREAM_MAX_SECONDS`, so this bounds every shutdown. |
+
+Two limits follow from the canvas and are not settings: the largest object
+a push may carry, and so the longest commit message, is four times the
+canvas's full `tiles/` tree (601,088 bytes at 64 x 64; resolving the tree
+as a delta needs room for two copies) and at least 64 KiB; the largest
+pack one push may send is 1 MiB unless `PLACE_LIMITS_FILE` says otherwise;
+and the instance runs at most 256 pushes and 128 fetches at once, with up
+to 1,024 of each waiting at most 10 s for a slot before a `503`
+(`aspen_place::defaults`).
 
 Anonymous callers are counted by client address, an IPv6 address by its
 /64.

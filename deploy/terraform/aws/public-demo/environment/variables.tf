@@ -223,6 +223,12 @@ variable "place_dashboard_url" {
   default     = "none"
 }
 
+variable "place_personas" {
+  description = "Personas (PLACE_PERSONAS): 3 to 6 pretend painters always on the canvas, each painting a picture one tile per push on its own agent/ branch, keeping off people's recent work; they replace the ambient sprite agents. On by default; false runs the sprite agents instead."
+  type        = bool
+  default     = true
+}
+
 variable "place_environment" {
   description = "Extra aspen-place settings (demo/place/server/README.md); they override the defaults in place.tf, for example PLACE_SWARM_MAX_AGENTS."
   type        = map(string)

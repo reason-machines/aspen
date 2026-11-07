@@ -21,11 +21,20 @@ fn free_port() -> u16 {
 }
 
 fn start(data: &Path, port: u16, extra: &[(&str, &str)]) -> Child {
+    // These tests control every writer except the one under test.
+    let mut settings = vec![("PLACE_PERSONAS", "false")];
+    settings.extend_from_slice(extra);
+    start_configured(data, port, &settings)
+}
+
+fn start_configured(data: &Path, port: u16, extra: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aspen-place"));
     cmd.arg("serve")
         .env("PLACE_LISTEN", format!("127.0.0.1:{port}"))
         .env("PLACE_DATA_DIR", data)
         .env("PLACE_AGENTS", "0")
+        .env_remove("PLACE_PERSONAS")
+        .env_remove("PLACE_KILL_SWITCH")
         // The merger never runs on its own during a test: only the last
         // merge at shutdown can merge anything.
         .env("PLACE_MERGE_INTERVAL_MS", "600000")
@@ -104,6 +113,94 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Without a persona setting or a manual start request, the running binary
+/// paints on an agent branch. Its author identifies the persona, not the
+/// ambient sprite agents (which are disabled in the test).
+#[test]
+fn personas_paint_by_default_without_an_operator_start() {
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = start_configured(data.path(), port, &[]);
+    wait_ready(&mut child, port);
+    let url = format!("http://127.0.0.1:{port}/canvas.git");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let painted = loop {
+        let refs = git(work.path(), &["ls-remote", &url, "refs/heads/agent/*"]);
+        if let Some(branch) = refs
+            .split_whitespace()
+            .find(|r| r.starts_with("refs/heads/agent/"))
+        {
+            break Some(branch.to_owned());
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let authors = painted.as_ref().map(|branch| {
+        git(work.path(), &["init", "-q", "canvas"]);
+        let canvas = work.path().join("canvas");
+        git(&canvas, &["fetch", "-q", &url, branch]);
+        git(&canvas, &["log", "-1", "--format=%ae", "FETCH_HEAD"])
+    });
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let authors = authors.expect("default startup never painted a persona stroke");
+    assert!(authors.contains("@personas.place.invalid"), "{authors}");
+}
+
+/// Default-on still honors both explicit off spellings. Persona-only
+/// settings are not read when disabled, but are validated by default.
+#[test]
+fn personas_honor_explicit_disable_and_startup_kill_switch() {
+    for setting in ["false", "0"] {
+        let data = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let mut child = start_configured(
+            data.path(),
+            port,
+            &[
+                ("PLACE_PERSONAS", setting),
+                ("PLACE_PERSONAS_MIN", "invalid"),
+            ],
+        );
+        wait_ready(&mut child, port);
+        std::thread::sleep(Duration::from_millis(300));
+        let url = format!("http://127.0.0.1:{port}/canvas.git");
+        let refs = git(work.path(), &["ls-remote", &url, "refs/heads/agent/*"]);
+        let (out, _) = terminate(child, Duration::from_secs(60));
+        assert!(out.status.success());
+        assert!(refs.is_empty(), "PLACE_PERSONAS={setting}: {refs}");
+    }
+
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = start_configured(data.path(), port, &[("PLACE_KILL_SWITCH", "1")]);
+    wait_ready(&mut child, port);
+    std::thread::sleep(Duration::from_millis(300));
+    let url = format!("http://127.0.0.1:{port}/canvas.git");
+    let refs = git(work.path(), &["ls-remote", &url, "refs/heads/agent/*"]);
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+    assert!(refs.is_empty(), "kill switch allowed persona paint: {refs}");
+
+    let child = start_configured(
+        data.path(),
+        free_port(),
+        &[("PLACE_PERSONAS_MIN", "invalid")],
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PLACE_PERSONAS_MIN"));
 }
 
 #[test]
@@ -361,6 +458,175 @@ fn a_pool_size_starts_the_server() {
     let port = free_port();
     let mut child = start(data.path(), port, &[("PLACE_DB_MAX_CONNECTIONS", "64")]);
     wait_ready(&mut child, port);
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+}
+
+/// Invariant: the binary sets a resident-memory mark on its Git requests
+/// (`PLACE_MEMORY_HIGH_WATER_BYTES`; 80% of the task's memory when unset).
+/// Over it, a Git request is refused with `503` while the page and the API
+/// still answer, so the canvas stays live for everyone else. Before, the
+/// binary set no mark at all.
+#[test]
+fn over_the_memory_mark_git_gets_503_and_the_api_still_answers() {
+    let data = tempfile::tempdir().unwrap();
+    let port = free_port();
+    // Any running process is over a one-byte mark.
+    let mut child = start(data.path(), port, &[("PLACE_MEMORY_HIGH_WATER_BYTES", "1")]);
+    wait_ready(&mut child, port);
+    let (head, body) = get(port, "/canvas.git/info/refs?service=git-upload-pack").unwrap();
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("memory pressure"), "{body}");
+    let (head, _) = get(port, "/api/v1/canvas").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+
+    // `0` turns the mark off: Git answers.
+    let port = free_port();
+    let mut child = start(data.path(), port, &[("PLACE_MEMORY_HIGH_WATER_BYTES", "0")]);
+    wait_ready(&mut child, port);
+    let (head, _) = get(port, "/canvas.git/info/refs?service=git-upload-pack").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+}
+
+/// A mark that is not a number refuses the start and names the variable.
+#[test]
+fn a_bad_memory_mark_refuses_the_start() {
+    let data = tempfile::tempdir().unwrap();
+    let child = start(
+        data.path(),
+        free_port(),
+        &[("PLACE_MEMORY_HIGH_WATER_BYTES", "1G")],
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PLACE_MEMORY_HIGH_WATER_BYTES"));
+}
+
+/// `POST path` with an empty JSON body on a fresh connection: the status.
+fn post_status(port: u16, path: &str) -> u16 {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: place.test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    String::from_utf8_lossy(&raw)
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status line")
+}
+
+/// Invariant: the binary lets one address open 120 page sessions a minute
+/// by default (10 before), and `PLACE_SESSIONS_PER_MINUTE` sets it.
+#[test]
+fn page_sessions_per_address_default_to_120_a_minute_and_are_a_setting() {
+    let data = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = start(data.path(), port, &[]);
+    wait_ready(&mut child, port);
+    for i in 0..120 {
+        assert_eq!(post_status(port, "/api/v1/sessions"), 201, "session {i}");
+    }
+    assert_eq!(post_status(port, "/api/v1/sessions"), 429);
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+
+    let port = free_port();
+    let mut child = start(data.path(), port, &[("PLACE_SESSIONS_PER_MINUTE", "2")]);
+    wait_ready(&mut child, port);
+    assert_eq!(post_status(port, "/api/v1/sessions"), 201);
+    assert_eq!(post_status(port, "/api/v1/sessions"), 201);
+    assert_eq!(post_status(port, "/api/v1/sessions"), 429);
+    let (out, _) = terminate(child, Duration::from_secs(60));
+    assert!(out.status.success());
+
+    let child = start(
+        data.path(),
+        free_port(),
+        &[("PLACE_SESSIONS_PER_MINUTE", "0")],
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PLACE_SESSIONS_PER_MINUTE"));
+}
+
+/// Resident memory of process `pid` in bytes (`VmRSS`).
+fn rss(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kib: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().strip_suffix("kB"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap();
+    kib * 1024
+}
+
+/// Opens `GET /api/v1/events` and reads until its first event arrives.
+fn open_stream(port: u16) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET /api/v1/events HTTP/1.1\r\nHost: place.test\r\n\r\n").unwrap();
+    let mut buf = [0u8; 4096];
+    let n = s.read(&mut buf).unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    s
+}
+
+/// Invariant (place change 5): an open event stream costs the server a
+/// few kilobytes, so the default cap of 20,000 streams fits far inside the
+/// memory mark (80% of the public demo's 64 GiB task). Measured on the real
+/// binary: 2,000 streams from one address (per-address cap lifted for the
+/// measurement), resident memory before and after. The cap itself still
+/// holds: the stream past `PLACE_EVENT_STREAMS` gets 429.
+#[test]
+fn an_event_stream_costs_kilobytes_so_twenty_thousand_fit_the_memory_mark() {
+    const STREAMS: usize = 2_000;
+    let data = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let total = STREAMS.to_string();
+    let mut child = start(
+        data.path(),
+        port,
+        &[
+            ("PLACE_EVENT_STREAMS", &total),
+            ("PLACE_EVENT_STREAMS_PER_ADDRESS", &total),
+        ],
+    );
+    wait_ready(&mut child, port);
+    // Warm the stream path once, so its first-use allocations are not
+    // counted per stream.
+    drop(open_stream(port));
+    std::thread::sleep(Duration::from_millis(200));
+    let before = rss(child.id());
+    let streams: Vec<TcpStream> = (0..STREAMS).map(|_| open_stream(port)).collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let after = rss(child.id());
+    let per_stream = after.saturating_sub(before) / STREAMS as u64;
+    eprintln!(
+        "event streams: {STREAMS} open, resident {} -> {} KiB, {per_stream} bytes per stream; 20,000 streams = {} MiB",
+        before >> 10,
+        after >> 10,
+        (per_stream * 20_000) >> 20
+    );
+    assert!(per_stream < 64 << 10, "{per_stream} bytes per stream");
+    // 20,000 streams at this cost against the demo's mark: 80% of 64 GiB.
+    let mark = (64u64 << 30) / 100 * 80;
+    assert!(per_stream * 20_000 < mark / 20, "under 5% of the mark");
+
+    let (head, _) = get(port, "/api/v1/events").unwrap();
+    assert!(head.starts_with("HTTP/1.1 429"), "{head}");
+    drop(streams);
     let (out, _) = terminate(child, Duration::from_secs(60));
     assert!(out.status.success());
 }

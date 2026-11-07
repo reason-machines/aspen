@@ -20,7 +20,7 @@ use aspen_auth::{Grants, LimitsConfig, NewToken, PolicyConfig};
 use aspen_blob::AnyBlobStore;
 use aspen_core::id::UnixMicros;
 use aspen_meta::{SqlStore, StoreOptions};
-use aspen_pack::{MaxInflatedBytes, MaxObjectBytes};
+use aspen_pack::MaxInflatedBytes;
 use aspen_place::{PlaceConfig, ServerSettings};
 use aspen_server::access::ClientAddr;
 use aspen_server::access::cache;
@@ -72,6 +72,41 @@ fn store_options(var: impl Fn(&str) -> Option<String>) -> Result<StoreOptions, S
     Ok(options)
 }
 
+/// The resident memory over which new Git requests are refused with
+/// `503`: `PLACE_MEMORY_HIGH_WATER_BYTES`, `0` for no mark, and when unset
+/// 80% of the memory the task may use
+/// ([`aspen_place::defaults::memory_high_water`]).
+fn memory_high_water(var: impl Fn(&str) -> Option<String>) -> Result<Option<u64>, String> {
+    match var("PLACE_MEMORY_HIGH_WATER_BYTES") {
+        None => Ok(aspen_place::defaults::memory_high_water()),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!(
+                "PLACE_MEMORY_HIGH_WATER_BYTES={v:?} must be a whole number of bytes (0 for no mark)"
+            )),
+        },
+    }
+}
+
+/// The startup line that says which memory mark is in force and where it
+/// came from, or that the guard is off and why.
+fn memory_mark_note(var: impl Fn(&str) -> Option<String>, mark: Option<u64>) -> String {
+    let set = var("PLACE_MEMORY_HIGH_WATER_BYTES").is_some();
+    match (mark, set) {
+        (Some(n), true) => format!(
+            "aspen-place: memory guard: new Git requests get 503 over {n} bytes resident (PLACE_MEMORY_HIGH_WATER_BYTES)"
+        ),
+        (Some(n), false) => format!(
+            "aspen-place: memory guard: new Git requests get 503 over {n} bytes resident (80% of the task's memory)"
+        ),
+        (None, true) => {
+            "aspen-place: memory guard off (PLACE_MEMORY_HIGH_WATER_BYTES=0)".to_owned()
+        }
+        (None, false) => "aspen-place: memory guard off: the task's memory limit could not be read; set PLACE_MEMORY_HIGH_WATER_BYTES to turn it on".to_owned(),
+    }
+}
+
 fn config() -> Result<PlaceConfig, String> {
     let domain = var("PLACE_DOMAIN").unwrap_or_else(|| "example.com".to_owned());
     let mut c = PlaceConfig::new(
@@ -87,6 +122,9 @@ fn config() -> Result<PlaceConfig, String> {
     c.rules.height = parse("PLACE_HEIGHT", c.rules.height)?;
     c.rules.tiles_per_push = parse("PLACE_TILES_PER_PUSH", c.rules.tiles_per_push)?;
     c.pushes_per_minute = parse("PLACE_PUSHES_PER_MINUTE", c.pushes_per_minute)?;
+    c.global_pushes_per_second =
+        parse("PLACE_GLOBAL_PUSHES_PER_SECOND", c.global_pushes_per_second)?;
+    c.global_push_burst = parse("PLACE_GLOBAL_PUSH_BURST", c.global_push_burst)?;
     c.branch_ttl = Duration::from_secs(parse("PLACE_BRANCH_TTL_SECONDS", c.branch_ttl.as_secs())?);
     c.merge_interval = Duration::from_millis(parse(
         "PLACE_MERGE_INTERVAL_MS",
@@ -144,6 +182,12 @@ fn config() -> Result<PlaceConfig, String> {
     // carries one tile (one click, one commit, one push).
     c.swarm_enabled = parse("PLACE_SWARM_ENABLED", false)?;
     c.web_tiles_per_push = parse("PLACE_WEB_TILES_PER_PUSH", 1)?;
+    // Page sessions per client address per minute: a classroom or an
+    // office behind one NAT opens many.
+    c.sessions_per_minute = parse("PLACE_SESSIONS_PER_MINUTE", 120)?;
+    if c.sessions_per_minute == 0 {
+        return Err("PLACE_SESSIONS_PER_MINUTE must be at least 1".into());
+    }
     c.agent_concurrency = parse("PLACE_AGENT_CONCURRENCY", c.agent_concurrency)?;
     c.client_addr = ClientAddr::from_settings(
         parse("PLACE_TRUSTED_PROXY_HOPS", 0)?,
@@ -160,6 +204,20 @@ fn config() -> Result<PlaceConfig, String> {
         c.event_stream_max_age.as_secs(),
     )?);
     c.kill_switch = var("PLACE_KILL_SWITCH").as_deref() == Some("1");
+    let personas = match var("PLACE_PERSONAS").as_deref() {
+        Some("0" | "false") => false,
+        None | Some("1" | "true") => true,
+        Some(v) => return Err(format!("PLACE_PERSONAS={v:?} must be 1, 0, true or false")),
+    };
+    if personas {
+        let d = aspen_place::personas::PersonaSettings::default();
+        c.personas = Some(aspen_place::personas::PersonaSettings {
+            min_active: parse("PLACE_PERSONAS_MIN", d.min_active)?,
+            max_active: parse("PLACE_PERSONAS_MAX", d.max_active)?,
+            pushes_per_second: parse("PLACE_PERSONAS_PUSHES_PER_SECOND", d.pushes_per_second)?,
+            ..d
+        });
+    }
     c.validate()?;
     Ok(c)
 }
@@ -179,11 +237,7 @@ fn policy(repo: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
 fn limits() -> Result<LimitsConfig, Box<dyn std::error::Error>> {
     Ok(match var("PLACE_LIMITS_FILE") {
         Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
-        None => serde_json::from_value(serde_json::json!({
-            "read": { "burst": 30, "per_second": 5.0 },
-            "push": { "burst": 10, "per_second": 1.0 },
-            "quota": { "max_pack_bytes": 8 << 20, "max_objects": 20_000, "bytes_per_hour": 256 << 20 },
-        }))?,
+        None => aspen_place::defaults::limits(),
     })
 }
 
@@ -197,13 +251,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         Some(u) => aspen_blob::open(&u)?,
         None => AnyBlobStore::Local(aspen_blob::LocalBlobStore::open(data_dir().join("blobs"))?),
     };
+    let memory_mark = memory_high_water(var)?;
+    eprintln!("{}", memory_mark_note(var, memory_mark));
     let settings = ServerSettings {
         spool_dir: var("PLACE_SPOOL_DIR").map_or_else(|| data_dir().join("spool"), PathBuf::from),
-        max_object_bytes: MaxObjectBytes::new(16 << 20).expect("valid"),
+        max_object_bytes: aspen_place::defaults::max_object_bytes(&config.rules),
         max_inflated_bytes: MaxInflatedBytes::new(256 << 20).expect("valid"),
         policy: policy(&config.repo)?,
         limits: limits()?,
         client_addr: config.client_addr.clone(),
+        instance: aspen_place::defaults::instance_limits(memory_mark),
     };
     // Read before anything starts, so a wrong directory, or a file at a
     // path the API and Git router keeps, refuses the start.
@@ -399,6 +456,54 @@ mod tests {
                 max_connections: 64,
                 ..StoreOptions::default()
             }
+        );
+    }
+
+    /// Unset, the mark is 80% of the task's memory; `0` turns it off; a
+    /// number is used as is; anything else refuses the start.
+    #[test]
+    fn place_memory_high_water_bytes_sets_the_mark() {
+        assert_eq!(
+            memory_high_water(with(&[])),
+            Ok(aspen_place::defaults::memory_high_water())
+        );
+        let set = |v: &str| memory_high_water(with(&[("PLACE_MEMORY_HIGH_WATER_BYTES", v)]));
+        assert_eq!(set("0"), Ok(None));
+        assert_eq!(set("1073741824"), Ok(Some(1 << 30)));
+        for bad in ["-1", "1G", "ten"] {
+            assert!(
+                set(bad)
+                    .unwrap_err()
+                    .contains("PLACE_MEMORY_HIGH_WATER_BYTES")
+            );
+        }
+    }
+
+    /// The startup line names the mark and its source, and says when the
+    /// guard is off, including when the task's memory could not be read.
+    #[test]
+    fn the_startup_line_says_which_memory_mark_is_in_force() {
+        let set = [("PLACE_MEMORY_HIGH_WATER_BYTES", "7")];
+        let note = memory_mark_note(with(&set), Some(7));
+        assert!(
+            note.contains("over 7 bytes") && note.contains("(PLACE_MEMORY_HIGH_WATER_BYTES)"),
+            "{note}"
+        );
+        let note = memory_mark_note(with(&[]), Some(9));
+        assert!(
+            note.contains("over 9 bytes") && note.contains("80% of the task's memory"),
+            "{note}"
+        );
+        let off = [("PLACE_MEMORY_HIGH_WATER_BYTES", "0")];
+        let note = memory_mark_note(with(&off), None);
+        assert!(
+            note.contains("memory guard off (PLACE_MEMORY_HIGH_WATER_BYTES=0)"),
+            "{note}"
+        );
+        let note = memory_mark_note(with(&[]), None);
+        assert!(
+            note.contains("memory guard off: the task's memory limit could not be read"),
+            "{note}"
         );
     }
 

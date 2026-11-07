@@ -170,7 +170,8 @@ commits cannot deadlock on each other's keys.
 
 ### `commit_index`
 
-`(repo_id, commit_oid) → ref_version_id, parents, committer_time`, written
+`(repo_id, commit_oid) → ref_version_id, parents, committer_time,
+generation, root_tree, generation_waits_on`, written
 synchronously for each pushed tip and by an `index_commits` job for the rest.
 
 | Column | Meaning |
@@ -178,9 +179,25 @@ synchronously for each pushed tip and by an `index_commits` job for the rest.
 | `ref_version_id` | A version whose tip reaches the commit, so its closure holds the commit's whole history; read the commit from its packs when needed. Safe for resolving a want, never a have |
 | `parents` | Parent IDs concatenated in commit order, 20 bytes each (empty for a root commit) |
 | `committer_time` | Seconds since the epoch, for `deepen-since` |
+| `generation` | Migration 0011: the commit's generation number (Git's commit-graph topological level: 1 for a root, otherwise one more than its parents' largest), or `NULL` when not known yet. Every ancestor of a commit has a smaller one, so an ancestry walk stops at the other commit's generation. Derived from history, so every writer computes the same value: a push writes it when its parents' rows have one, the `index_commits` job backfills the rest (`MetaStore::unexamined_commits`, paged through the partial index `commit_index_unexamined`), and `MetaStore::set_generations` never changes a value already written. `NULL` only costs time: the walk then runs without generations |
+| `generation_waits_on` | Migration 0011: for a row without a generation that a backfill examined and could not fill, the commit whose generation it waits on (a parent, or an ancestor through parents that wait on it too), 20 bytes; `NULL` otherwise. Such a row leaves `commit_index_unexamined` and is found again through the partial index `commit_index_waiting` only when a backfill gives that commit a generation (`MetaStore::commits_waiting_on`), so each row is examined once however many jobs run; `set_generations` clears it |
+| `root_tree` | Migration 0011: the commit's root tree ID, 20 bytes; `NULL` for rows written before it or for a tip the push read back from a pack. Stored for later use; nothing reads it yet |
 
 A missing row means "not indexed yet", never "no parents" or "not an
 ancestor" (`aspen_core::meta::CommitLookup`).
+
+Migration 0011 on a large `commit_index`: adding the nullable columns does
+not rewrite the table, and on PostgreSQL the three `CHECK` constraints are
+added `NOT VALID` (every existing row holds `NULL` in the new columns, which
+satisfies them; rows written afterwards are checked), so no statement scans
+the table under the migration's exclusive lock. Building the two partial
+indexes does read the table and blocks writes to it while they build, since
+a migration runs in a transaction and cannot use `CREATE INDEX
+CONCURRENTLY`. To upgrade a large deployment without that pause, add the
+columns and build the indexes first with `CREATE INDEX CONCURRENTLY`, under
+the names and definitions in `migrations/postgres/0011_commit_generation.sql`
+(`ADD COLUMN IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` there then do
+nothing); then run the migration.
 
 ### `covers`
 

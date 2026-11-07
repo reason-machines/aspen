@@ -50,6 +50,7 @@ where
                 CommitLookup::Indexed(row) => Lookup::Commit(CommitNode {
                     parents: row.parents,
                     time: row.committer_time,
+                    generation: row.generation,
                 }),
                 CommitLookup::NotIndexed => Lookup::Unknown,
             })
@@ -105,7 +106,12 @@ where
                             parse_commit(&buf).map_err(|e| StoreError::Corrupt {
                                 what: format!("stored commit {id}: {e}"),
                             })?;
-                        *slot = Lookup::Commit(CommitNode { parents, time });
+                        *slot = Lookup::Commit(CommitNode {
+                            parents,
+                            time,
+                            // Not read from history: the walk paints.
+                            generation: None,
+                        });
                     }
                     Some(_) => *slot = Lookup::NotCommit,
                     None => {}

@@ -36,11 +36,11 @@ use tokio::sync::Semaphore;
 
 use crate::git::{
     MODE_FILE, MODE_TREE, PackBuilder, Report, TreeEntry, parse_commit, parse_tree,
-    receive_request, write_commit, write_tree,
+    receive_request, write_tree,
 };
 use crate::hook::{Accepted, CheckLimits, INTERNAL_KEY, MainHistory, Shared, Waiting, Writer};
-use crate::limits::{Slots, Windows};
-use crate::rules::{self, Rules, TRUNK_REF, Tile};
+use crate::limits::{self, BucketProblem, PushCeiling, Slots, Windows};
+use crate::rules::{self, AMBIENT_PREFIX, Rules, TRUNK_REF, Tile};
 use crate::state::{Actor, History, Main, State, SwarmLimits, UNSET, now_ms};
 
 /// Settings of a `place` deployment.
@@ -52,6 +52,19 @@ pub struct PlaceConfig {
     pub rules: Rules,
     /// Pushes per web session, and per Git caller and branch, per minute.
     pub pushes_per_minute: usize,
+    /// The server-wide push ceiling: pushes a second from everyone
+    /// together, web strokes and Git updates alike (at least
+    /// [`limits::MIN_BUCKET_PER_SECOND`]).
+    /// Past it, and once [`Self::global_push_burst`] is spent, a push is
+    /// refused with a message that the demo is at its limit (`429` with
+    /// `Retry-After` on the API, the `ng` reason for Git). It bounds the
+    /// pushes the server commits and the merger bot replays, whatever the
+    /// number of callers; the server's own agents and merges do not count.
+    pub global_pushes_per_second: f64,
+    /// Pushes the ceiling lets through at once after a quiet spell (at
+    /// least 1, and refilled within [`limits::MAX_BUCKET_REFILL_SECONDS`]
+    /// at [`Self::global_pushes_per_second`]).
+    pub global_push_burst: u32,
     /// A branch idle this long, with all its tiles merged, is deleted.
     pub branch_ttl: Duration,
     /// How often the merger bot runs while pushes arrive at up to
@@ -100,7 +113,13 @@ pub struct PlaceConfig {
     /// canvas's README).
     pub mirror_url: Option<String>,
     /// Background agents that paint a stroke every few seconds each.
+    /// Ignored while [`Self::personas`] is on: the personas replace them.
     pub ambient_agents: usize,
+    /// Personas ([`crate::personas`]): pretend painters who drop in on
+    /// shifts and paint pictures one tile per push, so the canvas always
+    /// looks alive. `None` (the default) leaves them out and runs the
+    /// ambient sprite agents instead.
+    pub personas: Option<crate::personas::PersonaSettings>,
     /// The swarm's limits.
     pub swarm: SwarmLimits,
     /// Swarm runs one client address may start per hour.
@@ -161,6 +180,8 @@ impl PlaceConfig {
                 tiles_per_push: 64,
             },
             pushes_per_minute: 30,
+            global_pushes_per_second: 550.0,
+            global_push_burst: 2750,
             branch_ttl: Duration::from_secs(600),
             merge_interval: Duration::from_millis(3000),
             busy_pushes_per_second: 5,
@@ -174,6 +195,7 @@ impl PlaceConfig {
             dashboard_url: None,
             mirror_url: None,
             ambient_agents: 6,
+            personas: None,
             swarm: SwarmLimits {
                 max_agents: 1000,
                 pushes_per_second_cap: 120,
@@ -187,8 +209,8 @@ impl PlaceConfig {
             sessions_per_minute: 10,
             max_sessions: 100_000,
             event_backlog: 5000,
-            max_event_streams: 4096,
-            max_event_streams_per_address: 16,
+            max_event_streams: 20_000,
+            max_event_streams_per_address: 64,
             event_stream_max_age: Duration::from_secs(600),
             max_commits: 1000,
             max_tree_entries: 200_000,
@@ -224,6 +246,18 @@ impl PlaceConfig {
         if r.tiles_per_push == 0 || self.pushes_per_minute == 0 {
             return Err("tiles per push and pushes per minute must be at least 1".into());
         }
+        if let Some(problem) =
+            limits::bucket_problem(self.global_pushes_per_second, self.global_push_burst)
+        {
+            let setting = match problem {
+                BucketProblem::Rate(_) => "PLACE_GLOBAL_PUSHES_PER_SECOND",
+                BucketProblem::Burst => "PLACE_GLOBAL_PUSH_BURST",
+                BucketProblem::Refill { .. } => {
+                    "PLACE_GLOBAL_PUSH_BURST and PLACE_GLOBAL_PUSHES_PER_SECOND"
+                }
+            };
+            return Err(format!("{setting}: {problem}"));
+        }
         if self.swarm.max_agents == 0 || self.swarm.pushes_per_second_cap == 0 {
             return Err("the swarm needs at least one agent and one push per second".into());
         }
@@ -238,6 +272,9 @@ impl PlaceConfig {
         }
         if self.busy_pushes_per_second == 0 {
             return Err("busy pushes per second must be at least 1".into());
+        }
+        if let Some(p) = &self.personas {
+            p.validate(crate::personas::ROSTER.len())?;
         }
         Ok(())
     }
@@ -518,6 +555,9 @@ pub struct Place<M, B> {
     permits: Arc<Semaphore>,
     rng: Mutex<Rng>,
     ambient: Mutex<Vec<Ambient>>,
+    /// The personas, when [`PlaceConfig::personas`] is on. Never lock
+    /// `shared.state` while holding it.
+    personas: Mutex<Option<crate::personas::Director>>,
     /// False while [`Place::run`]'s [`Place::rebuild_memory`] is still
     /// reading recent paint from `main`'s merge commits.
     memory_ready: std::sync::atomic::AtomicBool,
@@ -553,6 +593,12 @@ pub async fn ensure_repo<M: MetaStore>(meta: &M, name: &str) -> Result<Repo, Pla
 /// Give `PlaceHook(shared.clone())` to the receive-pack configuration,
 /// then call [`Place::open`]. `main_history` is usually
 /// [`crate::hook::IndexedMain`] over the metadata store.
+///
+/// # Panics
+///
+/// If `config` fails [`PlaceConfig::validate`] on the push ceiling's rate
+/// or burst ([`limits::bucket_problem`]); [`crate::build`] validates
+/// first.
 pub fn shared(
     repo: &Repo,
     config: &PlaceConfig,
@@ -586,6 +632,11 @@ pub fn shared(
         committed: Mutex::new(HashMap::new()),
         git_quota: Mutex::new(Windows::new(config.pushes_per_minute, 60_000, 100_000)),
         main_history,
+        pushes: Mutex::new(PushCeiling::new(
+            config.global_pushes_per_second,
+            config.global_push_burst,
+            std::time::Instant::now(),
+        )),
     })
 }
 
@@ -665,7 +716,25 @@ where
             "cinder",
         ];
         let now = now_ms();
-        let ambient = (0..config.ambient_agents)
+        let personas = match &config.personas {
+            Some(settings) => Some(
+                crate::personas::Director::new(
+                    crate::personas::ROSTER,
+                    settings.clone(),
+                    rng.next(),
+                    now,
+                )
+                .map_err(PlaceError::Corrupt)?,
+            ),
+            None => None,
+        };
+        // The personas replace the ambient sprite agents.
+        let ambient_agents = if personas.is_some() {
+            0
+        } else {
+            config.ambient_agents
+        };
+        let ambient = (0..ambient_agents)
             .map(|i| Ambient {
                 name: format!("agent/{}-{}", words[i % words.len()], 10 + rng.below(89)),
                 job: None,
@@ -683,6 +752,7 @@ where
             merge_lock: tokio::sync::Mutex::new(()),
             rng: Mutex::new(rng),
             ambient: Mutex::new(ambient),
+            personas: Mutex::new(personas),
             memory_ready: std::sync::atomic::AtomicBool::new(true),
             sessions: Mutex::new(sessions),
             event_streams,
@@ -947,6 +1017,20 @@ where
         parents: &[ObjectId],
         message: &str,
     ) -> ObjectId {
+        self.add_commit_by(pb, pixels, extras, parents, message, None)
+    }
+
+    /// [`Self::add_commit`] with `author` (`Name <email>`) as the commit's
+    /// author; the server stays its committer.
+    fn add_commit_by(
+        &self,
+        pb: &mut PackBuilder,
+        pixels: &[u8],
+        extras: &[TreeEntry],
+        parents: &[ObjectId],
+        message: &str,
+        author: Option<&str>,
+    ) -> ObjectId {
         let rules = &self.shared.rules;
         let w = rules.width as usize;
         let mut used = [false; 256];
@@ -979,9 +1063,17 @@ where
         }
         let root = pb.add(ObjectKind::Tree, write_tree(root));
         let secs = (now_ms() / 1000) as i64;
+        let server = "place <place@aspen.invalid>";
         pb.add(
             ObjectKind::Commit,
-            write_commit(root, parents, "place <place@aspen.invalid>", secs, message),
+            crate::git::write_commit_by(
+                root,
+                parents,
+                author.unwrap_or(server),
+                server,
+                secs,
+                message,
+            ),
         )
     }
 
@@ -1029,6 +1121,19 @@ where
         tiles: &[Tile],
         message: &str,
     ) -> Result<Painted, PlaceError> {
+        self.paint_by(branch, actor, tiles, message, None).await
+    }
+
+    /// [`Self::paint`] with `author` (`Name <email>`) as the commit's
+    /// author instead of the server (a persona's stroke).
+    pub async fn paint_by(
+        &self,
+        branch: &str,
+        actor: Actor,
+        tiles: &[Tile],
+        message: &str,
+        author: Option<&str>,
+    ) -> Result<Painted, PlaceError> {
         let name = RefName::new(format!("refs/heads/{branch}"))
             .map_err(|e| PlaceError::Refused(e.to_string()))?;
         let lock = self.branch_lock(branch);
@@ -1065,7 +1170,7 @@ where
         } else {
             message.to_owned()
         };
-        let commit = self.add_commit(&mut pb, &pixels, &extras, &[parent], &message);
+        let commit = self.add_commit_by(&mut pb, &pixels, &extras, &[parent], &message, author);
         // Removes this write's entries however it ends, a dropped request
         // included.
         let cleanup = Cleanup {
@@ -1571,6 +1676,9 @@ where
         if killed {
             return;
         }
+        if self.memory_ready.load(std::sync::atomic::Ordering::Acquire) {
+            self.personas_tick(now);
+        }
         // Tiles people painted recently, read only when an agent is about
         // to pick a new sprite (lock order: `shared.state` is never taken
         // while `ambient` is held).
@@ -1670,6 +1778,102 @@ where
             });
         }
     }
+
+    /// Whether the server-wide push ceiling ([`PlaceConfig::global_pushes_per_second`])
+    /// is reached or nearly so, so personas back off: true while less than
+    /// a tenth of its burst is left. Personas never take a token: they
+    /// read the bucket and leave what is there to people, before anyone is
+    /// refused.
+    pub fn push_ceiling_busy(&self) -> bool {
+        let ceiling = self.shared.pushes.lock().expect("not poisoned");
+        ceiling.available(std::time::Instant::now()) * 10 < u64::from(ceiling.burst())
+    }
+
+    /// The personas' turn ([`crate::personas`]): each stroke due now is
+    /// one tile pushed on the persona's `agent/` branch with the persona
+    /// as the commit's author. Like ambient strokes, a stroke that finds
+    /// no free agent permit is dropped (and tried again on its next turn).
+    fn personas_tick(self: &Arc<Self>, now: u64) {
+        let due = self
+            .personas
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .is_some_and(|d| d.due(now));
+        if !due {
+            return;
+        }
+        let rules = self.shared.rules.clone();
+        // Lock order: `shared.state` is never taken while `personas` is held.
+        let (people, agent_paint, pixels) = self.with_state(|s| {
+            (
+                s.recent_people_tiles(now),
+                s.recent_agent_tiles(now),
+                s.main.pixels.clone(),
+            )
+        });
+        let mut people: std::collections::HashSet<usize> = people.into_iter().collect();
+        for &(x, y, w, h) in &self.config.keep_areas {
+            for ty in y..y.saturating_add(h).min(rules.height) {
+                for tx in x..x.saturating_add(w).min(rules.width) {
+                    people.insert(rules.index(tx, ty));
+                }
+            }
+        }
+        let agent_paint = agent_paint.into_iter().collect();
+        let view = crate::personas::View {
+            rules: &rules,
+            people: &people,
+            agent_paint: &agent_paint,
+            pixels: &pixels,
+            ceiling_busy: self.push_ceiling_busy(),
+        };
+        let strokes = {
+            let mut d = self.personas.lock().expect("not poisoned");
+            let Some(d) = d.as_mut() else { return };
+            d.tick(now, &view)
+        };
+        for stroke in strokes {
+            let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+                if let Some(d) = self.personas.lock().expect("not poisoned").as_mut() {
+                    d.finished(stroke.persona, false, now);
+                }
+                continue;
+            };
+            let place = self.clone();
+            tokio::spawn(async move {
+                let message = format!("{} paints a {}", stroke.name, stroke.picture);
+                let ok = place
+                    .paint_by(
+                        &stroke.branch,
+                        Actor::agent(stroke.name),
+                        &[stroke.tile],
+                        &message,
+                        Some(&stroke.author),
+                    )
+                    .await
+                    .is_ok();
+                if let Some(d) = place.personas.lock().expect("not poisoned").as_mut() {
+                    d.finished(stroke.persona, ok, now_ms());
+                }
+                drop(permit);
+            });
+        }
+    }
+
+    /// Personas on shift now: `(name, branch)`.
+    pub fn personas_active(&self) -> Vec<(&'static str, String)> {
+        self.personas
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .map_or_else(Vec::new, |d| {
+                d.active()
+                    .into_iter()
+                    .map(|(i, b)| (crate::personas::ROSTER[i].name, b.to_owned()))
+                    .collect()
+            })
+    }
 }
 
 /// Trailers that record which tiles of a merge people painted and which
@@ -1744,9 +1948,6 @@ pub enum StartRefusal {
     /// The client address has started the swarm too often this hour.
     StartsUsed,
 }
-
-/// The ambient agents' branch namespace.
-pub const AMBIENT_PREFIX: &str = "agent/";
 
 /// The actor a branch's pushes are shown as, from its namespace.
 pub fn actor_for(short: &str) -> Actor {
@@ -1831,5 +2032,103 @@ mod sprite_spot_tests {
         assert_eq!(choose_spot(&mut rng, &r, (8, 8), &everything, &[]), None);
         // Larger than the canvas: no spot.
         assert_eq!(choose_spot(&mut rng, &rules(4, 4), (8, 8), &[], &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invariant: persona settings that cannot work are refused at startup
+    /// with the setting to change.
+    #[test]
+    fn validate_refuses_personas_naming_the_setting_to_change() {
+        use crate::personas::PersonaSettings;
+        let refused = |p: PersonaSettings| {
+            let mut c = PlaceConfig::new("http://localhost/canvas.git");
+            c.personas = Some(p);
+            c.validate().expect_err("refused")
+        };
+        let d = PersonaSettings::default();
+        for (p, name) in [
+            (
+                PersonaSettings {
+                    min_active: 0,
+                    ..d.clone()
+                },
+                "PLACE_PERSONAS_MIN: ",
+            ),
+            (
+                PersonaSettings {
+                    min_active: 7,
+                    ..d.clone()
+                },
+                "PLACE_PERSONAS_MIN: ",
+            ),
+            (
+                PersonaSettings {
+                    max_active: 14,
+                    ..d.clone()
+                },
+                "PLACE_PERSONAS_MAX: ",
+            ),
+            (
+                PersonaSettings {
+                    pushes_per_second: 0.0,
+                    ..d.clone()
+                },
+                "PLACE_PERSONAS_PUSHES_PER_SECOND: ",
+            ),
+            (
+                PersonaSettings {
+                    pushes_per_second: f64::NAN,
+                    ..d.clone()
+                },
+                "PLACE_PERSONAS_PUSHES_PER_SECOND: ",
+            ),
+        ] {
+            let e = refused(p);
+            assert!(e.starts_with(name), "{name}: {e}");
+        }
+        let mut c = PlaceConfig::new("http://localhost/canvas.git");
+        c.personas = Some(d);
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    /// Invariant: a push ceiling the token bucket cannot hold is refused at
+    /// startup with the setting to change, never a panic; the default and
+    /// the bounds themselves pass.
+    #[test]
+    fn validate_refuses_a_push_ceiling_naming_the_setting_to_change() {
+        let refused = |rate: f64, burst: u32| {
+            let mut c = PlaceConfig::new("http://localhost/canvas.git");
+            c.global_pushes_per_second = rate;
+            c.global_push_burst = burst;
+            c.validate().expect_err("refused")
+        };
+        for rate in [f64::NAN, f64::INFINITY, -1.0, 0.0, 5e-20, 1e-16, 0.000_999] {
+            let e = refused(rate, 1);
+            assert!(
+                e.starts_with("PLACE_GLOBAL_PUSHES_PER_SECOND: the rate must be"),
+                "{rate}: {e}"
+            );
+        }
+        let e = refused(550.0, 0);
+        assert_eq!(e, "PLACE_GLOBAL_PUSH_BURST: the burst must be at least 1");
+        for (rate, burst) in [(0.001, 1001), (1.0, u32::MAX)] {
+            let e = refused(rate, burst);
+            assert!(
+                e.starts_with(
+                    "PLACE_GLOBAL_PUSH_BURST and PLACE_GLOBAL_PUSHES_PER_SECOND: a burst of"
+                ) && e.contains("to refill"),
+                "{rate} {burst}: {e}"
+            );
+        }
+        for (rate, burst) in [(550.0, 2750), (0.001, 1000), (f64::MAX, u32::MAX)] {
+            let mut c = PlaceConfig::new("http://localhost/canvas.git");
+            c.global_pushes_per_second = rate;
+            c.global_push_burst = burst;
+            assert_eq!(c.validate(), Ok(()), "{rate} {burst}");
+        }
     }
 }

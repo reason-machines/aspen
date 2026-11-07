@@ -634,6 +634,44 @@ impl Metrics {
     }
 }
 
+/// `aspen_blob_requests_total` and `aspen_blob_get_bytes_total`: every
+/// request this process sent its blob store, by caller (push stage, fetch,
+/// compaction, ...), file (`pack`, `idx`, `entries`) and kind, from
+/// `counts` (`aspen_blob::RequestCounts::global` in `aspen serve`).
+pub fn render_blob_requests(out: &mut String, counts: &aspen_blob::RequestCounts) {
+    let rows = counts.snapshot();
+    expo::family(
+        out,
+        "aspen_blob_requests_total",
+        "Requests to the blob store by caller (push stage, fetch, compaction, gc, merge_queue, mirror, other), file and kind (get, head, put, delete). On S3 each is one billed request.",
+        expo::Kind::Counter,
+        rows.iter().map(|r| {
+            (
+                vec![
+                    ("caller", r.caller.as_str()),
+                    ("file", r.file.as_str()),
+                    ("kind", r.kind.as_str()),
+                ],
+                r.requests as f64,
+            )
+        }),
+    );
+    expo::family(
+        out,
+        "aspen_blob_get_bytes_total",
+        "Bytes ranged reads (GETs) of the blob store returned, by caller and file.",
+        expo::Kind::Counter,
+        rows.iter()
+            .filter(|r| r.kind == aspen_blob::RequestKind::Get)
+            .map(|r| {
+                (
+                    vec![("caller", r.caller.as_str()), ("file", r.file.as_str())],
+                    r.bytes as f64,
+                )
+            }),
+    );
+}
+
 /// `aspen_build_info`: always 1, labelled with the version, so dashboards
 /// can show which build each instance runs.
 pub(crate) fn render_build_info(out: &mut String) {

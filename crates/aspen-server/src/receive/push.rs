@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aspen_core::blob::BlobStore;
+use aspen_core::blob::{BlobCaller, BlobStore};
 use aspen_core::error::{RejectReason, StoreError, ToWire, UnpackError};
 use aspen_core::id::{ObjectId, PackId, RefVersionId, Seq, UnixMicros};
 use aspen_core::ingest::{BaseLookup, CandidateBases, ObjectKind, SearchPacks, SortedIds};
@@ -272,8 +272,10 @@ where
             scope = scope.map(|s| s.as_str()),
             origin = ?origin,
         );
-        let result = self
-            .push_inner(r, scope, access, quota, body, origin)
+        // Blob requests are counted per push stage (the scopes inside);
+        // what no stage claims is `push_other`.
+        let result = BlobCaller::PushOther
+            .scope(self.push_inner(r, scope, access, quota, body, origin))
             .instrument(span.clone())
             .await;
         let took = started.elapsed();
@@ -733,6 +735,15 @@ where
             .current_versions(self.repo.id, &names)
             .await
             .map_err(store)?;
+        // The tips' generations, read with the refs: a fast-forward's new
+        // commits get theirs from them without a statement of their own.
+        for c in read.iter().flatten() {
+            if let (Some(tip), Some(g)) = (c.version.value.tip(), c.tip_generation) {
+                self.walker.remember_generation(tip, g);
+            }
+        }
+        let read: Vec<Option<RefVersion>> =
+            read.into_iter().map(|c| c.map(|c| c.version)).collect();
         let current_of = |name: &RefName| -> Option<RefVersion> {
             names
                 .iter()
@@ -752,13 +763,19 @@ where
             .map(|v| v.id)
             .collect();
         let started = Instant::now();
-        self.search = closure_packs(meta, &self.svc.closures, self.repo.id, &roots)
+        self.search = BlobCaller::PushSearch
+            .scope(closure_packs(
+                meta,
+                &self.svc.closures,
+                self.repo.id,
+                &roots,
+            ))
             .await
             .map_err(store)?;
         self.timings.search += started.elapsed();
 
         if let Some(received) = received.filter(|r| r.object_count > 0) {
-            self.ingest(received).await?;
+            BlobCaller::PushGraph.scope(self.ingest(received)).await?;
         }
         // A tip the client did not send must be stored already. Outside the
         // dependencies, it is a commit the negotiation acknowledged (a new
@@ -773,7 +790,7 @@ where
                         .is_none_or(|p| p.graph.position(t).is_none())
                 })
                 .collect();
-            self.widen(outside).await?;
+            BlobCaller::PushSearch.scope(self.widen(outside)).await?;
         }
 
         // The commit check, against each ref's current version.
@@ -790,7 +807,11 @@ where
             currents.push(current.as_ref().and_then(|v| v.value.tip()));
             self.stored
                 .insert(c.name.clone(), current.as_ref().and_then(|v| v.value.tip()));
-            verdicts.push(self.verdict(c, current.as_ref(), &options).await?);
+            verdicts.push(
+                BlobCaller::PushCheck
+                    .scope(self.verdict(c, current.as_ref(), &options))
+                    .await?,
+            );
         }
         self.timings.check += started.elapsed();
         let atomic = self.req.caps.atomic;
@@ -899,7 +920,11 @@ where
                                 c.name.clone(),
                                 current.as_ref().and_then(|v| v.value.tip()),
                             );
-                            again.push(self.verdict(c, current.as_ref(), &options).await?);
+                            again.push(
+                                BlobCaller::PushCheck
+                                    .scope(self.verdict(c, current.as_ref(), &options))
+                                    .await?,
+                            );
                         }
                         let again = self.finish_verdicts(again, atomic).await?;
                         for (&i, v) in group.iter().zip(again) {
@@ -1357,7 +1382,7 @@ where
                 )
             {
                 let (name, new) = (v.name.clone(), v.new);
-                if let Plan::Reject(r) = self.plan(&name, new).await? {
+                if let Plan::Reject(r) = BlobCaller::PushGraph.scope(self.plan(&name, new)).await? {
                     verdicts[i].kind = VerdictKind::Reject(r);
                 }
             }
@@ -1415,7 +1440,9 @@ where
         let (pack_id, closure) = match pack {
             None => (None, closure),
             Some(pl) => {
-                let id = self.ensure_stored(pl.pack).await?;
+                let id = BlobCaller::PushUpload
+                    .scope(self.ensure_stored(pl.pack))
+                    .await?;
                 let closure = if self.pack_is_exact(pl) {
                     closure
                 } else {
@@ -1669,8 +1696,14 @@ where
         let mut slot = svc.gate.acquire().await.map_err(store)?;
         self.timings.gate_wait = started.elapsed();
         let started = Instant::now();
-        let mut prefetched =
-            prefetch(&slot, &svc.packs, self.reads(), &received.candidates).await?;
+        let mut prefetched = BlobCaller::PushPrefetch
+            .scope(prefetch(
+                &slot,
+                &svc.packs,
+                self.reads(),
+                &received.candidates,
+            ))
+            .await?;
         self.timings.prefetch = started.elapsed();
         // A REF_DELTA base the dependencies lack is either in the pack (a
         // libgit2 push) or a thin base of a commit the client left out
@@ -1680,12 +1713,19 @@ where
             drop(prefetched);
             drop(slot);
             let boundary = self.boundary_of(&received).await?;
-            let widened = self.widen(boundary).await?;
+            let widened = BlobCaller::PushSearch.scope(self.widen(boundary)).await?;
             let started = Instant::now();
             slot = svc.gate.acquire().await.map_err(store)?;
             self.timings.gate_wait += started.elapsed();
             let started = Instant::now();
-            prefetched = prefetch(&slot, &svc.packs, self.reads(), &received.candidates).await?;
+            prefetched = BlobCaller::PushPrefetch
+                .scope(prefetch(
+                    &slot,
+                    &svc.packs,
+                    self.reads(),
+                    &received.candidates,
+                ))
+                .await?;
             if widened {
                 tracing::debug!(
                     not_in_deps = prefetched.not_in_deps.len(),
@@ -1876,6 +1916,7 @@ where
                 CommitNode {
                     parents: c.parents.clone(),
                     time: c.committer_time,
+                    generation: None,
                 },
             );
         }
@@ -2067,12 +2108,33 @@ where
                                 commit: tip,
                                 parents: node.parents,
                                 committer_time: node.time,
+                                generation: node.generation,
+                                root_tree: None,
                             }),
                             None => return Ok(Plan::Reject(RejectReason::AncestryUndecided)),
                         }
                     }
                 }
             }
+        }
+        // Generation numbers for the rows, from the pushed pack, the tips of
+        // the refs this push read and the rows its ancestry questions
+        // already read (`Walker::known_generation`): never a statement of
+        // their own, so a branch push costs what it did before generations
+        // (throughput item 6b). A row left without one (a commit on a parent
+        // that is neither a tip it read nor a row it read) gets it from the
+        // `index_commits` job's backfill.
+        let mut walker = std::mem::replace(&mut self.walker, Walker::new(0));
+        for c in &mut commits {
+            if c.generation.is_none() {
+                c.generation = walker.known_generation(c.commit);
+            }
+        }
+        self.walker = walker;
+        if commits.iter().any(|c| c.generation.is_none())
+            && !jobs.iter().any(|j| j.kind == VersionJobKind::IndexCommits)
+        {
+            jobs.push(index_job);
         }
         Ok(Plan::Store {
             pack,

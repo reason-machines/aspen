@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aspen_core::error::StoreError;
-use aspen_core::id::{CoverId, JobId, PackChecksum, PackId, RefVersionId, RepoId, Seq, UnixMicros};
+use aspen_core::id::{
+    CoverId, JobId, ObjectId, PackChecksum, PackId, RefVersionId, RepoId, Seq, UnixMicros,
+};
 use aspen_core::ingest::SortedIds;
 use aspen_core::meta::{
-    CommitLookup, CommitOutcome, CommitRow, Cover, Job, JobEvent, JobTag, Lease, MetaStore,
-    NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery, ShallowDepth,
-    ShallowRecorded, Statements, SweepBatch,
+    CommitLookup, CommitOutcome, CommitRow, Cover, CurrentVersion, Job, JobEvent, JobTag, Lease,
+    MetaStore, NewCover, NewJob, PackTombstone, PushCommit, RefChanges, RefCursor, RefListQuery,
+    ShallowDepth, ShallowRecorded, Statements, SweepBatch,
 };
 use aspen_core::name::{RefName, RepoName};
 use aspen_core::pack::{CoverLevel, NewPack, PackRecord};
@@ -477,14 +479,14 @@ pub(crate) async fn insert_commits(
     // Stable, so of several rows for one commit the first stays first.
     commits.sort_by_key(|c| c.commit);
     commits.dedup_by_key(|c| c.commit);
-    for chunk in commits.chunks(CHUNK / 5) {
+    for chunk in commits.chunks(CHUNK / 7) {
         let values = (0..chunk.len())
-            .map(|i| format!("({})", placeholders(5 * i + 1, 5)))
+            .map(|i| format!("({})", placeholders(7 * i + 1, 7)))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "INSERT INTO commit_index (repo_id, commit_oid, ref_version_id, parents, committer_time) \
-             VALUES {values} ON CONFLICT (repo_id, commit_oid) DO NOTHING"
+            "INSERT INTO commit_index (repo_id, commit_oid, ref_version_id, parents, committer_time, \
+             generation, root_tree) VALUES {values} ON CONFLICT (repo_id, commit_oid) DO NOTHING"
         );
         let mut q = sqlx::query(AssertSqlSafe(sql));
         for c in chunk {
@@ -493,7 +495,9 @@ pub(crate) async fn insert_commits(
                 .bind(c.commit.as_bytes().to_vec())
                 .bind(c.ref_version.get())
                 .bind(rows::parents_column(&c.parents))
-                .bind(c.committer_time);
+                .bind(c.committer_time)
+                .bind(rows::generation_column(c.generation))
+                .bind(c.root_tree.map(|t| t.as_bytes().to_vec()));
         }
         q.execute(&mut *conn).await.map_err(store_error)?;
     }
@@ -586,6 +590,81 @@ async fn list_ref_ranges(
         .collect()
 }
 
+/// What [`SqlStore::fill_commits`] writes.
+enum CommitFill<'a> {
+    /// Generation numbers; clears what the rows waited on.
+    Generations(&'a [(ObjectId, u64)]),
+    /// The commit each row waits on.
+    WaitsOn(&'a [(ObjectId, ObjectId)]),
+}
+
+impl SqlStore {
+    /// Writes `fill` to each listed commit's row of `repo` that still has
+    /// no generation; a row that has one is left alone, so a generation is
+    /// never changed and a row that got one meanwhile does not start
+    /// waiting.
+    async fn fill_commits(&self, repo: RepoId, fill: CommitFill<'_>) -> Result<(), StoreError> {
+        // (commit, generation or the commit it waits on)
+        let mut values: Vec<(ObjectId, Result<i64, ObjectId>)> = match fill {
+            CommitFill::Generations(g) => g
+                .iter()
+                .map(|(id, g)| (*id, Ok(rows::generation_column(Some(*g)).unwrap_or(0))))
+                .collect(),
+            CommitFill::WaitsOn(w) => w.iter().map(|(id, w)| (*id, Err(*w))).collect(),
+        };
+        if values.is_empty() {
+            return Ok(());
+        }
+        let (set, cast) = match fill {
+            CommitFill::Generations(_) => ("generation", "BIGINT"),
+            CommitFill::WaitsOn(_) => (
+                "generation_waits_on",
+                match self.dialect {
+                    Dialect::Postgres => "BYTEA",
+                    Dialect::Sqlite => "BLOB",
+                },
+            ),
+        };
+        let also = match fill {
+            CommitFill::Generations(_) => ", generation_waits_on = NULL",
+            CommitFill::WaitsOn(_) => "",
+        };
+        // Rows locked in one global order, as `insert_commits` writes them.
+        values.sort_by_key(|(id, _)| *id);
+        values.dedup_by_key(|(id, _)| *id);
+        self.write(async |tx| {
+            // `$1` and three per row: the `WHEN`, its value, and the `IN`.
+            for chunk in values.chunks((CHUNK - 1) / 3) {
+                // One `CASE` per chunk works in both dialects (SQLite's
+                // `VALUES` cannot name its columns for `UPDATE ... FROM`).
+                let cases = (0..chunk.len())
+                    .map(|i| format!("WHEN ${} THEN CAST(${} AS {cast})", 2 + 2 * i, 3 + 2 * i))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let keys = placeholders(2 + 2 * chunk.len(), chunk.len());
+                let sql = format!(
+                    "UPDATE commit_index SET {set} = CASE commit_oid {cases} END{also} \
+                     WHERE repo_id = $1 AND generation IS NULL AND commit_oid IN ({keys})"
+                );
+                let mut q = sqlx::query(AssertSqlSafe(sql)).bind(repo.get());
+                for (id, v) in chunk {
+                    q = q.bind(id.as_bytes().to_vec());
+                    q = match v {
+                        Ok(g) => q.bind(*g),
+                        Err(w) => q.bind(w.as_bytes().to_vec()),
+                    };
+                }
+                for (id, _) in chunk {
+                    q = q.bind(id.as_bytes().to_vec());
+                }
+                q.execute(&mut **tx).await.map_err(store_error)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
 impl MetaStore for SqlStore {
     async fn create_repo(
         &self,
@@ -628,12 +707,17 @@ impl MetaStore for SqlStore {
         &self,
         repo: RepoId,
         names: &[RefName],
-    ) -> Result<Vec<Option<RefVersion>>, StoreError> {
-        let mut found: Vec<RefVersion> = Vec::new();
+    ) -> Result<Vec<Option<CurrentVersion>>, StoreError> {
+        let mut found: Vec<CurrentVersion> = Vec::new();
         let mut conn = self.admit().await?;
         for chunk in names.chunks(CHUNK) {
+            // The tip's generation comes from its `commit_index` row by the
+            // primary key, in the same statement (a deletion's `tip_oid` is
+            // NULL and joins nothing).
             let sql = format!(
-                "SELECT {VERSION_COLS} FROM refs r JOIN ref_versions v ON v.id = r.version_id \
+                "SELECT {VERSION_COLS}, ci.generation AS tip_generation \
+                 FROM refs r JOIN ref_versions v ON v.id = r.version_id \
+                 LEFT JOIN commit_index ci ON ci.repo_id = v.repo_id AND ci.commit_oid = v.tip_oid \
                  WHERE r.repo_id = $1 AND r.ref_name IN ({})",
                 placeholders(2, chunk.len())
             );
@@ -642,12 +726,15 @@ impl MetaStore for SqlStore {
                 q = q.bind(n.as_str().to_owned());
             }
             for row in q.fetch_all(&mut *conn).await.map_err(store_error)? {
-                found.push(rows::version(&row)?);
+                found.push(CurrentVersion {
+                    version: rows::version(&row)?,
+                    tip_generation: rows::generation(&row, "tip_generation")?,
+                });
             }
         }
         Ok(names
             .iter()
-            .map(|n| found.iter().find(|v| &v.name == n).cloned())
+            .map(|n| found.iter().find(|v| &v.version.name == n).cloned())
             .collect())
     }
 
@@ -909,6 +996,85 @@ impl MetaStore for SqlStore {
         }
         self.write(async |tx| insert_commits(tx, repo, rows).await)
             .await
+    }
+
+    async fn unexamined_commits(
+        &self,
+        repo: RepoId,
+        after: Option<(RefVersionId, ObjectId)>,
+        limit: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        // Paged through the partial index `commit_index_unexamined`.
+        let (version, commit) =
+            after.map_or((0, Vec::new()), |(v, c)| (v.get(), c.as_bytes().to_vec()));
+        let sql = format!(
+            "SELECT {COMMIT_COLS} FROM commit_index WHERE repo_id = $1 AND generation IS NULL \
+             AND generation_waits_on IS NULL AND (ref_version_id > $2 OR (ref_version_id = $2 \
+             AND commit_oid > $3)) ORDER BY ref_version_id, commit_oid LIMIT $4"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(repo.get())
+            .bind(version)
+            .bind(commit)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *self.admit().await?)
+            .await
+            .map_err(store_error)?
+            .iter()
+            .map(rows::commit)
+            .collect()
+    }
+
+    async fn commits_waiting_on(
+        &self,
+        repo: RepoId,
+        ids: &SortedIds,
+        limit: usize,
+    ) -> Result<Vec<CommitRow>, StoreError> {
+        let mut out = Vec::new();
+        let mut conn = self.admit().await?;
+        for chunk in ids.as_slice().chunks(CHUNK - 2) {
+            if out.len() >= limit {
+                break;
+            }
+            // Through the partial index `commit_index_waiting`.
+            let sql = format!(
+                "SELECT {COMMIT_COLS} FROM commit_index WHERE repo_id = $1 AND generation IS NULL \
+                 AND generation_waits_on IN ({}) LIMIT ${}",
+                placeholders(2, chunk.len()),
+                2 + chunk.len()
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql)).bind(repo.get());
+            for id in chunk {
+                q = q.bind(id.as_bytes().to_vec());
+            }
+            let got = q
+                .bind(i64::try_from(limit - out.len()).unwrap_or(i64::MAX))
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(store_error)?;
+            for row in &got {
+                out.push(rows::commit(row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_generations(
+        &self,
+        repo: RepoId,
+        generations: &[(ObjectId, u64)],
+    ) -> Result<(), StoreError> {
+        self.fill_commits(repo, CommitFill::Generations(generations))
+            .await
+    }
+
+    async fn set_generation_waits_on(
+        &self,
+        repo: RepoId,
+        waits: &[(ObjectId, ObjectId)],
+    ) -> Result<(), StoreError> {
+        self.fill_commits(repo, CommitFill::WaitsOn(waits)).await
     }
 
     async fn covers(&self, repo: RepoId, name: &RefName) -> Result<Vec<Cover>, StoreError> {

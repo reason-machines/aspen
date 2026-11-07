@@ -155,6 +155,9 @@ fn process_owner() -> String {
 const _: () =
     assert!(DEFAULT_GC_GRACE.as_secs() >= 2 * aspen_core::pack::MAX_PACK_URL_LIFETIME.as_secs());
 
+/// Default [`CompactConfig::backfill_held`].
+pub const DEFAULT_BACKFILL_HELD: usize = 2_000_000;
+
 /// The compactor's configuration.
 #[derive(Debug, Clone)]
 pub struct CompactConfig {
@@ -240,6 +243,17 @@ pub struct CompactConfig {
     /// the lease, and a holder that dies loses it this long after its last
     /// extension. At least [`MIN_GC_LEASE`].
     pub gc_lease: Duration,
+    /// Most commit index rows the generation backfill of an
+    /// `index_commits` job holds in memory at once
+    /// ([`Compactor::backfill_generations`]): for a commit with one parent,
+    /// 28 bytes for the commit, 20 for its parent, 13 while it solves and
+    /// 20 more if it waits, so at most about 80 bytes, and the default,
+    /// [`DEFAULT_BACKFILL_HELD`] (2,000,000), holds at most about 160 MB.
+    /// A round never reads more rows than this. More rows to examine than this are
+    /// examined in several rounds; a row whose parent lies in a later round
+    /// waits on it and is filled when that round fills the parent. 0 counts
+    /// as 1.
+    pub backfill_held: usize,
     /// The name this compactor holds the garbage-collection lease under.
     /// Compactors with the same owner share the lease; processes must use
     /// different owners. The default is unique per process.
@@ -272,6 +286,7 @@ impl CompactConfig {
             gc_sweep_batch: DEFAULT_GC_SWEEP_BATCH,
             gc_lease: DEFAULT_GC_LEASE,
             gc_owner: process_owner(),
+            backfill_held: DEFAULT_BACKFILL_HELD,
         }
     }
 
