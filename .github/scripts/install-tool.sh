@@ -17,7 +17,7 @@ set -euo pipefail
 
 die() { echo "install-tool: $*" >&2; exit 1; }
 
-[[ $# -eq 2 ]] || die "usage: install-tool.sh <helm|kubeconform|kind> <dir>"
+[[ $# -eq 2 ]] || die "usage: install-tool.sh <helm|kubeconform|kind|gitleaks> <dir>"
 tool=$1 dir=$2
 
 # url, sha256 of the download, and the executable's path inside the archive
@@ -38,7 +38,12 @@ case $tool in
     sha256=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
     member=
     ;;
-  *) die "unknown tool '$tool' (known: helm, kubeconform, kind)" ;;
+  gitleaks)
+    url=https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+    sha256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    member=gitleaks
+    ;;
+  *) die "unknown tool '$tool' (known: helm, kubeconform, kind, gitleaks)" ;;
 esac
 
 work=$(mktemp -d)

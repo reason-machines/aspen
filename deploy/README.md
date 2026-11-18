@@ -462,7 +462,7 @@ S3-compatible bucket (S3, GCS through its S3 API, R2, MinIO).
 ```bash
 kubectl create secret generic aspen-db --from-literal=password='<db password>'
 helm install aspen deploy/helm/aspen \
-  --set database.url='postgres://aspen@db.internal:5432/aspen?sslmode=require' \
+  --set database.url='postgres://aspen@host.example.invalid:5432/aspen?sslmode=require' \
   --set database.passwordSecret.name=aspen-db \
   --set blob.url=s3://acme-aspen-packs --set blob.env.AWS_REGION=us-east-1 \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::123456789012:role/aspen \

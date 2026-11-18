@@ -21,7 +21,7 @@ mock_provider "azurerm" {
     defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/aspen/providers/Microsoft.Network/virtualNetworks/aspen" }
   }
   mock_resource "azurerm_private_dns_zone" {
-    defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/aspen/providers/Microsoft.Network/privateDnsZones/aspen.private.postgres.database.azure.com" }
+    defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/aspen/providers/Microsoft.Network/privateDnsZones/database.example.invalid" }
   }
   mock_resource "azurerm_log_analytics_workspace" {
     defaults = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/aspen/providers/Microsoft.OperationalInsights/workspaces/aspen" }

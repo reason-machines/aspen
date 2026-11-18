@@ -308,14 +308,14 @@ async fn an_issuer_cannot_speak_for_another() {
     let mut policy = oidc_policy(&a);
     policy["oidc"].as_array_mut().unwrap().push(json!({
         "name": "corp",
-        "issuer": "https://idp.corp.example",
+        "issuer": "https://host.example.invalid",
         "audience": AUDIENCE,
         "jwks": { "keys": [b.jwk(None)] },
         "rules": [{ "claims": { "repository": "acme/mono" }, "grants": ["admin:*"] }]
     }));
     let svc = service(policy);
     let mut c = claims();
-    c["iss"] = json!("https://idp.corp.example");
+    c["iss"] = json!("https://host.example.invalid");
     assert_eq!(
         svc.identify(&basic(&a.simple(Some("k1"), &c)), T)
             .await
