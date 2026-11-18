@@ -229,7 +229,7 @@ background worker (`ASPEN_ROLE` `all` or `compact`) claims `compact`,
 `index_commits` and `rewrite_pack` jobs; mirror mode claims `mirror_push`.
 
 ```console
-$ DATABASE_URL=postgres://aspen@db.internal/aspen PGPASSWORD=... aspen doctor jobs
+$ DATABASE_URL=postgres://aspen@host.example.invalid/aspen PGPASSWORD=... aspen doctor jobs
 KIND             QUEUED  RUNNING     DEAD  OLDEST DUE
 rewrite_pack          0        0        1  -
 
@@ -350,7 +350,7 @@ scrape_configs:
   - job_name: aspen
     scrape_interval: 30s
     static_configs:
-      - targets: ["aspen-1.internal:9464", "aspen-2.internal:9464"]
+      - targets: ["host.example.invalid:9464", "host.example.invalid:9464"]
 ```
 
 ## For the binary that serves Git
