@@ -350,7 +350,7 @@ scrape_configs:
   - job_name: aspen
     scrape_interval: 30s
     static_configs:
-      - targets: ["host.example.invalid:9464", "host.example.invalid:9464"]
+      - targets: ["aspen-1.example.invalid:9464", "aspen-2.example.invalid:9464"]
 ```
 
 ## For the binary that serves Git
